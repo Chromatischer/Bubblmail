@@ -80,7 +80,6 @@ func (sb *Sidebar) View() string {
 
 	accountHeaderStyle := lipgloss.NewStyle().
 		Foreground(theme.TextMuted).
-		Background(theme.Surface).
 		Bold(true)
 
 	for _, acct := range sb.accounts {
@@ -103,8 +102,7 @@ func (sb *Sidebar) View() string {
 					Bold(true)
 			} else {
 				folderStyle = lipgloss.NewStyle().
-					Foreground(theme.Text).
-					Background(theme.Surface)
+					Foreground(theme.Text)
 			}
 
 			name := f.DisplayName
@@ -115,8 +113,7 @@ func (sb *Sidebar) View() string {
 			var line string
 			if f.Unread > 0 && !isActive {
 				countStyle := lipgloss.NewStyle().
-					Foreground(theme.Unread).
-					Background(theme.Surface)
+					Foreground(theme.Unread)
 				unreadStr := countStyle.Render(fmt.Sprintf(" %d", f.Unread))
 				// Build line with name and unread count
 				available := sb.width - lipgloss.Width(indent) - 2 - lipgloss.Width(unreadStr)
@@ -132,11 +129,11 @@ func (sb *Sidebar) View() string {
 			// Pad to full width
 			lineW := lipgloss.Width(line)
 			if lineW < sb.width {
-				bg := theme.Surface
+				padStyle := lipgloss.NewStyle()
 				if isActive {
-					bg = theme.Accent
+					padStyle = padStyle.Background(theme.Accent)
 				}
-				line += lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", sb.width-lineW))
+				line += padStyle.Render(strings.Repeat(" ", sb.width-lineW))
 			}
 
 			sb.hitZones = append(sb.hitZones, sidebarHitZone{
@@ -146,14 +143,13 @@ func (sb *Sidebar) View() string {
 			row++
 		}
 		// Spacer between accounts
-		lines = append(lines, lipgloss.NewStyle().Background(theme.Surface).Render(""))
+		lines = append(lines, "")
 		row++
 	}
 
 	if len(lines) == 0 {
 		emptyLine := lipgloss.NewStyle().
 			Foreground(theme.TextFaint).
-			Background(theme.Surface).
 			Render("  No accounts")
 		lines = append(lines, emptyLine)
 	}
@@ -172,7 +168,6 @@ func (sb *Sidebar) View() string {
 	// Pad remaining height
 	for len(visible) < sb.height {
 		visible = append(visible, lipgloss.NewStyle().
-			Background(theme.Surface).
 			Width(sb.width).
 			Render(""))
 	}

@@ -28,6 +28,9 @@ func Open(dir string) (*Store, error) {
 		return nil, fmt.Errorf("creating cache dir: %w", err)
 	}
 	dbPath := filepath.Join(dir, "cache.db")
+	if err := removeStaleFTS5DB(dbPath); err != nil {
+		return nil, fmt.Errorf("migrating cache: %w", err)
+	}
 	db, err := sql.Open("sqlite3", dbPath+"?_foreign_keys=on&_journal_mode=WAL")
 	if err != nil {
 		return nil, fmt.Errorf("opening database: %w", err)
@@ -38,6 +41,23 @@ func Open(dir string) (*Store, error) {
 		return nil, fmt.Errorf("applying schema: %w", err)
 	}
 	return s, nil
+}
+
+// removeStaleFTS5DB removes the cache database if it was built with the fts5
+// module, which go-sqlite3 does not compile by default. The cache is not a
+// source of truth (mail lives on the IMAP server), so deletion is safe.
+func removeStaleFTS5DB(dbPath string) error {
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return nil // file doesn't exist yet
+	}
+	var ftsDDL string
+	err = db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'`).Scan(&ftsDDL)
+	db.Close()
+	if err != nil || !strings.Contains(strings.ToLower(ftsDDL), "fts5") {
+		return nil // no stale fts5 table
+	}
+	return os.Remove(dbPath)
 }
 
 // Close closes the database connection.

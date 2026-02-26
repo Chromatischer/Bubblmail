@@ -58,14 +58,11 @@ func (sb *StatusBar) View(context string) string {
 
 	keyStyle := lipgloss.NewStyle().
 		Foreground(theme.Accent).
-		Background(theme.Surface).
 		Bold(true)
 	descStyle := lipgloss.NewStyle().
-		Foreground(theme.TextMuted).
-		Background(theme.Surface)
+		Foreground(theme.TextMuted)
 	sepStyle := lipgloss.NewStyle().
-		Foreground(theme.TextFaint).
-		Background(theme.Surface)
+		Foreground(theme.TextFaint)
 
 	type hint struct{ key, desc string }
 
@@ -143,12 +140,10 @@ func (sb *StatusBar) View(context string) string {
 		}
 		rightStr = lipgloss.NewStyle().
 			Foreground(color).
-			Background(theme.Surface).
 			Render(sb.message)
 	} else if sb.loading {
 		rightStr = lipgloss.NewStyle().
 			Foreground(theme.TextMuted).
-			Background(theme.Surface).
 			Render(spinnerFrames[sb.spinner] + " Loading…")
 	}
 
@@ -165,7 +160,6 @@ func (sb *StatusBar) View(context string) string {
 		Render(strings.Repeat("─", sb.width))
 
 	row := lipgloss.NewStyle().
-		Background(theme.Surface).
 		Width(sb.width).
 		Padding(0, 1).
 		Render(barContent)

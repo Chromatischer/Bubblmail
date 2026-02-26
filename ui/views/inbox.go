@@ -166,15 +166,6 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	w := v.width
 	theme := v.theme
 
-	var bg lipgloss.Color
-	if selected {
-		bg = theme.Selected
-	} else if t.HasUnread {
-		bg = theme.Background
-	} else {
-		bg = theme.Background
-	}
-
 	fgMain := theme.Text
 	fgMuted := theme.TextMuted
 	if selected {
@@ -185,26 +176,16 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	// Status indicator: ★ for starred, ● unread, ○ read
 	var indicator string
 	if t.Starred {
-		indicator = lipgloss.NewStyle().
-			Foreground(theme.Starred).
-			Background(bg).
-			Render("★")
+		indicator = lipgloss.NewStyle().Foreground(theme.Starred).Render("★")
 	} else if t.HasUnread {
-		indicator = lipgloss.NewStyle().
-			Foreground(theme.Unread).
-			Background(bg).
-			Render("●")
+		indicator = lipgloss.NewStyle().Foreground(theme.Unread).Render("●")
 	} else {
-		indicator = lipgloss.NewStyle().
-			Foreground(fgMuted).
-			Background(bg).
-			Render("○")
+		indicator = lipgloss.NewStyle().Foreground(fgMuted).Render("○")
 	}
 
 	// From field
 	fromStr := t.Messages[0].FromString()
 	if t.HasUnread {
-		// Use latest sender
 		if latest := t.Latest(); latest != nil {
 			fromStr = latest.FromString()
 		}
@@ -214,7 +195,7 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	tagStr := ""
 	if len(t.Tags) > 0 {
 		tagStyle := lipgloss.NewStyle().
-			Foreground(bg).
+			Foreground(theme.Background).
 			Background(theme.Accent).
 			Padding(0, 1)
 		var tagParts []string
@@ -228,11 +209,7 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	}
 
 	// Date
-	dateStr := util.FormatDate(t.LastDate)
-
-	// Row 1 layout: indicator + from + [tags] + date
-	dateStyle := lipgloss.NewStyle().Foreground(fgMuted).Background(bg)
-	dateRendered := dateStyle.Render(dateStr)
+	dateRendered := lipgloss.NewStyle().Foreground(fgMuted).Render(util.FormatDate(t.LastDate))
 	dateW := lipgloss.Width(dateRendered)
 	tagW := lipgloss.Width(tagStr)
 	indW := 2 // "● "
@@ -243,7 +220,7 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	}
 	fromTrunc := util.TruncateText(fromStr, fromW)
 
-	fromStyle := lipgloss.NewStyle().Background(bg)
+	fromStyle := lipgloss.NewStyle()
 	if t.HasUnread && !selected {
 		fromStyle = fromStyle.Foreground(theme.Text).Bold(true)
 	} else {
@@ -260,8 +237,11 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	if gap1 < 1 {
 		gap1 = 1
 	}
-	row1 := lipgloss.NewStyle().Background(bg).Width(w).
-		Render(row1Parts + strings.Repeat(" ", gap1) + dateRendered)
+	row1Style := lipgloss.NewStyle().Width(w)
+	if selected {
+		row1Style = row1Style.Background(theme.Selected)
+	}
+	row1 := row1Style.Render(row1Parts + strings.Repeat(" ", gap1) + dateRendered)
 
 	// Row 2: subject + message count
 	subject := t.Subject
@@ -273,10 +253,7 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 
 	countStr := ""
 	if len(t.Messages) > 1 {
-		countStr = lipgloss.NewStyle().
-			Foreground(fgMuted).
-			Background(bg).
-			Render(fmt.Sprintf("(%d)", len(t.Messages)))
+		countStr = lipgloss.NewStyle().Foreground(fgMuted).Render(fmt.Sprintf("(%d)", len(t.Messages)))
 	}
 	countW := lipgloss.Width(countStr)
 
@@ -286,15 +263,17 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	}
 	subjectTrunc := util.TruncateText(subject, subjectW)
 
-	subjectStyle := lipgloss.NewStyle().Foreground(fgMuted).Background(bg)
-	subjectRendered := subjectStyle.Render("   " + subjectTrunc)
+	subjectRendered := lipgloss.NewStyle().Foreground(fgMuted).Render("   " + subjectTrunc)
 
 	gap2 := w - lipgloss.Width(subjectRendered) - countW
 	if gap2 < 1 {
 		gap2 = 1
 	}
-	row2 := lipgloss.NewStyle().Background(bg).Width(w).
-		Render(subjectRendered + strings.Repeat(" ", gap2) + countStr)
+	row2Style := lipgloss.NewStyle().Width(w)
+	if selected {
+		row2Style = row2Style.Background(theme.Selected)
+	}
+	row2 := row2Style.Render(subjectRendered + strings.Repeat(" ", gap2) + countStr)
 
 	return []string{row1, row2}
 }

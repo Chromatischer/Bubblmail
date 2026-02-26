@@ -48,7 +48,6 @@ func (h *Header) View() string {
 	// Row 1: app name + sync indicator
 	appName := lipgloss.NewStyle().
 		Foreground(theme.Accent).
-		Background(theme.Surface).
 		Bold(true).
 		Render("bubblmail")
 
@@ -57,17 +56,14 @@ func (h *Header) View() string {
 	case "syncing":
 		syncStr = lipgloss.NewStyle().
 			Foreground(theme.Warning).
-			Background(theme.Surface).
 			Render("⟳ syncing")
 	case "synced":
 		syncStr = lipgloss.NewStyle().
 			Foreground(theme.Success).
-			Background(theme.Surface).
 			Render("● synced")
 	case "error":
 		syncStr = lipgloss.NewStyle().
 			Foreground(theme.Error).
-			Background(theme.Surface).
 			Render("✗ sync error")
 	}
 
@@ -78,7 +74,6 @@ func (h *Header) View() string {
 	gap1 := strings.Repeat(" ", row1Width)
 
 	row1 := lipgloss.NewStyle().
-		Background(theme.Surface).
 		Width(h.width).
 		Render(appName + gap1 + syncStr)
 
@@ -86,22 +81,18 @@ func (h *Header) View() string {
 	var breadcrumb string
 	if h.activeAccount != "" && h.activeFolder != "" {
 		acctStyle := lipgloss.NewStyle().
-			Foreground(theme.TextMuted).
-			Background(theme.Surface)
+			Foreground(theme.TextMuted)
 		folderStyle := lipgloss.NewStyle().
 			Foreground(theme.Text).
-			Background(theme.Surface).
 			Bold(true)
 		breadcrumb = acctStyle.Render(h.activeAccount) + " › " + folderStyle.Render(h.activeFolder)
 	} else if h.activeAccount != "" {
 		breadcrumb = lipgloss.NewStyle().
 			Foreground(theme.TextMuted).
-			Background(theme.Surface).
 			Render(h.activeAccount)
 	}
 
 	row2 := lipgloss.NewStyle().
-		Background(theme.Surface).
 		Foreground(theme.Text).
 		Width(h.width).
 		Padding(0, 1).

@@ -45,12 +45,13 @@ func NewStyles(theme *config.Theme) *Styles {
 	s := &Styles{Theme: theme}
 
 	s.Header = lipgloss.NewStyle().
-		Background(theme.Surface).
 		Foreground(theme.Text).
-		Padding(0, 1)
+		Padding(0, 1).
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderBottom(true).
+		BorderForeground(theme.Border)
 
 	s.Sidebar = lipgloss.NewStyle().
-		Background(theme.Surface).
 		Foreground(theme.Text).
 		Padding(0, 1).
 		BorderStyle(lipgloss.NormalBorder()).
@@ -60,9 +61,11 @@ func NewStyles(theme *config.Theme) *Styles {
 	s.Content = lipgloss.NewStyle()
 
 	s.StatusBar = lipgloss.NewStyle().
-		Background(theme.Surface).
 		Foreground(theme.TextMuted).
-		Padding(0, 1)
+		Padding(0, 1).
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderTop(true).
+		BorderForeground(theme.Border)
 
 	// List items — 1 col padding each side
 	s.ListItem = lipgloss.NewStyle().
