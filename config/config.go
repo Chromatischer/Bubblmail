@@ -101,6 +101,25 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
+// Save writes the config to ~/.config/bubblmail/config.toml, creating the
+// directory if it does not exist.
+func (c *Config) Save() error {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(configDir, "bubblmail")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	f, err := os.Create(filepath.Join(dir, "config.toml"))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return toml.NewEncoder(f).Encode(c)
+}
+
 // ResolvePassword returns the account password, running PasswordCmd if needed.
 func (a *AccountConfig) ResolvePassword() (string, error) {
 	if a.Password != "" {
