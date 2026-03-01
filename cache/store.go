@@ -66,6 +66,13 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) applySchema() error {
+	// Migration: drop the FTS4 update trigger if it exists. It re-inserted with
+	// the same docid after a 'delete', which FTS4 external-content tables reject
+	// with "sql logic error". Email content (subject/snippet/body) never changes
+	// after initial sync, so the trigger was unnecessary to begin with.
+	if _, err := s.db.Exec(`DROP TRIGGER IF EXISTS messages_fts_update`); err != nil {
+		return fmt.Errorf("dropping stale fts_update trigger: %w", err)
+	}
 	_, err := s.db.Exec(schemaSQL)
 	return err
 }

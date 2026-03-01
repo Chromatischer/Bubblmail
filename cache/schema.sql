@@ -71,12 +71,6 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
     VALUES ('delete', old.id, old.subject, old.snippet, '');
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, docid, subject, snippet, body_text)
-    VALUES ('delete', old.id, old.subject, old.snippet, '');
-    INSERT INTO messages_fts(docid, subject, snippet, body_text)
-    VALUES (new.id, new.subject, new.snippet, '');
-END;
 
 CREATE INDEX IF NOT EXISTS idx_messages_account_folder ON messages(account_name, folder_name);
 CREATE INDEX IF NOT EXISTS idx_messages_thread_id      ON messages(thread_id);

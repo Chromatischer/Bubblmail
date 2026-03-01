@@ -69,6 +69,12 @@ type App struct {
 	activeAccount string
 	activeFolder  string
 
+	// Pagination
+	loadedMessages []*data.Message
+	fetchedCount   int
+	loadingMore    bool
+	allLoaded      bool
+
 	accounts []*data.Account
 }
 
@@ -223,19 +229,37 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.statusbar.SetLoading(false)
 			return a, nil
 		}
-		// Cache messages
+		a.loadedMessages = msg.Messages
+		a.fetchedCount = len(msg.Messages)
+		a.loadingMore = false
+		a.allLoaded = false
 		if err := a.store.UpsertMessages(msg.Messages); err != nil {
 			a.flash("Cache write error: "+err.Error(), "err")
 		}
-		// Build threads and update view
-		threads := thread.BuildThreads(msg.Messages)
-		// Persist thread IDs
-		if err := a.store.UpsertMessages(msg.Messages); err == nil {
-			_ = err
-		}
+		threads := thread.BuildThreads(a.loadedMessages)
 		a.inboxView.SetThreads(threads)
 		a.statusbar.SetLoading(false)
 		return a, a.scheduleSyncTick(msg.Account)
+
+	case imaplib.MoreMessageListMsg:
+		a.loadingMore = false
+		a.statusbar.SetLoading(false)
+		if msg.Err != nil {
+			a.flash("Load more error: "+msg.Err.Error(), "err")
+			return a, nil
+		}
+		if len(msg.Messages) == 0 {
+			a.allLoaded = true
+			return a, nil
+		}
+		a.fetchedCount += len(msg.Messages)
+		a.loadedMessages = append(a.loadedMessages, msg.Messages...)
+		if err := a.store.UpsertMessages(msg.Messages); err != nil {
+			a.flash("Cache write error: "+err.Error(), "err")
+		}
+		threads := thread.BuildThreads(a.loadedMessages)
+		a.inboxView.AppendThreads(threads)
+		return a, nil
 
 	case imaplib.MessageBodyMsg:
 		if msg.Err != nil {
@@ -406,12 +430,14 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// View-specific navigation
 	case "j", "down":
 		a.moveDown()
+		return a, a.maybeLoadMore()
 
 	case "k", "up":
 		a.moveUp()
 
 	case "ctrl+d":
 		a.pageDown()
+		return a, a.maybeLoadMore()
 
 	case "ctrl+u":
 		a.pageUp()
@@ -421,6 +447,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "G":
 		a.goToBottom()
+		return a, a.maybeLoadMore()
 
 	case "enter":
 		return a, a.handleEnter()
@@ -603,6 +630,11 @@ func (a *App) openMessage(msg *data.Message) tea.Cmd {
 }
 
 func (a *App) fetchMessages() tea.Cmd {
+	a.loadedMessages = nil
+	a.fetchedCount = 0
+	a.loadingMore = false
+	a.allLoaded = false
+
 	client, ok := a.imapClients[a.activeAccount]
 	if !ok {
 		// Try loading from cache
@@ -893,6 +925,27 @@ func (a *App) View() string {
 	statusbar := a.statusbar.View(sbContext)
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, mainContent, statusbar)
+}
+
+func (a *App) maybeLoadMore() tea.Cmd {
+	if a.viewID != ViewInbox || a.loadingMore || a.allLoaded {
+		return nil
+	}
+	client, ok := a.imapClients[a.activeAccount]
+	if !ok {
+		return nil
+	}
+	n := a.inboxView.Len()
+	cursor := a.inboxView.CursorPos()
+	if n == 0 || cursor < n-10 {
+		return nil
+	}
+	a.loadingMore = true
+	a.statusbar.SetLoading(true)
+	return tea.Batch(
+		client.FetchMoreMessages(a.activeFolder, a.fetchedCount, a.cfg.General.PageSize),
+		spinnerTick(),
+	)
 }
 
 // --- utility ---

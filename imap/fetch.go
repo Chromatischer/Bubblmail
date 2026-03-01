@@ -30,6 +30,14 @@ type MessageListMsg struct {
 	Err      error
 }
 
+// MoreMessageListMsg carries older messages appended during infinite scroll.
+type MoreMessageListMsg struct {
+	Account  string
+	Folder   string
+	Messages []*data.Message
+	Err      error
+}
+
 // MessageBodyMsg carries the result of FetchBody.
 type MessageBodyMsg struct {
 	Account string
@@ -61,11 +69,20 @@ func (c *Client) FetchFolders() tea.Cmd {
 	}
 }
 
-// FetchMessages returns a tea.Cmd that fetches message envelopes from a folder.
+// FetchMessages returns a tea.Cmd that fetches the newest message envelopes from a folder.
 func (c *Client) FetchMessages(folder string, limit int) tea.Cmd {
 	return func() tea.Msg {
-		msgs, err := c.fetchMessages(folder, limit)
+		msgs, err := c.fetchMessages(folder, 0, limit)
 		return MessageListMsg{Account: c.cfg.Name, Folder: folder, Messages: msgs, Err: err}
+	}
+}
+
+// FetchMoreMessages returns a tea.Cmd that fetches older messages beyond those already loaded.
+// skip is the count of newest messages already fetched.
+func (c *Client) FetchMoreMessages(folder string, skip, limit int) tea.Cmd {
+	return func() tea.Msg {
+		msgs, err := c.fetchMessages(folder, skip, limit)
+		return MoreMessageListMsg{Account: c.cfg.Name, Folder: folder, Messages: msgs, Err: err}
 	}
 }
 
@@ -124,7 +141,7 @@ func (c *Client) fetchFolders() ([]*data.Folder, error) {
 	return folders, nil
 }
 
-func (c *Client) fetchMessages(folder string, limit int) ([]*data.Message, error) {
+func (c *Client) fetchMessages(folder string, skip, limit int) ([]*data.Message, error) {
 	if _, err := c.conn.Select(folder, nil).Wait(); err != nil {
 		return nil, fmt.Errorf("selecting folder %q: %w", folder, err)
 	}
@@ -140,16 +157,18 @@ func (c *Client) fetchMessages(folder string, limit int) ([]*data.Message, error
 	if status.NumMessages != nil {
 		total = *status.NumMessages
 	}
-	if total == 0 {
+	if total == 0 || uint32(skip) >= total {
 		return nil, nil
 	}
 
+	end := total - uint32(skip)
 	start := uint32(1)
-	if total > uint32(limit) {
-		start = total - uint32(limit) + 1
+	if end > uint32(limit) {
+		start = end - uint32(limit) + 1
 	}
 
-	seqSet := imaplib.SeqSetNum(start, total)
+	var seqSet imaplib.SeqSet
+	seqSet.AddRange(start, end)
 	fetchOptions := &imaplib.FetchOptions{
 		Envelope:      true,
 		Flags:         true,

@@ -43,6 +43,23 @@ func (v *InboxView) SetThreads(threads []*data.Thread) {
 	v.offset = 0
 }
 
+// AppendThreads replaces the thread list while preserving cursor position.
+func (v *InboxView) AppendThreads(threads []*data.Thread) {
+	v.threads = threads
+	if v.cursor >= len(v.threads) {
+		v.cursor = len(v.threads) - 1
+	}
+	if v.cursor < 0 {
+		v.cursor = 0
+	}
+}
+
+// Len returns the number of threads loaded.
+func (v *InboxView) Len() int { return len(v.threads) }
+
+// CursorPos returns the current cursor index.
+func (v *InboxView) CursorPos() int { return v.cursor }
+
 // SelectedThread returns the currently focused thread, or nil.
 func (v *InboxView) SelectedThread() *data.Thread {
 	if v.cursor < 0 || v.cursor >= len(v.threads) {
@@ -166,6 +183,16 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	w := v.width
 	theme := v.theme
 
+	// sel applies the selection background to any style when this row is selected.
+	// Every pre-rendered span must go through sel() so that ANSI resets inside
+	// them don't leave gaps in the selection highlight.
+	sel := func(s lipgloss.Style) lipgloss.Style {
+		if selected {
+			return s.Background(theme.Selected)
+		}
+		return s
+	}
+
 	fgMain := theme.Text
 	fgMuted := theme.TextMuted
 	if selected {
@@ -173,14 +200,19 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 		fgMuted = theme.Background
 	}
 
-	// Status indicator: ★ for starred, ● unread, ○ read
-	var indicator string
+	// Flag column: accent ▌ bar for starred/flagged messages, blank otherwise
+	flagCh := " "
 	if t.Starred {
-		indicator = lipgloss.NewStyle().Foreground(theme.Starred).Render("★")
-	} else if t.HasUnread {
-		indicator = lipgloss.NewStyle().Foreground(theme.Unread).Render("●")
+		flagCh = "▌"
+	}
+	flag := sel(lipgloss.NewStyle().Foreground(theme.Starred)).Render(flagCh)
+
+	// Status dot: ● unread, ○ read
+	var dot string
+	if t.HasUnread {
+		dot = sel(lipgloss.NewStyle().Foreground(theme.Unread)).Render("●")
 	} else {
-		indicator = lipgloss.NewStyle().Foreground(fgMuted).Render("○")
+		dot = sel(lipgloss.NewStyle().Foreground(fgMuted)).Render("○")
 	}
 
 	// From field
@@ -208,13 +240,13 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 		tagStr = strings.Join(tagParts, " ")
 	}
 
-	// Date
-	dateRendered := lipgloss.NewStyle().Foreground(fgMuted).Render(util.FormatDate(t.LastDate))
+	// Date — right side of row 1
+	dateRendered := sel(lipgloss.NewStyle().Foreground(fgMuted)).Render(util.FormatDate(t.LastDate))
 	dateW := lipgloss.Width(dateRendered)
 	tagW := lipgloss.Width(tagStr)
-	indW := 2 // "● "
 
-	fromW := w - indW - tagW - dateW - 4
+	// Prefix: cursor(1) + dot(1) + space(1) = 3 cols
+	fromW := w - 3 - tagW - dateW - 2
 	if fromW < 5 {
 		fromW = 5
 	}
@@ -222,14 +254,14 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 
 	fromStyle := lipgloss.NewStyle()
 	if t.HasUnread && !selected {
-		fromStyle = fromStyle.Foreground(theme.Text).Bold(true)
+		fromStyle = sel(fromStyle.Foreground(theme.Text).Bold(true))
 	} else {
-		fromStyle = fromStyle.Foreground(fgMain)
+		fromStyle = sel(fromStyle.Foreground(fgMain))
 	}
 	fromRendered := fromStyle.Render(util.PadRight(fromTrunc, fromW))
 
-	// Assemble row 1
-	row1Parts := " " + indicator + " " + fromRendered
+	// Row 1: flag + dot + space + from [+ tags] + gap + date
+	row1Parts := flag + dot + " " + fromRendered
 	if tagStr != "" {
 		row1Parts += " " + tagStr
 	}
@@ -237,13 +269,10 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	if gap1 < 1 {
 		gap1 = 1
 	}
-	row1Style := lipgloss.NewStyle().Width(w)
-	if selected {
-		row1Style = row1Style.Background(theme.Selected)
-	}
-	row1 := row1Style.Render(row1Parts + strings.Repeat(" ", gap1) + dateRendered)
+	gapStr1 := sel(lipgloss.NewStyle()).Render(strings.Repeat(" ", gap1))
+	row1 := sel(lipgloss.NewStyle().Width(w)).Render(row1Parts + gapStr1 + dateRendered)
 
-	// Row 2: subject + message count
+	// Row 2: indent + subject + gap + count
 	subject := t.Subject
 	if subject == "" {
 		if latest := t.Latest(); latest != nil {
@@ -253,27 +282,23 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 
 	countStr := ""
 	if len(t.Messages) > 1 {
-		countStr = lipgloss.NewStyle().Foreground(fgMuted).Render(fmt.Sprintf("(%d)", len(t.Messages)))
+		countStr = sel(lipgloss.NewStyle().Foreground(fgMuted)).Render(fmt.Sprintf("(%d)", len(t.Messages)))
 	}
 	countW := lipgloss.Width(countStr)
 
-	subjectW := w - 4 - countW - 2
+	subjectW := w - 5 - countW
 	if subjectW < 5 {
 		subjectW = 5
 	}
 	subjectTrunc := util.TruncateText(subject, subjectW)
-
-	subjectRendered := lipgloss.NewStyle().Foreground(fgMuted).Render("   " + subjectTrunc)
+	subjectRendered := sel(lipgloss.NewStyle().Foreground(fgMuted)).Render("   " + subjectTrunc)
 
 	gap2 := w - lipgloss.Width(subjectRendered) - countW
 	if gap2 < 1 {
 		gap2 = 1
 	}
-	row2Style := lipgloss.NewStyle().Width(w)
-	if selected {
-		row2Style = row2Style.Background(theme.Selected)
-	}
-	row2 := row2Style.Render(subjectRendered + strings.Repeat(" ", gap2) + countStr)
+	gapStr2 := sel(lipgloss.NewStyle()).Render(strings.Repeat(" ", gap2))
+	row2 := sel(lipgloss.NewStyle().Width(w)).Render(subjectRendered + gapStr2 + countStr)
 
 	return []string{row1, row2}
 }
