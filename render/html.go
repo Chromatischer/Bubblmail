@@ -156,7 +156,8 @@ func renderHTML(htmlBody string, width int, theme *config.Theme) []string {
 				collectText(n, &sb)
 				linkText := strings.TrimSpace(sb.String())
 				if linkText == "" {
-					linkText = href
+					// No visible text (e.g. image-only or structural links) — skip.
+					return
 				}
 				if href != "" {
 					appendText(&blocks, hyperlink(href, linkText, theme.Accent), quoteDepth)
@@ -243,6 +244,24 @@ func appendText(blocks *[]block, text string, quoteDepth int) {
 func renderBlocks(blocks []block, width int, theme *config.Theme) []string {
 	quoteStyle := lipgloss.NewStyle().Foreground(theme.TextMuted)
 	divider := strings.Repeat("─", width)
+
+	// Collapse consecutive empty blocks to at most one (marketing emails use
+	// many <br> tags and empty table cells that generate long runs of blanks).
+	deduped := blocks[:0:0]
+	lastEmpty := false
+	for _, b := range blocks {
+		isEmpty := !b.isDivider && b.text == "" && b.listPrefix == ""
+		if isEmpty {
+			if lastEmpty {
+				continue
+			}
+			lastEmpty = true
+		} else {
+			lastEmpty = false
+		}
+		deduped = append(deduped, b)
+	}
+	blocks = deduped
 
 	var lines []string
 	for _, b := range blocks {

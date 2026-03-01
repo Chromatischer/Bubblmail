@@ -151,10 +151,22 @@ func (v *ReaderView) View() string {
 		Foreground(theme.Text).
 		Bold(true)
 
-	fromStr := addressListStr(v.message.From)
-	toStr := addressListStr(v.message.To)
-	dateStr := util.FormatDateLong(v.message.Date) + "  " + v.message.Date.Format("15:04")
-	subjectStr := v.message.Subject
+	// maxValW: visible columns available for header values.
+	// Label = 10, separator = 2, so value must be ≤ v.width-12.
+	// Subject also reserves 2 cols for the " ★" star indicator.
+	maxValW := v.width - 12
+	if maxValW < 10 {
+		maxValW = 10
+	}
+	maxSubjectW := maxValW - 2
+	if maxSubjectW < 5 {
+		maxSubjectW = 5
+	}
+
+	fromStr := util.TruncateText(addressListStr(v.message.From), maxValW)
+	toStr := util.TruncateText(addressListStr(v.message.To), maxValW)
+	dateStr := util.TruncateText(util.FormatDateLong(v.message.Date)+"  "+v.message.Date.Format("15:04"), maxValW)
+	subjectStr := util.TruncateText(v.message.Subject, maxSubjectW)
 
 	stars := ""
 	if v.message.IsStarred() {
