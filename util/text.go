@@ -15,6 +15,17 @@ func TruncateText(s string, maxCols int) string {
 	return runewidth.Truncate(s, maxCols, "…")
 }
 
+// SingleLine replaces newline and carriage-return characters with spaces so
+// the result never spans more than one terminal line.
+func SingleLine(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' {
+			return ' '
+		}
+		return r
+	}, s)
+}
+
 // VisibleWidth returns the number of terminal columns occupied by s.
 // ANSI escape codes (CSI and OSC) are stripped before measurement.
 func VisibleWidth(s string) int {
@@ -156,6 +167,35 @@ func splitToWrapWords(s string) []wrapWord {
 	return words
 }
 
+// clampWrapWord truncates a wrapWord so its visible width fits within maxCols.
+// For OSC 8 hyperlinks the URL is preserved; only the display text is trimmed.
+// For plain words the ANSI codes are stripped and the text is truncated.
+func clampWrapWord(w wrapWord, maxCols int) wrapWord {
+	if w.visW <= maxCols {
+		return w
+	}
+	const osc8Prefix = "\x1b]8;;"
+	const osc8Close = "\x1b]8;;\x07"
+	if strings.HasPrefix(w.raw, osc8Prefix) {
+		rest := w.raw[len(osc8Prefix):]
+		belIdx := strings.IndexByte(rest, '\x07')
+		if belIdx >= 0 {
+			url := rest[:belIdx]
+			afterBel := rest[belIdx+1:]
+			closeIdx := strings.Index(afterBel, osc8Close)
+			if closeIdx >= 0 {
+				displayText := afterBel[:closeIdx]
+				truncated := runewidth.Truncate(StripANSI(displayText), maxCols, "…")
+				newRaw := osc8Prefix + url + "\x07" + truncated + osc8Close
+				return wrapWord{raw: newRaw, visW: runewidth.StringWidth(truncated)}
+			}
+		}
+	}
+	// Plain (or unrecognised): strip ANSI and truncate.
+	plain := runewidth.Truncate(StripANSI(w.raw), maxCols, "…")
+	return wrapWord{raw: plain, visW: runewidth.StringWidth(plain)}
+}
+
 func wrapANSILine(s string, maxCols int) []string {
 	if VisibleWidth(s) <= maxCols {
 		return []string{s}
@@ -171,6 +211,11 @@ func wrapANSILine(s string, maxCols int) []string {
 	currentW := 0
 
 	for _, w := range words {
+		// A single word wider than the column limit must be clamped so the
+		// resulting line never causes the terminal to wrap unexpectedly.
+		if w.visW > maxCols {
+			w = clampWrapWord(w, maxCols)
+		}
 		if currentW == 0 {
 			current = w.raw
 			currentW = w.visW

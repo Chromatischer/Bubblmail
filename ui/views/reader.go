@@ -163,10 +163,10 @@ func (v *ReaderView) View() string {
 		maxSubjectW = 5
 	}
 
-	fromStr := util.TruncateText(addressListStr(v.message.From), maxValW)
-	toStr := util.TruncateText(addressListStr(v.message.To), maxValW)
+	fromStr := util.TruncateText(util.SingleLine(addressListStr(v.message.From)), maxValW)
+	toStr := util.TruncateText(util.SingleLine(addressListStr(v.message.To)), maxValW)
 	dateStr := util.TruncateText(util.FormatDateLong(v.message.Date)+"  "+v.message.Date.Format("15:04"), maxValW)
-	subjectStr := util.TruncateText(v.message.Subject, maxSubjectW)
+	subjectStr := util.TruncateText(util.SingleLine(v.message.Subject), maxSubjectW)
 
 	stars := ""
 	if v.message.IsStarred() {

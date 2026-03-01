@@ -271,10 +271,10 @@ func renderBlocks(blocks []block, width int, theme *config.Theme) []string {
 		}
 
 		if b.isCode {
-			// No wrapping; cap to width
+			// No wrapping; cap to width using rune-aware truncation.
 			line := b.text
 			if util.VisibleWidth(line) > width {
-				line = line[:width]
+				line = util.TruncateText(line, width)
 			}
 			lines = append(lines, line)
 			continue
