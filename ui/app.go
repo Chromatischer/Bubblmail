@@ -688,12 +688,26 @@ func (a *App) senderAddress() data.Address {
 }
 
 func (a *App) toggleStar() tea.Cmd {
-	msg := a.currentMessage()
+	t := a.inboxView.SelectedThread()
+	if t == nil {
+		return nil
+	}
+	msg := t.Latest()
 	if msg == nil {
 		return nil
 	}
 	starred := msg.IsStarred()
-	_ = a.store.SetFlags(a.activeAccount, a.activeFolder, msg.UID, toggleFlag(msg.Flags, data.FlagFlagged, !starred))
+	newFlags := toggleFlag(msg.Flags, data.FlagFlagged, !starred)
+	_ = a.store.SetFlags(a.activeAccount, a.activeFolder, msg.UID, newFlags)
+	msg.Flags = newFlags
+	// Recompute thread aggregate so the inbox re-renders immediately.
+	t.Starred = false
+	for _, m := range t.Messages {
+		if m.IsStarred() {
+			t.Starred = true
+			break
+		}
+	}
 	client, ok := a.imapClients[a.activeAccount]
 	if ok {
 		return client.SetFlag(a.activeFolder, msg.UID, data.FlagFlagged, !starred)
@@ -702,7 +716,11 @@ func (a *App) toggleStar() tea.Cmd {
 }
 
 func (a *App) toggleRead() tea.Cmd {
-	msg := a.currentMessage()
+	t := a.inboxView.SelectedThread()
+	if t == nil {
+		return nil
+	}
+	msg := t.Latest()
 	if msg == nil {
 		return nil
 	}
@@ -710,6 +728,14 @@ func (a *App) toggleRead() tea.Cmd {
 	newFlags := toggleFlag(msg.Flags, data.FlagSeen, !read)
 	_ = a.store.SetFlags(a.activeAccount, a.activeFolder, msg.UID, newFlags)
 	msg.Flags = newFlags
+	// Recompute thread aggregate so the inbox re-renders immediately.
+	t.HasUnread = false
+	for _, m := range t.Messages {
+		if !m.IsRead() {
+			t.HasUnread = true
+			break
+		}
+	}
 	client, ok := a.imapClients[a.activeAccount]
 	if ok {
 		return client.SetFlag(a.activeFolder, msg.UID, data.FlagSeen, !read)

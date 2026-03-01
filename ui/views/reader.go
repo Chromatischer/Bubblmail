@@ -7,6 +7,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/data"
+	"github.com/bubblmail/bubblmail/render"
 	"github.com/bubblmail/bubblmail/util"
 )
 
@@ -107,31 +108,23 @@ func (v *ReaderView) bodyHeight() int {
 	return h
 }
 
-// buildLines wraps the body into display lines.
+// buildLines renders the body into display lines using the rich renderer.
 func (v *ReaderView) buildLines() {
 	if v.message == nil {
 		v.lines = nil
 		return
 	}
-	body := v.message.Body
-	if body == "" {
-		body = "(No body loaded — press Enter to fetch)"
+	plainBody := v.message.Body
+	htmlBody := v.message.HTMLBody
+	if plainBody == "" && htmlBody == "" {
+		v.lines = []string{"(No body loaded — press Enter to fetch)"}
+		return
 	}
 	textWidth := v.width - 2
 	if textWidth < 20 {
 		textWidth = 20
 	}
-	// Split into paragraphs then word-wrap
-	var lines []string
-	for _, para := range strings.Split(body, "\n") {
-		if para == "" {
-			lines = append(lines, "")
-			continue
-		}
-		wrapped := util.WrapText(para, textWidth)
-		lines = append(lines, wrapped...)
-	}
-	v.lines = lines
+	v.lines = render.RenderBody(plainBody, htmlBody, textWidth, v.theme)
 }
 
 // View renders the message reader.
@@ -196,8 +189,8 @@ func (v *ReaderView) View() string {
 		visibleBody = append(visibleBody, "")
 	}
 
+	// Use default foreground so per-line ANSI colours from the renderer are preserved.
 	bodyStr := lipgloss.NewStyle().
-		Foreground(theme.Text).
 		Width(v.width).
 		Render(strings.Join(visibleBody, "\n"))
 

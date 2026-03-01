@@ -261,7 +261,7 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	fromRendered := fromStyle.Render(util.PadRight(fromTrunc, fromW))
 
 	// Row 1: flag + dot + space + from [+ tags] + gap + date
-	row1Parts := flag + dot + " " + fromRendered
+	row1Parts := flag + dot + sel(lipgloss.NewStyle()).Render(" ") + fromRendered
 	if tagStr != "" {
 		row1Parts += " " + tagStr
 	}
