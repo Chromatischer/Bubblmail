@@ -156,13 +156,33 @@ func renderHTML(htmlBody string, width int, theme *config.Theme) []string {
 				collectText(n, &sb)
 				linkText := strings.TrimSpace(sb.String())
 				if linkText == "" {
-					// No visible text (e.g. image-only or structural links) — skip.
+					// Fall back to alt text from any child <img>.
+					linkText = collectImgAlt(n)
+				}
+				if linkText == "" {
+					// Still no text — walk children generically so nested content isn't lost.
+					for c := n.FirstChild; c != nil; c = c.NextSibling {
+						walker(c, quoteDepth, inCode, listCounters)
+					}
 					return
 				}
 				if href != "" {
 					appendText(&blocks, hyperlink(href, linkText, theme.Accent), quoteDepth)
 				} else {
 					appendText(&blocks, linkText, quoteDepth)
+				}
+				return
+
+			case "td", "th":
+				// Treat each cell as a block: inject paragraph separation before and after.
+				if len(blocks) > 0 && blocks[len(blocks)-1].text != "" {
+					blocks = append(blocks, block{text: ""})
+				}
+				for c := n.FirstChild; c != nil; c = c.NextSibling {
+					walker(c, quoteDepth, inCode, listCounters)
+				}
+				if len(blocks) > 0 && blocks[len(blocks)-1].text != "" {
+					blocks = append(blocks, block{text: ""})
 				}
 				return
 
@@ -324,10 +344,20 @@ func renderBlocks(blocks []block, width int, theme *config.Theme) []string {
 	return lines
 }
 
-// collectText recursively collects all text node content under n.
+// collectText recursively collects all text node content under n, normalising
+// whitespace so that newlines and tabs never appear in the result. Words from
+// adjacent elements are separated by a single space.
 func collectText(n *html.Node, sb *strings.Builder) {
 	if n.Type == html.TextNode {
-		sb.WriteString(n.Data)
+		// Collapse all whitespace runs (including \n and \t) to single spaces.
+		t := strings.Join(strings.Fields(n.Data), " ")
+		if t == "" {
+			return
+		}
+		if sb.Len() > 0 {
+			sb.WriteByte(' ')
+		}
+		sb.WriteString(t)
 		return
 	}
 	for c := n.FirstChild; c != nil; c = c.NextSibling {
@@ -340,6 +370,20 @@ func collectText(n *html.Node, sb *strings.Builder) {
 		}
 		collectText(c, sb)
 	}
+}
+
+// collectImgAlt finds the first <img> descendant of n and returns its alt
+// attribute value, trimmed of whitespace. Returns "" if none found.
+func collectImgAlt(n *html.Node) string {
+	if n.Type == html.ElementNode && strings.ToLower(n.Data) == "img" {
+		return strings.TrimSpace(attrVal(n, "alt"))
+	}
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if alt := collectImgAlt(c); alt != "" {
+			return alt
+		}
+	}
+	return ""
 }
 
 // cleanText normalises whitespace in text nodes.

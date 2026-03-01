@@ -272,13 +272,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.flash("Cache error: "+err.Error(), "err")
 			}
 		}
-		// Update reader view if still showing same message
-		if v := a.readerView; v != nil {
-			if cur := a.currentMessage(); cur != nil && cur.UID == msg.UID {
-				cur.Body = msg.Text
-				cur.HTMLBody = msg.HTML
-				v.SetMessage(cur)
-			}
+		// Update reader view — works for both thread and single-message mode.
+		if a.viewID == ViewReader {
+			a.readerView.UpdateMessageBody(msg.UID, msg.Text, msg.HTML)
 		}
 		return a, nil
 
@@ -583,8 +579,8 @@ func (a *App) handleEnter() tea.Cmd {
 	switch a.viewID {
 	case ViewInbox:
 		t := a.inboxView.SelectedThread()
-		if t != nil && t.Latest() != nil {
-			return a.openMessage(t.Latest())
+		if t != nil {
+			return a.openThread(t)
 		}
 	case ViewFolder:
 		f := a.folderView.SelectedFolder()
@@ -627,6 +623,39 @@ func (a *App) openMessage(msg *data.Message) tea.Cmd {
 	}
 
 	return tea.Batch(markCmd, fetchCmd)
+}
+
+// openThread opens a full thread in the reader, fetching bodies for any
+// messages that haven't been loaded yet.
+func (a *App) openThread(t *data.Thread) tea.Cmd {
+	a.readerView.SetThread(t)
+	a.viewID = ViewReader
+
+	var cmds []tea.Cmd
+
+	// Mark the latest (most recent) message as read.
+	latest := t.Latest()
+	if latest != nil && !latest.IsRead() {
+		client, ok := a.imapClients[a.activeAccount]
+		if ok {
+			cmds = append(cmds, client.SetFlag(a.activeFolder, latest.UID, data.FlagSeen, true))
+		}
+		_ = a.store.SetFlags(a.activeAccount, a.activeFolder, latest.UID,
+			append(latest.Flags, data.FlagSeen))
+		latest.Flags = append(latest.Flags, data.FlagSeen)
+	}
+
+	// Fetch body for every message in the thread that doesn't have one yet.
+	client, ok := a.imapClients[a.activeAccount]
+	if ok {
+		for _, msg := range t.Messages {
+			if msg.Body == "" && msg.HTMLBody == "" {
+				cmds = append(cmds, client.FetchBody(a.activeFolder, msg.UID, msg.ID))
+			}
+		}
+	}
+
+	return tea.Batch(cmds...)
 }
 
 func (a *App) fetchMessages() tea.Cmd {
@@ -799,11 +828,10 @@ func (a *App) currentMessage() *data.Message {
 			return t.Latest()
 		}
 	case ViewReader:
-		// readerView stores its own message; return via the inbox thread
-		t := a.inboxView.SelectedThread()
-		if t != nil {
+		if t := a.readerView.CurrentThread(); t != nil {
 			return t.Latest()
 		}
+		return a.readerView.CurrentMessage()
 	}
 	return nil
 }
