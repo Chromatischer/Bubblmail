@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/bubblmail/bubblmail/data"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 //go:embed schema.sql
@@ -168,6 +168,41 @@ func (s *Store) GetMessages(account, folder string, limit int) ([]*data.Message,
 	return scanMessages(rows, account, folder)
 }
 
+// GetMessagesFiltered returns messages filtered by account/folder/unread, newest first.
+// Empty account or folder means "all".
+func (s *Store) GetMessagesFiltered(account, folder string, unreadOnly bool, limit int) ([]*data.Message, error) {
+	query := strings.Builder{}
+	query.WriteString(`
+		SELECT id, uid, 0, message_id, in_reply_to, refs,
+		       subject, from_addr, to_addr, cc_addr, date, flags, size, snippet, thread_id,
+		       account_name, folder_name
+		FROM messages
+		WHERE 1=1
+	`)
+	args := make([]any, 0, 4)
+	if account != "" {
+		query.WriteString(" AND account_name = ?")
+		args = append(args, account)
+	}
+	if folder != "" {
+		query.WriteString(" AND folder_name = ?")
+		args = append(args, folder)
+	}
+	if unreadOnly {
+		query.WriteString(" AND flags NOT LIKE ?")
+		args = append(args, "%\\Seen%")
+	}
+	query.WriteString(" ORDER BY date DESC LIMIT ?")
+	args = append(args, limit)
+
+	rows, err := s.db.Query(query.String(), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanMessagesWithAccount(rows)
+}
+
 // GetMessageByUID returns a single message by account/folder/uid.
 func (s *Store) GetMessageByUID(account, folder string, uid uint32) (*data.Message, error) {
 	row := s.db.QueryRow(`
@@ -253,6 +288,39 @@ func (s *Store) SearchLocal(query string) ([]*data.Message, error) {
 	return scanMessagesWithAccount(rows)
 }
 
+// SearchLocalFiltered performs a full-text search with optional account/folder filters.
+func (s *Store) SearchLocalFiltered(query, account, folder string, limit int) ([]*data.Message, error) {
+	sql := strings.Builder{}
+	sql.WriteString(`
+		SELECT m.id, m.uid, 0, m.message_id, m.in_reply_to, m.refs,
+		       m.subject, m.from_addr, m.to_addr, m.cc_addr, m.date,
+		       m.flags, m.size, m.snippet, m.thread_id,
+		       m.account_name, m.folder_name
+		FROM messages m
+		JOIN messages_fts ON messages_fts.docid = m.id
+		WHERE messages_fts MATCH ?
+	`)
+	args := make([]any, 0, 4)
+	args = append(args, query)
+	if account != "" {
+		sql.WriteString(" AND m.account_name = ?")
+		args = append(args, account)
+	}
+	if folder != "" {
+		sql.WriteString(" AND m.folder_name = ?")
+		args = append(args, folder)
+	}
+	sql.WriteString(" ORDER BY m.date DESC LIMIT ?")
+	args = append(args, limit)
+
+	rows, err := s.db.Query(sql.String(), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanMessagesWithAccount(rows)
+}
+
 // SetFlags updates flags for a message by UID.
 func (s *Store) SetFlags(account, folder string, uid uint32, flags []data.Flag) error {
 	_, err := s.db.Exec(`
@@ -329,6 +397,32 @@ func (s *Store) GetFolders(account string) ([]*data.Folder, error) {
 		f := &data.Folder{AccountName: account}
 		var attrs string
 		if err := rows.Scan(&f.Name, &f.DisplayName, &f.Delimiter, &attrs, &f.Depth, &f.Unread, &f.Total); err != nil {
+			return nil, err
+		}
+		if attrs != "" {
+			f.Attributes = strings.Split(attrs, " ")
+		}
+		folders = append(folders, f)
+	}
+	return folders, rows.Err()
+}
+
+// GetAllFolders returns folders across all accounts with counts.
+func (s *Store) GetAllFolders() ([]*data.Folder, error) {
+	rows, err := s.db.Query(`
+		SELECT account_name, name, display_name, delimiter, attributes, depth, unread, total
+		FROM folders ORDER BY account_name, name
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var folders []*data.Folder
+	for rows.Next() {
+		f := &data.Folder{}
+		var attrs string
+		if err := rows.Scan(&f.AccountName, &f.Name, &f.DisplayName, &f.Delimiter, &attrs, &f.Depth, &f.Unread, &f.Total); err != nil {
 			return nil, err
 		}
 		if attrs != "" {
