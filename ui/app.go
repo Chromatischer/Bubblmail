@@ -376,6 +376,16 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case tea.MouseMsg:
+		if a.comp.IsActive() {
+			if a.comp.HandleMouse(msg) {
+				if r := a.comp.Result(); r != nil {
+					cmd := a.handleComposerResult(r)
+					a.comp.ClearResult()
+					return a, cmd
+				}
+				return a, nil
+			}
+		}
 		return a.handleMouse(msg)
 
 	case tea.KeyMsg:
@@ -387,6 +397,17 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
+
+	// 1. Composer captures all keys when active
+	if a.comp.IsActive() {
+		a.comp.HandleKey(key)
+		if r := a.comp.Result(); r != nil {
+			cmd := a.handleComposerResult(r)
+			a.comp.ClearResult()
+			return a, cmd
+		}
+		return a, nil
+	}
 
 	if key != "q" {
 		a.quitPending = false
@@ -413,17 +434,6 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return quitTimeoutMsg{}
 				}),
 			)
-		}
-		return a, nil
-	}
-
-	// 1. Composer captures all keys when active
-	if a.comp.IsActive() {
-		a.comp.HandleKey(key)
-		if r := a.comp.Result(); r != nil {
-			cmd := a.handleComposerResult(r)
-			a.comp.ClearResult()
-			return a, cmd
 		}
 		return a, nil
 	}

@@ -81,6 +81,7 @@ func (sb *StatusBar) View(context string) string {
 		hints = []hint{
 			{icons.Send, "ctrl+enter", "send"},
 			{icons.ChevronRight, "tab", "next field"},
+			{icons.ArrowUpDown, "pgup/pgdn", "scroll"},
 			{icons.Close, "esc", "cancel"},
 		}
 	case "reader":

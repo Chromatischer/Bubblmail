@@ -3,16 +3,17 @@ package composer
 import (
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/data"
 	outsmtp "github.com/bubblmail/bubblmail/smtp"
+	"github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // Result holds the outcome of a composer interaction.
 type Result struct {
-	Action  string // "send", "cancel"
-	Draft   *outsmtp.ComposedMessage
+	Action string // "send", "cancel"
+	Draft  *outsmtp.ComposedMessage
 }
 
 // Composer is the full-screen email composition overlay.
@@ -23,10 +24,17 @@ type Composer struct {
 	active  bool
 	result  *Result
 	focused int // 0=To, 1=CC, 2=Subject, 3=Body
+	mode    string
+	bodyTop int
 
 	fields []*Field
 	from   data.Address
 }
+
+const (
+	composerLabelWidth = 10
+	composerFieldSep   = " │ "
+)
 
 // NewComposer creates a new composer overlay.
 func NewComposer(theme *config.Theme) *Composer {
@@ -39,6 +47,8 @@ func (c *Composer) OpenNew(from data.Address) {
 	c.active = true
 	c.result = nil
 	c.focused = 0
+	c.mode = "New Message"
+	c.bodyTop = 0
 	c.fields = []*Field{
 		{Label: "To", Kind: FieldText},
 		{Label: "CC", Kind: FieldText},
@@ -53,20 +63,18 @@ func (c *Composer) OpenReply(from data.Address, orig *data.Message, replyAll boo
 	c.active = true
 	c.result = nil
 	c.focused = 3 // jump to body
-
-	to := ""
-	if len(orig.From) > 0 {
-		to = orig.From[0].Address
+	c.bodyTop = 0
+	if replyAll {
+		c.mode = "Reply All"
+	} else {
+		c.mode = "Reply"
 	}
+
+	replyTo := primaryReplyAddress(orig)
+	to := replyTo.Address
 	cc := ""
-	if replyAll && len(orig.To) > 0 {
-		var ccParts []string
-		for _, a := range orig.To {
-			if a.Address != from.Address {
-				ccParts = append(ccParts, a.Address)
-			}
-		}
-		cc = strings.Join(ccParts, ", ")
+	if replyAll {
+		cc = addressListString(filterSelf(orig.To, from.Address))
 	}
 	subject := orig.Subject
 	if !strings.HasPrefix(strings.ToLower(subject), "re:") {
@@ -75,9 +83,9 @@ func (c *Composer) OpenReply(from data.Address, orig *data.Message, replyAll boo
 	body := quoteBody(orig)
 
 	c.fields = []*Field{
-		{Label: "To", Kind: FieldText, Value: to, cursor: len(to)},
-		{Label: "CC", Kind: FieldText, Value: cc, cursor: len(cc)},
-		{Label: "Subject", Kind: FieldText, Value: subject, cursor: len(subject)},
+		{Label: "To", Kind: FieldText, Value: to, cursor: len([]rune(to))},
+		{Label: "CC", Kind: FieldText, Value: cc, cursor: len([]rune(cc))},
+		{Label: "Subject", Kind: FieldText, Value: subject, cursor: len([]rune(subject))},
 		{Label: "Body", Kind: FieldTextArea, Value: body, cursor: 0},
 	}
 }
@@ -88,6 +96,8 @@ func (c *Composer) OpenForward(from data.Address, orig *data.Message) {
 	c.active = true
 	c.result = nil
 	c.focused = 0
+	c.mode = "Forward"
+	c.bodyTop = 0
 
 	subject := orig.Subject
 	if !strings.HasPrefix(strings.ToLower(subject), "fwd:") {
@@ -98,7 +108,7 @@ func (c *Composer) OpenForward(from data.Address, orig *data.Message) {
 	c.fields = []*Field{
 		{Label: "To", Kind: FieldText},
 		{Label: "CC", Kind: FieldText},
-		{Label: "Subject", Kind: FieldText, Value: subject, cursor: len(subject)},
+		{Label: "Subject", Kind: FieldText, Value: subject, cursor: len([]rune(subject))},
 		{Label: "Body", Kind: FieldTextArea, Value: body, cursor: 0},
 	}
 }
@@ -122,12 +132,16 @@ func (c *Composer) ClearResult() {
 func (c *Composer) SetSize(w, h int) {
 	c.width = w
 	c.height = h
+	c.ensureBodyVisible()
 }
 
 // HandleKey processes a key press.
 func (c *Composer) HandleKey(key string) {
 	if !c.active {
 		return
+	}
+	if c.focused < 0 || c.focused >= len(c.fields) {
+		c.focused = 0
 	}
 	f := c.fields[c.focused]
 
@@ -144,6 +158,22 @@ func (c *Composer) HandleKey(key string) {
 		return
 	case "shift+tab":
 		c.focused = (c.focused - 1 + len(c.fields)) % len(c.fields)
+		return
+	case "up":
+		if f.Kind == FieldTextArea {
+			f.cursorMoveLines(-1)
+			return
+		}
+	case "down":
+		if f.Kind == FieldTextArea {
+			f.cursorMoveLines(1)
+			return
+		}
+	case "pgup":
+		c.scrollBody(-1)
+		return
+	case "pgdn":
+		c.scrollBody(1)
 		return
 	case "enter":
 		if f.Kind == FieldTextArea {
@@ -173,6 +203,26 @@ func (c *Composer) HandleKey(key string) {
 			f.insert(key)
 		}
 	}
+	c.ensureBodyVisible()
+}
+
+// HandleMouse processes mouse input for composer scrolling.
+func (c *Composer) HandleMouse(msg tea.MouseMsg) bool {
+	if !c.active {
+		return false
+	}
+	if msg.Action != tea.MouseActionPress {
+		return false
+	}
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		c.scrollBody(-1)
+		return true
+	case tea.MouseButtonWheelDown:
+		c.scrollBody(1)
+		return true
+	}
+	return false
 }
 
 // submit builds the draft and sets the result.
@@ -216,7 +266,11 @@ func (c *Composer) View() string {
 		Align(lipgloss.Center).
 		Width(boxWidth - 4)
 
-	title := titleStyle.Render("New Message")
+	mode := c.mode
+	if mode == "" {
+		mode = "New Message"
+	}
+	title := titleStyle.Render(mode)
 
 	divider := lipgloss.NewStyle().
 		Foreground(theme.Border).
@@ -231,36 +285,50 @@ func (c *Composer) View() string {
 		ef.SetWidth(boxWidth - 4)
 
 		if f.Kind == FieldTextArea {
-			// Render multi-line body
-			rows = append(rows, ef.View())
-			// Show additional body lines
+			// Render multi-line body (no single-line field row)
+			labelStyle := lipgloss.NewStyle().
+				Foreground(theme.TextMuted).
+				Width(composerLabelWidth).
+				Align(lipgloss.Right)
+			sepStyle := lipgloss.NewStyle().
+				Foreground(theme.Border)
+			label := labelStyle.Render(f.Label + ":")
+			sep := sepStyle.Render(composerFieldSep)
+			prefixWidth := lipgloss.Width(label + sep)
+			indent := strings.Repeat(" ", prefixWidth)
+			textW := boxWidth - 4 - prefixWidth
+			if textW < 1 {
+				textW = 1
+			}
 			bodyLines := strings.Split(f.Value, "\n")
 			bodyH := c.height - len(rows) - 6
 			if bodyH < 3 {
 				bodyH = 3
 			}
-			// Show visible portion of body
-			start := 0
-			if len(bodyLines) > bodyH {
-				// Find current line from cursor
-				before := f.Value[:f.cursor]
-				currentLine := strings.Count(before, "\n")
-				start = currentLine - bodyH + 1
-				if start < 0 {
-					start = 0
-				}
-			}
-			end := start + bodyH
-			if end > len(bodyLines) {
-				end = len(bodyLines)
-			}
+			start, end := c.bodyWindow(f, bodyH)
 			visible := bodyLines[start:end]
-			for _, line := range visible {
+			for idx, line := range visible {
 				lineStyle := lipgloss.NewStyle().
 					Foreground(theme.Text).
 					Background(theme.SurfaceAlt).
-					Width(boxWidth - 4)
-				rows = append(rows, "           "+lineStyle.Render(line))
+					Width(textW)
+				display := line
+				if i == c.focused {
+					cursorLine := c.cursorLine(f)
+					if cursorLine == start+idx {
+						col := c.cursorColumn(f)
+						lineRunes := []rune(line)
+						if col > len(lineRunes) {
+							col = len(lineRunes)
+						}
+						display = string(lineRunes[:col]) + "▌" + string(lineRunes[col:])
+					}
+				}
+				prefix := indent
+				if start == 0 && idx == 0 {
+					prefix = label + sep
+				}
+				rows = append(rows, prefix+lineStyle.Render(display))
 			}
 		} else {
 			rows = append(rows, ef.View())
@@ -274,7 +342,7 @@ func (c *Composer) View() string {
 		Background(theme.Surface).
 		Align(lipgloss.Center).
 		Width(boxWidth - 4)
-	rows = append(rows, hintStyle.Render("ctrl+enter send  ·  tab next field  ·  esc cancel"))
+	rows = append(rows, hintStyle.Render("ctrl+enter send  ·  tab next field  ·  ↑/↓ move line  ·  pgup/pgdn scroll  ·  esc cancel"))
 
 	content := strings.Join(rows, "\n")
 
@@ -330,4 +398,130 @@ func forwardBody(msg *data.Message) string {
 	sb.WriteString("\n\n")
 	sb.WriteString(msg.Body)
 	return sb.String()
+}
+
+func primaryReplyAddress(msg *data.Message) data.Address {
+	if len(msg.From) > 0 {
+		return msg.From[0]
+	}
+	return data.Address{}
+}
+
+func filterSelf(addrs []data.Address, self string) []data.Address {
+	if self == "" {
+		return addrs
+	}
+	var out []data.Address
+	for _, a := range addrs {
+		if strings.EqualFold(a.Address, self) {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+func addressListString(addrs []data.Address) string {
+	if len(addrs) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		if a.Address == "" {
+			continue
+		}
+		parts = append(parts, a.Address)
+	}
+	return strings.Join(parts, ", ")
+}
+
+func (c *Composer) bodyWindow(f *Field, bodyH int) (int, int) {
+	lines := strings.Split(f.Value, "\n")
+	if len(lines) == 0 {
+		return 0, 0
+	}
+	maxTop := len(lines) - bodyH
+	if maxTop < 0 {
+		maxTop = 0
+	}
+	if c.bodyTop > maxTop {
+		c.bodyTop = maxTop
+	}
+	if c.bodyTop < 0 {
+		c.bodyTop = 0
+	}
+	end := c.bodyTop + bodyH
+	if end > len(lines) {
+		end = len(lines)
+	}
+	return c.bodyTop, end
+}
+
+func (c *Composer) cursorLine(f *Field) int {
+	byteIdx := f.cursorByteIndex()
+	return strings.Count(f.Value[:byteIdx], "\n")
+}
+
+func (c *Composer) cursorColumn(f *Field) int {
+	byteIdx := f.cursorByteIndex()
+	before := f.Value[:byteIdx]
+	lastIdx := strings.LastIndex(before, "\n")
+	if lastIdx < 0 {
+		return len([]rune(before))
+	}
+	return len([]rune(before[lastIdx+1:]))
+}
+
+func (c *Composer) ensureBodyVisible() {
+	if c.focused >= len(c.fields) {
+		return
+	}
+	f := c.fields[c.focused]
+	if f.Kind != FieldTextArea {
+		return
+	}
+	bodyH := c.height - 6 - len(c.fields)
+	if bodyH < 3 {
+		bodyH = 3
+	}
+	line := c.cursorLine(f)
+	if line < c.bodyTop {
+		c.bodyTop = line
+	}
+	if line >= c.bodyTop+bodyH {
+		c.bodyTop = line - bodyH + 1
+	}
+	maxTop := strings.Count(f.Value, "\n") - bodyH + 1
+	if maxTop < 0 {
+		maxTop = 0
+	}
+	if c.bodyTop > maxTop {
+		c.bodyTop = maxTop
+	}
+}
+
+func (c *Composer) scrollBody(delta int) {
+	if c.focused >= len(c.fields) {
+		return
+	}
+	f := c.fields[c.focused]
+	if f.Kind != FieldTextArea {
+		return
+	}
+	bodyH := c.height - 6 - len(c.fields)
+	if bodyH < 3 {
+		bodyH = 3
+	}
+	lines := strings.Split(f.Value, "\n")
+	maxTop := len(lines) - bodyH
+	if maxTop < 0 {
+		maxTop = 0
+	}
+	c.bodyTop += delta * (bodyH / 2)
+	if c.bodyTop < 0 {
+		c.bodyTop = 0
+	}
+	if c.bodyTop > maxTop {
+		c.bodyTop = maxTop
+	}
 }

@@ -4,8 +4,8 @@ package composer
 import (
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
 	"github.com/bubblmail/bubblmail/config"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // Field types for the composer form.
@@ -21,59 +21,100 @@ type Field struct {
 	Label  string
 	Kind   FieldKind
 	Value  string
-	cursor int // byte position within Value
+	cursor int // rune position within Value
 }
+
+const (
+	labelWidth = 10
+	fieldSep   = " │ "
+)
 
 // insert inserts s at cursor position.
 func (f *Field) insert(s string) {
-	f.Value = f.Value[:f.cursor] + s + f.Value[f.cursor:]
-	f.cursor += len(s)
+	byteIdx := f.cursorByteIndex()
+	f.Value = f.Value[:byteIdx] + s + f.Value[byteIdx:]
+	f.cursor += len([]rune(s))
 }
 
 // backspace deletes the character before cursor.
 func (f *Field) backspace() {
-	if f.cursor == 0 {
+	if f.cursor <= 0 {
 		return
 	}
 	runes := []rune(f.Value)
-	pos := f.runePos()
-	if pos == 0 {
-		return
+	if f.cursor > len(runes) {
+		f.cursor = len(runes)
 	}
-	newRunes := append(runes[:pos-1], runes[pos:]...)
+	newRunes := append(runes[:f.cursor-1], runes[f.cursor:]...)
 	f.Value = string(newRunes)
-	// recalculate cursor
-	f.cursor = len(string(newRunes[:pos-1]))
+	f.cursor--
 }
 
-func (f *Field) runePos() int {
-	return len([]rune(f.Value[:f.cursor]))
+func (f *Field) cursorByteIndex() int {
+	if f.cursor <= 0 {
+		return 0
+	}
+	runes := []rune(f.Value)
+	if f.cursor >= len(runes) {
+		return len(f.Value)
+	}
+	return len(string(runes[:f.cursor]))
+}
+
+func (f *Field) runeIndexFromByte(byteIdx int) int {
+	if byteIdx <= 0 {
+		return 0
+	}
+	if byteIdx >= len(f.Value) {
+		return len([]rune(f.Value))
+	}
+	return len([]rune(f.Value[:byteIdx]))
+}
+
+func (f *Field) lineAndColumn() (int, int, []string) {
+	lines := strings.Split(f.Value, "\n")
+	byteIdx := f.cursorByteIndex()
+	before := f.Value[:byteIdx]
+	line := strings.Count(before, "\n")
+	lastIdx := strings.LastIndex(before, "\n")
+	col := 0
+	if lastIdx < 0 {
+		col = len([]rune(before))
+	} else {
+		col = len([]rune(before[lastIdx+1:]))
+	}
+	return line, col, lines
 }
 
 func (f *Field) cursorLeft() {
 	runes := []rune(f.Value)
-	pos := f.runePos()
-	if pos > 0 {
-		f.cursor = len(string(runes[:pos-1]))
+	if f.cursor > len(runes) {
+		f.cursor = len(runes)
+	}
+	if f.cursor > 0 {
+		f.cursor--
 	}
 }
 
 func (f *Field) cursorRight() {
 	runes := []rune(f.Value)
-	pos := f.runePos()
-	if pos < len(runes) {
-		f.cursor = len(string(runes[:pos+1]))
+	if f.cursor > len(runes) {
+		f.cursor = len(runes)
+	}
+	if f.cursor < len(runes) {
+		f.cursor++
 	}
 }
 
 func (f *Field) cursorHome() {
 	if f.Kind == FieldTextArea {
 		// Move to start of current line
-		idx := strings.LastIndex(f.Value[:f.cursor], "\n")
+		byteIdx := f.cursorByteIndex()
+		idx := strings.LastIndex(f.Value[:byteIdx], "\n")
 		if idx < 0 {
 			f.cursor = 0
 		} else {
-			f.cursor = idx + 1
+			f.cursor = f.runeIndexFromByte(idx + 1)
 		}
 	} else {
 		f.cursor = 0
@@ -82,15 +123,43 @@ func (f *Field) cursorHome() {
 
 func (f *Field) cursorEnd() {
 	if f.Kind == FieldTextArea {
-		idx := strings.Index(f.Value[f.cursor:], "\n")
+		byteIdx := f.cursorByteIndex()
+		idx := strings.Index(f.Value[byteIdx:], "\n")
 		if idx < 0 {
-			f.cursor = len(f.Value)
+			f.cursor = len([]rune(f.Value))
 		} else {
-			f.cursor = f.cursor + idx
+			f.cursor = f.runeIndexFromByte(byteIdx + idx)
 		}
 	} else {
-		f.cursor = len(f.Value)
+		f.cursor = len([]rune(f.Value))
 	}
+}
+
+func (f *Field) cursorMoveLines(delta int) {
+	if f.Kind != FieldTextArea || delta == 0 {
+		return
+	}
+	line, col, lines := f.lineAndColumn()
+	target := line + delta
+	if target < 0 {
+		target = 0
+	}
+	if target >= len(lines) {
+		target = len(lines) - 1
+	}
+	if target < 0 {
+		f.cursor = 0
+		return
+	}
+	lineRunes := []rune(lines[target])
+	if col > len(lineRunes) {
+		col = len(lineRunes)
+	}
+	before := 0
+	for i := 0; i < target; i++ {
+		before += len([]rune(lines[i])) + 1
+	}
+	f.cursor = before + col
 }
 
 // EditorField is the visual component for rendering a single field.
@@ -119,7 +188,7 @@ func (ef *EditorField) SetWidth(w int) {
 // View renders a single form field row.
 func (ef *EditorField) View() string {
 	theme := ef.theme
-	labelW := 10
+	labelW := labelWidth
 
 	labelStyle := lipgloss.NewStyle().
 		Foreground(theme.TextMuted).
@@ -127,41 +196,61 @@ func (ef *EditorField) View() string {
 		Align(lipgloss.Right)
 
 	var valueStyle lipgloss.Style
+	valueW := ef.width - labelW - len(fieldSep)
+	if valueW < 1 {
+		valueW = 1
+	}
 	if ef.active {
 		valueStyle = lipgloss.NewStyle().
 			Foreground(theme.Text).
 			Background(theme.SurfaceAlt).
-			Width(ef.width - labelW - 3)
+			Width(valueW)
 	} else {
 		valueStyle = lipgloss.NewStyle().
 			Foreground(theme.Text).
 			Background(theme.Surface).
-			Width(ef.width - labelW - 3)
+			Width(valueW)
 	}
 
 	label := labelStyle.Render(ef.field.Label + ":")
 	sep := lipgloss.NewStyle().
 		Foreground(theme.Border).
-		Render(" │ ")
+		Render(fieldSep)
 
 	var display string
-	if ef.active {
-		// Insert cursor marker
-		v := ef.field.Value
-		cursor := ef.field.cursor
-		if cursor > len(v) {
-			cursor = len(v)
+	value := ef.field.Value
+	if ef.field.Kind == FieldTextArea {
+		parts := strings.Split(value, "\n")
+		if len(parts) > 0 {
+			value = parts[0]
+		} else {
+			value = ""
 		}
-		display = valueStyle.Render(v[:cursor] + "▌" + v[cursor:])
+	}
+	if ef.active {
+		// Insert cursor marker (textarea cursor is rendered in the body view)
+		runes := []rune(value)
+		if ef.field.Kind == FieldTextArea {
+			display = valueStyle.Render(value)
+		} else {
+			cursor := ef.field.cursor
+			if cursor > len(runes) {
+				cursor = len(runes)
+			}
+			if cursor < 0 {
+				cursor = 0
+			}
+			display = valueStyle.Render(string(runes[:cursor]) + "▌" + string(runes[cursor:]))
+		}
 	} else {
-		if ef.field.Value == "" {
+		if value == "" {
 			display = lipgloss.NewStyle().
 				Foreground(theme.TextFaint).
 				Background(theme.Surface).
-				Width(ef.width - labelW - 3).
+				Width(valueW).
 				Render("(empty)")
 		} else {
-			display = valueStyle.Render(ef.field.Value)
+			display = valueStyle.Render(value)
 		}
 	}
 
