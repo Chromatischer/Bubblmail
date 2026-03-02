@@ -5,17 +5,17 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/data"
 	"github.com/bubblmail/bubblmail/util"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // InboxView displays a scrollable list of email threads.
 // Each thread occupies two rows:
 //
-//	  ● From Name                    tag1  tag2     Jun 12
-//	    Re: Subject truncated…                   (3 msgs)
+//	● From Name                    tag1  tag2     Jun 12
+//	  Re: Subject truncated…                   (3 msgs)
 type InboxView struct {
 	theme   *config.Theme
 	width   int
@@ -216,34 +216,66 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	}
 
 	// From field
-	fromStr := t.Messages[0].FromString()
+	fromStr := util.SingleLine(t.Messages[0].FromString())
 	if t.HasUnread {
 		if latest := t.Latest(); latest != nil {
-			fromStr = latest.FromString()
+			fromStr = util.SingleLine(latest.FromString())
 		}
 	}
 
 	// Tags
-	tagStr := ""
+	var tagStr string
 	if len(t.Tags) > 0 {
 		tagStyle := lipgloss.NewStyle().
 			Foreground(theme.Background).
 			Background(theme.Accent).
 			Padding(0, 1)
-		var tagParts []string
-		for _, tag := range t.Tags {
-			if len(tagParts) >= 2 { // show at most 2 tags
-				break
+		minFromW := 5
+		maxTagW := w - 3 - lipgloss.Width(util.FormatDate(t.LastDate)) - 2 - minFromW
+		if maxTagW > 0 {
+			var tagParts []string
+			usedW := 0
+			for _, tag := range t.Tags {
+				if len(tagParts) >= 2 { // show at most 2 tags
+					break
+				}
+				remaining := maxTagW - usedW
+				if len(tagParts) > 0 {
+					remaining--
+				}
+				if remaining <= 2 {
+					break
+				}
+				labelMax := remaining - 2
+				if labelMax < 1 {
+					break
+				}
+				label := util.TruncateText(util.SingleLine(tag), labelMax)
+				part := tagStyle.Render(label)
+				partW := util.VisibleWidth(part)
+				if partW > remaining {
+					labelMax = remaining - 2
+					if labelMax < 1 {
+						break
+					}
+					label = util.TruncateText(label, labelMax)
+					part = tagStyle.Render(label)
+					partW = util.VisibleWidth(part)
+				}
+				tagParts = append(tagParts, part)
+				usedW += partW
+				if len(tagParts) > 0 {
+					usedW++
+				}
 			}
-			tagParts = append(tagParts, tagStyle.Render(tag))
+			tagStr = strings.Join(tagParts, " ")
 		}
-		tagStr = strings.Join(tagParts, " ")
 	}
 
 	// Date — right side of row 1
 	dateRendered := sel(lipgloss.NewStyle().Foreground(fgMuted)).Render(util.FormatDate(t.LastDate))
-	dateW := lipgloss.Width(dateRendered)
-	tagW := lipgloss.Width(tagStr)
+	dateW := util.VisibleWidth(dateRendered)
+	tagW := util.VisibleWidth(tagStr)
 
 	// Prefix: cursor(1) + dot(1) + space(1) = 3 cols
 	fromW := w - 3 - tagW - dateW - 2
@@ -265,7 +297,7 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	if tagStr != "" {
 		row1Parts += " " + tagStr
 	}
-	gap1 := w - lipgloss.Width(row1Parts) - dateW
+	gap1 := w - util.VisibleWidth(row1Parts) - dateW
 	if gap1 < 1 {
 		gap1 = 1
 	}
@@ -273,10 +305,10 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	row1 := sel(lipgloss.NewStyle().Width(w)).Render(row1Parts + gapStr1 + dateRendered)
 
 	// Row 2: indent + subject + gap + count
-	subject := t.Subject
+	subject := util.SingleLine(t.Subject)
 	if subject == "" {
 		if latest := t.Latest(); latest != nil {
-			subject = latest.Subject
+			subject = util.SingleLine(latest.Subject)
 		}
 	}
 
@@ -284,7 +316,7 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	if len(t.Messages) > 1 {
 		countStr = sel(lipgloss.NewStyle().Foreground(fgMuted)).Render(fmt.Sprintf("(%d)", len(t.Messages)))
 	}
-	countW := lipgloss.Width(countStr)
+	countW := util.VisibleWidth(countStr)
 
 	subjectW := w - 5 - countW
 	if subjectW < 5 {
@@ -293,7 +325,7 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	subjectTrunc := util.TruncateText(subject, subjectW)
 	subjectRendered := sel(lipgloss.NewStyle().Foreground(fgMuted)).Render("   " + subjectTrunc)
 
-	gap2 := w - lipgloss.Width(subjectRendered) - countW
+	gap2 := w - util.VisibleWidth(subjectRendered) - countW
 	if gap2 < 1 {
 		gap2 = 1
 	}

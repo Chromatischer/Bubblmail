@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/bubblmail/bubblmail/util"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -67,7 +68,7 @@ func (h *Header) View() string {
 			Render("✗ sync error")
 	}
 
-	row1Width := h.width - lipgloss.Width(appName) - lipgloss.Width(syncStr) - 2
+	row1Width := h.width - lipgloss.Width(appName) - util.VisibleWidth(syncStr) - 2
 	if row1Width < 0 {
 		row1Width = 0
 	}
@@ -78,25 +79,68 @@ func (h *Header) View() string {
 		Render(appName + gap1 + syncStr)
 
 	// Row 2: account + folder breadcrumb
+	acctRaw := util.SingleLine(h.activeAccount)
+	folderRaw := util.SingleLine(h.activeFolder)
+	sep := " › "
+	maxBreadW := h.width - 3
+	if maxBreadW < 0 {
+		maxBreadW = 0
+	}
+
+	acctW := util.VisibleWidth(acctRaw)
+	folderW := util.VisibleWidth(folderRaw)
+	sepW := util.VisibleWidth(sep)
+
+	if acctRaw != "" && folderRaw != "" {
+		if acctW+sepW+folderW > maxBreadW {
+			minFolderW := 1
+			availableForFolder := maxBreadW - acctW - sepW
+			if availableForFolder < minFolderW {
+				acctAllowed := maxBreadW - sepW - minFolderW
+				if acctAllowed < 0 {
+					acctAllowed = 0
+					sepW = 0
+					minFolderW = maxBreadW
+				}
+				acctRaw = util.TruncateText(acctRaw, acctAllowed)
+				acctW = util.VisibleWidth(acctRaw)
+				availableForFolder = maxBreadW - acctW - sepW
+			}
+			if availableForFolder < 0 {
+				availableForFolder = 0
+			}
+			folderRaw = util.TruncateText(folderRaw, availableForFolder)
+		}
+	} else if acctRaw != "" {
+		acctRaw = util.TruncateText(acctRaw, maxBreadW)
+	} else if folderRaw != "" {
+		folderRaw = util.TruncateText(folderRaw, maxBreadW)
+	}
+
 	var breadcrumb string
-	if h.activeAccount != "" && h.activeFolder != "" {
+	if acctRaw != "" && folderRaw != "" {
 		acctStyle := lipgloss.NewStyle().
 			Foreground(theme.TextMuted)
 		folderStyle := lipgloss.NewStyle().
 			Foreground(theme.Text).
 			Bold(true)
-		breadcrumb = acctStyle.Render(h.activeAccount) + " › " + folderStyle.Render(h.activeFolder)
-	} else if h.activeAccount != "" {
+		breadcrumb = acctStyle.Render(acctRaw) + sep + folderStyle.Render(folderRaw)
+	} else if acctRaw != "" {
 		breadcrumb = lipgloss.NewStyle().
 			Foreground(theme.TextMuted).
-			Render(h.activeAccount)
+			Render(acctRaw)
+	} else if folderRaw != "" {
+		breadcrumb = lipgloss.NewStyle().
+			Foreground(theme.Text).
+			Bold(true).
+			Render(folderRaw)
 	}
 
-	row2 := lipgloss.NewStyle().
+	row2Style := lipgloss.NewStyle().
 		Foreground(theme.Text).
 		Width(h.width).
-		Padding(0, 1).
-		Render(fmt.Sprintf(" %s", breadcrumb))
+		Padding(0, 1)
+	row2 := row2Style.Render(fmt.Sprintf(" %s", breadcrumb))
 
 	divider := lipgloss.NewStyle().
 		Foreground(theme.Border).
