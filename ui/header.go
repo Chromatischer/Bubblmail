@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/bubblmail/bubblmail/ui/icons"
 	"github.com/bubblmail/bubblmail/util"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -57,15 +58,15 @@ func (h *Header) View() string {
 	case "syncing":
 		syncStr = lipgloss.NewStyle().
 			Foreground(theme.Warning).
-			Render("⟳ syncing")
+			Render(fmt.Sprintf("%s syncing", icons.Syncing))
 	case "synced":
 		syncStr = lipgloss.NewStyle().
 			Foreground(theme.Success).
-			Render("● synced")
+			Render(fmt.Sprintf("%s synced", icons.Synced))
 	case "error":
 		syncStr = lipgloss.NewStyle().
 			Foreground(theme.Error).
-			Render("✗ sync error")
+			Render(fmt.Sprintf("%s sync error", icons.Error))
 	}
 
 	row1Width := h.width - lipgloss.Width(appName) - util.VisibleWidth(syncStr) - 2
@@ -81,7 +82,7 @@ func (h *Header) View() string {
 	// Row 2: account + folder breadcrumb
 	acctRaw := util.SingleLine(h.activeAccount)
 	folderRaw := util.SingleLine(h.activeFolder)
-	sep := " › "
+	sep := fmt.Sprintf(" %s ", icons.ChevronRight)
 	maxBreadW := h.width - 3
 	if maxBreadW < 0 {
 		maxBreadW = 0

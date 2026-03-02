@@ -3,13 +3,14 @@ package ui
 import (
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
 	"github.com/bubblmail/bubblmail/data"
+	"github.com/bubblmail/bubblmail/ui/icons"
 	"github.com/bubblmail/bubblmail/util"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // qwertyRow holds the top keyboard row keys for instant folder selection.
-var qwertyRow = []string{"q", "w", "e", "r", "t", "y", "u", "i", "o", "p"}
+var qwertyRow = []string{"w", "e", "r", "t", "y", "u", "i", "o", "p"}
 
 // FolderPickerOverlay is a floating folder-selection menu.
 type FolderPickerOverlay struct {
@@ -168,12 +169,12 @@ func (f *FolderPickerOverlay) View() string {
 	nameW := cw - 4 // subtract the 4-col prefix (" " + key + "  ")
 
 	// Title
-	titleLine := lipgloss.NewStyle().Foreground(theme.Accent).Bold(true).Render("Move to folder")
+	titleLine := lipgloss.NewStyle().Foreground(theme.Accent).Bold(true).Render(icons.FolderOpen + " Move to folder")
 
 	// Folder rows
 	var rows []string
 	if len(f.folders) == 0 {
-		emptyLine := util.PadRight("  No folders available", cw)
+		emptyLine := util.PadRight("  "+icons.FolderEmpty+" No folders available", cw)
 		rows = append(rows, lipgloss.NewStyle().Foreground(theme.TextFaint).Render(emptyLine))
 	}
 

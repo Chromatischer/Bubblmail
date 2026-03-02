@@ -4,11 +4,12 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/data"
 	"github.com/bubblmail/bubblmail/render"
+	"github.com/bubblmail/bubblmail/ui/icons"
 	"github.com/bubblmail/bubblmail/util"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // ReaderView displays a single email or a full thread as one scrollable document.
@@ -194,7 +195,7 @@ func (v *ReaderView) buildSingleLines() {
 		return
 	}
 	if v.message.Body == "" && v.message.HTMLBody == "" {
-		v.lines = []string{"(No body loaded — press Enter to fetch)"}
+		v.lines = []string{fmt.Sprintf("(%s No body loaded — press Enter to fetch)", icons.Download)}
 		return
 	}
 	textWidth := v.width - 2
@@ -230,7 +231,7 @@ func (v *ReaderView) buildThreadLines() {
 			textWidth = 20
 		}
 		if msg.Body == "" && msg.HTMLBody == "" {
-			all = append(all, "  (Loading…)")
+			all = append(all, fmt.Sprintf("  (%s Loading…)", icons.Syncing))
 		} else {
 			all = append(all, render.RenderBody(msg.Body, msg.HTMLBody, textWidth, v.theme)...)
 		}
@@ -263,7 +264,7 @@ func (v *ReaderView) fullMsgHeader(msg *data.Message) []string {
 
 	stars := ""
 	if msg.IsStarred() {
-		stars = lipgloss.NewStyle().Foreground(theme.Starred).Render(" ★")
+		stars = lipgloss.NewStyle().Foreground(theme.Starred).Render(" " + icons.Star)
 	}
 
 	return []string{
@@ -310,7 +311,7 @@ func (v *ReaderView) compactMsgHeader(msg *data.Message) string {
 func (v *ReaderView) View() string {
 	theme := v.theme
 	if v.thread == nil && v.message == nil {
-		empty := lipgloss.NewStyle().Foreground(theme.TextMuted).Render("No message selected")
+		empty := lipgloss.NewStyle().Foreground(theme.TextMuted).Render(icons.MailOpen + " No message selected")
 		return lipgloss.Place(v.width, v.height, lipgloss.Center, lipgloss.Center, empty)
 	}
 	if v.thread != nil {
@@ -384,7 +385,7 @@ func (v *ReaderView) viewSingle() string {
 
 	stars := ""
 	if v.message.IsStarred() {
-		stars = lipgloss.NewStyle().Foreground(theme.Starred).Render(" ★")
+		stars = lipgloss.NewStyle().Foreground(theme.Starred).Render(" " + icons.Star)
 	}
 
 	headerStr := strings.Join([]string{

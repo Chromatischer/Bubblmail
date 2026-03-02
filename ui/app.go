@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/bubblmail/bubblmail/cache"
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/data"
@@ -13,7 +11,10 @@ import (
 	outsmtp "github.com/bubblmail/bubblmail/smtp"
 	"github.com/bubblmail/bubblmail/thread"
 	"github.com/bubblmail/bubblmail/ui/composer"
+	"github.com/bubblmail/bubblmail/ui/icons"
 	"github.com/bubblmail/bubblmail/ui/views"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // ViewID identifies which main pane is active.
@@ -21,8 +22,8 @@ type ViewID int
 
 const (
 	ViewInbox  ViewID = iota
-	ViewReader         // reading a single message
-	ViewFolder         // folder browser
+	ViewReader        // reading a single message
+	ViewFolder        // folder browser
 )
 
 // syncMsg triggers a background sync.
@@ -33,6 +34,9 @@ type spinnerTickMsg struct{}
 
 // clearStatusMsg clears the flash message.
 type clearStatusMsg struct{}
+
+// quitTimeoutMsg clears the pending quit state.
+type quitTimeoutMsg struct{}
 
 // App is the root Bubble Tea model.
 type App struct {
@@ -76,8 +80,18 @@ type App struct {
 	fetchedCount   int
 	loadingMore    bool
 	allLoaded      bool
+	quitPending    bool
 
 	accounts []*data.Account
+}
+
+func (a *App) canQuitNow() bool {
+	return a.viewID == ViewInbox &&
+		!a.sidebarFocused &&
+		!a.searchOverlay.IsActive() &&
+		!a.folderPicker.IsActive() &&
+		!a.showHelp &&
+		!a.comp.IsActive()
 }
 
 // NewApp creates the root application model.
@@ -357,6 +371,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.statusbar.ClearMessage()
 		return a, nil
 
+	case quitTimeoutMsg:
+		a.quitPending = false
+		return a, nil
+
 	case tea.MouseMsg:
 		return a.handleMouse(msg)
 
@@ -370,10 +388,31 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 
+	if key != "q" {
+		a.quitPending = false
+	}
+
+	if key == "q" && !a.canQuitNow() {
+		a.quitPending = false
+		key = "esc"
+	}
+
 	const minW, minH = 80, 24
 	if a.width < minW || a.height < minH {
-		if key == "q" || key == "ctrl+c" {
+		if key == "ctrl+c" {
 			return a, tea.Quit
+		}
+		if key == "q" && a.canQuitNow() {
+			if a.quitPending {
+				return a, tea.Quit
+			}
+			a.quitPending = true
+			return a, tea.Batch(
+				a.flash("press q again to quit", "info"),
+				tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+					return quitTimeoutMsg{}
+				}),
+			)
 		}
 		return a, nil
 	}
@@ -450,10 +489,10 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				a.viewID = ViewInbox
 				return a, a.fetchMessages()
 			}
-		case "esc", "h", "left", "\\":
+		case "esc", "h", "left", "\\", "q":
 			a.sidebarFocused = false
 			a.sidebar.SetFocused(false)
-		case "q", "ctrl+c":
+		case "ctrl+c":
 			return a, tea.Quit
 		}
 		return a, nil
@@ -461,8 +500,20 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// 6. Global keys
 	switch key {
-	case "q", "ctrl+c":
+	case "ctrl+c":
 		return a, tea.Quit
+
+	case "q":
+		if a.quitPending {
+			return a, tea.Quit
+		}
+		a.quitPending = true
+		return a, tea.Batch(
+			a.flash("press q again to quit", "info"),
+			tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+				return quitTimeoutMsg{}
+			}),
+		)
 
 	case "?":
 		a.showHelp = true
@@ -504,7 +555,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// IMAP server search
 		client, ok := a.imapClients[a.activeAccount]
 		if ok {
-			a.flash("Searching server…", "info")
+			a.flash(fmt.Sprintf("%s Searching server…", icons.Search), "info")
 			q := a.searchOverlay.Query()
 			return a, client.SearchIMAP(a.activeFolder, q)
 		}
@@ -875,7 +926,7 @@ func (a *App) deleteMessage() tea.Cmd {
 		a.flash("No Trash folder found", "err")
 		return nil
 	}
-	a.flash("Moving to Trash…", "info")
+	a.flash(fmt.Sprintf("%s Moving to Trash…", icons.Trash), "info")
 	return client.MoveToTrash(a.activeFolder, msg.UID, trash)
 }
 
@@ -888,7 +939,7 @@ func (a *App) openFolderPicker() {
 		}
 	}
 	if len(folders) == 0 {
-		a.flash("No folders available", "err")
+		a.flash(fmt.Sprintf("%s No folders available", icons.FolderEmpty), "err")
 		return
 	}
 	a.folderPicker.SetSize(a.width, a.height-a.headerHeight()-a.statusHeight())
@@ -904,7 +955,7 @@ func (a *App) moveMessageToFolder(destFolder string) tea.Cmd {
 	if !ok {
 		return nil
 	}
-	a.flash("Moving…", "info")
+	a.flash(fmt.Sprintf("%s Moving…", icons.FolderOpen), "info")
 	return client.MoveMessage(a.activeFolder, msg.UID, destFolder)
 }
 
@@ -935,7 +986,7 @@ func (a *App) findTrashFolder(account string) string {
 }
 
 func (a *App) archiveMessage() tea.Cmd {
-	a.flash("Archive not yet implemented", "info")
+	a.flash(fmt.Sprintf("%s Archive not yet implemented", icons.Archive), "info")
 	return nil
 }
 
@@ -958,7 +1009,7 @@ func (a *App) handleComposerResult(r *composer.Result) tea.Cmd {
 		for i := range a.cfg.Accounts {
 			if a.cfg.Accounts[i].Name == a.activeAccount {
 				acfg := &a.cfg.Accounts[i]
-				a.flash("Sending…", "info")
+				a.flash(fmt.Sprintf("%s Sending…", icons.Send), "info")
 				return outsmtp.SendMessage(acfg, r.Draft)
 			}
 		}
@@ -1056,7 +1107,7 @@ func (a *App) updateLayout() {
 // View implements tea.Model.
 func (a *App) View() string {
 	if a.width == 0 || a.height == 0 {
-		return "Loading…"
+		return icons.Syncing + " Loading…"
 	}
 
 	const minW, minH = 80, 24

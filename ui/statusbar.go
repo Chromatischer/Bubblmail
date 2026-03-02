@@ -4,20 +4,28 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/bubblmail/bubblmail/ui/icons"
 	"github.com/charmbracelet/lipgloss"
 )
 
 // StatusBar renders the bottom hint bar with context-sensitive keys and flash messages.
 type StatusBar struct {
-	styles    *Styles
-	width     int
-	message   string
-	msgKind   string // "info", "ok", "err"
-	spinner   int
-	loading   bool
+	styles  *Styles
+	width   int
+	message string
+	msgKind string // "info", "ok", "err"
+	spinner int
+	loading bool
 }
 
-var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+var spinnerFrames = []string{
+	icons.Spinner1,
+	icons.Spinner2,
+	icons.Spinner3,
+	icons.Spinner4,
+	icons.Spinner5,
+	icons.Spinner6,
+}
 
 // NewStatusBar creates a new status bar.
 func NewStatusBar(styles *Styles) *StatusBar {
@@ -56,83 +64,90 @@ func (sb *StatusBar) AdvanceSpinner() {
 func (sb *StatusBar) View(context string) string {
 	theme := sb.styles.Theme
 
+	iconStyle := lipgloss.NewStyle().
+		Foreground(theme.Accent)
 	keyStyle := lipgloss.NewStyle().
-		Foreground(theme.Accent).
-		Bold(true)
+		Foreground(theme.TextFaint)
 	descStyle := lipgloss.NewStyle().
 		Foreground(theme.TextMuted)
 	sepStyle := lipgloss.NewStyle().
 		Foreground(theme.TextFaint)
 
-	type hint struct{ key, desc string }
+	type hint struct{ icon, key, desc string }
 
 	var hints []hint
 	switch context {
 	case "composer":
 		hints = []hint{
-			{"ctrl+enter", "send"},
-			{"tab", "next field"},
-			{"esc", "cancel"},
+			{icons.Send, "ctrl+enter", "send"},
+			{icons.ChevronRight, "tab", "next field"},
+			{icons.Close, "esc", "cancel"},
 		}
 	case "reader":
 		hints = []hint{
-			{"j/k", "scroll"},
-			{"r", "reply"},
-			{"R", "reply all"},
-			{"f", "forward"},
-			{"s", "star"},
-			{"d", "delete"},
-			{"esc/h", "back"},
-			{"?", "help"},
-			{"q", "quit"},
+			{icons.ArrowUpDown, "j/k", "scroll"},
+			{icons.Reply, "r", "reply"},
+			{icons.ReplyAll, "R", "reply all"},
+			{icons.Forward, "f", "forward"},
+			{icons.Star, "s", "star"},
+			{icons.Trash, "d", "delete"},
+			{icons.ArrowLeft, "esc/q/h", "back"},
+			{icons.Help, "?", "help"},
 		}
 	case "search":
 		hints = []hint{
-			{"type", "search"},
-			{"enter", "select"},
-			{"ctrl+f", "server search"},
-			{"esc", "close"},
+			{icons.Search, "type", "search"},
+			{icons.Check, "enter", "select"},
+			{icons.Search, "ctrl+f", "server search"},
+			{icons.Close, "esc", "close"},
 		}
 	case "move":
 		hints = []hint{
-			{"j/k", "navigate"},
-			{"enter", "move here"},
-			{"esc", "cancel"},
+			{icons.ArrowUpDown, "j/k", "navigate"},
+			{icons.FolderOpen, "enter", "move here"},
+			{icons.Close, "esc", "cancel"},
 		}
 	case "sidebar":
 		hints = []hint{
-			{"j/k", "navigate"},
-			{"enter", "open folder"},
-			{"esc/\\", "cancel"},
+			{icons.ArrowUpDown, "j/k", "navigate"},
+			{icons.FolderOpen, "enter", "open folder"},
+			{icons.Close, "esc/\\", "cancel"},
 		}
 	case "folder":
 		hints = []hint{
-			{"enter", "open"},
-			{"esc", "back"},
-			{"b", "sidebar"},
-			{"?", "help"},
-			{"q", "quit"},
+			{icons.FolderOpen, "enter", "open"},
+			{icons.ArrowLeft, "esc/q", "back"},
+			{icons.FolderTree, "b", "sidebar"},
+			{icons.Help, "?", "help"},
 		}
 	default: // inbox
 		hints = []hint{
-			{"j/k", "navigate"},
-			{"enter", "open"},
-			{"c", "compose"},
-			{"r", "reply"},
-			{"s", "star"},
-			{"m", "mark read"},
-			{"/", "search"},
-			{"b", "sidebar"},
-			{"?", "help"},
-			{"q", "quit"},
+			{icons.ArrowUpDown, "j/k", "navigate"},
+			{icons.MailOpen, "enter", "open"},
+			{icons.Compose, "c", "compose"},
+			{icons.Reply, "r", "reply"},
+			{icons.Star, "s", "star"},
+			{icons.Read, "m", "mark read"},
+			{icons.Search, "/", "search"},
+			{icons.FolderTree, "b", "sidebar"},
+			{icons.Help, "?", "help"},
+			{icons.Quit, "q", "quit (double)"},
 		}
 	}
 
 	var parts []string
 	for _, h := range hints {
-		parts = append(parts, fmt.Sprintf("%s %s",
-			keyStyle.Render(h.key),
+		if h.icon == "" {
+			parts = append(parts, fmt.Sprintf("%s %s",
+				descStyle.Render(h.desc),
+				keyStyle.Render("("+h.key+")"),
+			))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s %s %s",
+			iconStyle.Render(h.icon),
 			descStyle.Render(h.desc),
+			keyStyle.Render("("+h.key+")"),
 		))
 	}
 
@@ -156,7 +171,7 @@ func (sb *StatusBar) View(context string) string {
 	} else if sb.loading {
 		rightStr = lipgloss.NewStyle().
 			Foreground(theme.TextMuted).
-			Render(spinnerFrames[sb.spinner] + " Loading…")
+			Render(fmt.Sprintf("%s Loading…", icons.Syncing))
 	}
 
 	rightW := lipgloss.Width(rightStr)

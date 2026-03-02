@@ -3,9 +3,10 @@ package ui
 import (
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
 	"github.com/bubblmail/bubblmail/data"
+	"github.com/bubblmail/bubblmail/ui/icons"
 	"github.com/bubblmail/bubblmail/util"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // SearchOverlay is a floating search box with FTS5 results list.
@@ -142,7 +143,7 @@ func (s *SearchOverlay) View() string {
 	inputStyle := lipgloss.NewStyle().
 		Foreground(theme.Text).
 		Background(theme.SurfaceAlt).
-		Width(boxWidth - 4).
+		Width(boxWidth-4).
 		Padding(0, 1)
 
 	queryDisplay := s.query
@@ -150,7 +151,7 @@ func (s *SearchOverlay) View() string {
 		queryDisplay = lipgloss.NewStyle().
 			Foreground(theme.TextFaint).
 			Background(theme.SurfaceAlt).
-			Render("Type to search…")
+			Render(icons.Search + " Type to search…")
 	} else {
 		queryDisplay = inputStyle.Render(s.query + "▌")
 	}
@@ -168,7 +169,7 @@ func (s *SearchOverlay) View() string {
 		emptyMsg := lipgloss.NewStyle().
 			Foreground(theme.TextFaint).
 			Background(theme.Surface).
-			Render("  No results")
+			Render("  " + icons.Search + " No results")
 		resultLines = append(resultLines, emptyMsg)
 	}
 
@@ -206,7 +207,7 @@ func (s *SearchOverlay) View() string {
 					}
 					return theme.Surface
 				}()).
-				Render("●")
+				Render(icons.Unread)
 		}
 
 		fromW := 20

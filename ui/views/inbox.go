@@ -7,6 +7,7 @@ import (
 
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/data"
+	"github.com/bubblmail/bubblmail/ui/icons"
 	"github.com/bubblmail/bubblmail/util"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -168,7 +169,7 @@ func (v *InboxView) View() string {
 	for i := v.offset; i < end; i++ {
 		t := v.threads[i]
 		isSelected := i == v.cursor
-		rows = append(rows, v.renderThread(t, isSelected)...)
+		rows = append(rows, v.renderThread(t, isSelected, i)...)
 	}
 
 	// Pad to full height
@@ -179,9 +180,14 @@ func (v *InboxView) View() string {
 	return strings.Join(rows[:v.height], "\n")
 }
 
-func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
+func (v *InboxView) renderThread(t *data.Thread, selected bool, index int) []string {
 	w := v.width
 	theme := v.theme
+
+	rowBg := lipgloss.Color("")
+	if !selected && index%2 == 1 {
+		rowBg = theme.Surface
+	}
 
 	// sel applies the selection background to any style when this row is selected.
 	// Every pre-rendered span must go through sel() so that ANSI resets inside
@@ -189,6 +195,9 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	sel := func(s lipgloss.Style) lipgloss.Style {
 		if selected {
 			return s.Background(theme.Selected)
+		}
+		if rowBg != "" {
+			return s.Background(rowBg)
 		}
 		return s
 	}
@@ -203,16 +212,16 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	// Flag column: accent ▌ bar for starred/flagged messages, blank otherwise
 	flagCh := " "
 	if t.Starred {
-		flagCh = "▌"
+		flagCh = icons.Flag
 	}
 	flag := sel(lipgloss.NewStyle().Foreground(theme.Starred)).Render(flagCh)
 
-	// Status dot: ● unread, ○ read
+	// Status dot: ● unread, blank for read
 	var dot string
 	if t.HasUnread {
-		dot = sel(lipgloss.NewStyle().Foreground(theme.Unread)).Render("●")
+		dot = sel(lipgloss.NewStyle().Foreground(theme.Unread)).Render(icons.Unread)
 	} else {
-		dot = sel(lipgloss.NewStyle().Foreground(fgMuted)).Render("○")
+		dot = sel(lipgloss.NewStyle().Foreground(fgMuted)).Render(" ")
 	}
 
 	// From field
@@ -276,9 +285,17 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	dateRendered := sel(lipgloss.NewStyle().Foreground(fgMuted)).Render(util.FormatDate(t.LastDate))
 	dateW := util.VisibleWidth(dateRendered)
 	tagW := util.VisibleWidth(tagStr)
+	rightPad := sel(lipgloss.NewStyle()).Render(" ")
+	rightPadW := util.VisibleWidth(rightPad)
 
-	// Prefix: cursor(1) + dot(1) + space(1) = 3 cols
-	fromW := w - 3 - tagW - dateW - 2
+	// Prefix: flag + space + dot + space
+	prefix := flag + sel(lipgloss.NewStyle()).Render(" ") + dot + sel(lipgloss.NewStyle()).Render(" ")
+	prefixW := util.VisibleWidth(prefix)
+	spaceBeforeTags := 0
+	if tagStr != "" {
+		spaceBeforeTags = 1
+	}
+	fromW := w - prefixW - tagW - dateW - spaceBeforeTags - 1
 	if fromW < 5 {
 		fromW = 5
 	}
@@ -292,17 +309,17 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	}
 	fromRendered := fromStyle.Render(util.PadRight(fromTrunc, fromW))
 
-	// Row 1: flag + dot + space + from [+ tags] + gap + date
-	row1Parts := flag + dot + sel(lipgloss.NewStyle()).Render(" ") + fromRendered
+	// Row 1: flag + space + dot + space + from [+ tags] + gap + date
+	row1Parts := prefix + fromRendered
 	if tagStr != "" {
 		row1Parts += " " + tagStr
 	}
-	gap1 := w - util.VisibleWidth(row1Parts) - dateW
+	gap1 := w - util.VisibleWidth(row1Parts) - dateW - rightPadW
 	if gap1 < 1 {
 		gap1 = 1
 	}
 	gapStr1 := sel(lipgloss.NewStyle()).Render(strings.Repeat(" ", gap1))
-	row1 := sel(lipgloss.NewStyle().Width(w)).Render(row1Parts + gapStr1 + dateRendered)
+	row1 := sel(lipgloss.NewStyle().Width(w)).Render(row1Parts + gapStr1 + dateRendered + rightPad)
 
 	// Row 2: indent + subject + gap + count
 	subject := util.SingleLine(t.Subject)
@@ -318,19 +335,20 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool) []string {
 	}
 	countW := util.VisibleWidth(countStr)
 
-	subjectW := w - 5 - countW
+	indent := strings.Repeat(" ", prefixW)
+	subjectW := w - prefixW - countW
 	if subjectW < 5 {
 		subjectW = 5
 	}
 	subjectTrunc := util.TruncateText(subject, subjectW)
-	subjectRendered := sel(lipgloss.NewStyle().Foreground(fgMuted)).Render("   " + subjectTrunc)
+	subjectRendered := sel(lipgloss.NewStyle().Foreground(fgMuted)).Render(indent + subjectTrunc)
 
-	gap2 := w - util.VisibleWidth(subjectRendered) - countW
+	gap2 := w - util.VisibleWidth(subjectRendered) - countW - rightPadW
 	if gap2 < 1 {
 		gap2 = 1
 	}
 	gapStr2 := sel(lipgloss.NewStyle()).Render(strings.Repeat(" ", gap2))
-	row2 := sel(lipgloss.NewStyle().Width(w)).Render(subjectRendered + gapStr2 + countStr)
+	row2 := sel(lipgloss.NewStyle().Width(w)).Render(subjectRendered + gapStr2 + countStr + rightPad)
 
 	return []string{row1, row2}
 }
@@ -339,10 +357,10 @@ func (v *InboxView) emptyState() string {
 	theme := v.theme
 	msg := lipgloss.NewStyle().
 		Foreground(theme.TextMuted).
-		Render("No messages")
+		Render(icons.Inbox + " No messages")
 	hint := lipgloss.NewStyle().
 		Foreground(theme.TextFaint).
-		Render("Press ctrl+r to sync")
+		Render(fmt.Sprintf("%s Press ctrl+r to sync", icons.Refresh))
 	body := lipgloss.JoinVertical(lipgloss.Center, msg, hint)
 	return lipgloss.Place(v.width, v.height, lipgloss.Center, lipgloss.Center, body)
 }

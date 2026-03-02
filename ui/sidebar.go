@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
 	"github.com/bubblmail/bubblmail/data"
+	"github.com/bubblmail/bubblmail/ui/icons"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // sidebarHitZone is a clickable row in the sidebar.
@@ -178,7 +179,11 @@ func (sb *Sidebar) View() string {
 
 	for _, acct := range sb.accounts {
 		// Account header
-		acctLine := accountHeaderStyle.Render("  " + strings.ToUpper(acct.Name))
+		acctPrefix := ""
+		if icons.User != "" {
+			acctPrefix = icons.User + " "
+		}
+		acctLine := accountHeaderStyle.Render("  " + acctPrefix + strings.ToUpper(acct.Name))
 		lines = append(lines, acctLine)
 		row++
 
@@ -209,6 +214,9 @@ func (sb *Sidebar) View() string {
 			name := f.DisplayName
 			if name == "" {
 				name = f.Name
+			}
+			if icon := folderIcon(f.Name); icon != "" {
+				name = icon + " " + name
 			}
 
 			// Build indent: depth spaces, then cursor indicator or space
@@ -259,7 +267,7 @@ func (sb *Sidebar) View() string {
 	if len(lines) == 0 {
 		emptyLine := lipgloss.NewStyle().
 			Foreground(theme.TextFaint).
-			Render("  No accounts")
+			Render("  " + icons.Users + " No accounts")
 		lines = append(lines, emptyLine)
 	}
 
@@ -311,4 +319,25 @@ func truncateFolderName(name string, maxCols int) string {
 		return "…"
 	}
 	return string(runes[:maxCols-1]) + "…"
+}
+
+func folderIcon(name string) string {
+	upper := strings.ToUpper(name)
+	switch upper {
+	case "INBOX":
+		return icons.Inbox
+	case "SENT", "SENT ITEMS", "SENT MAIL":
+		return icons.Sent
+	case "DRAFTS":
+		return icons.Drafts
+	case "TRASH", "DELETED", "BIN":
+		return icons.Trash
+	case "ARCHIVE", "ARCHIVES":
+		return icons.Archive
+	case "JUNK", "SPAM":
+		return icons.Junk
+	case "OUTBOX":
+		return icons.Outbox
+	}
+	return icons.Folder
 }

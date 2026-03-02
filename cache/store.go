@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -265,6 +266,12 @@ func (s *Store) GetThreads(account, folder string) ([]*data.Thread, error) {
 	for _, tid := range threadOrder {
 		threads = append(threads, threadMap[tid])
 	}
+	sort.Slice(threads, func(i, j int) bool {
+		if !threads[i].LastDate.Equal(threads[j].LastDate) {
+			return threads[i].LastDate.After(threads[j].LastDate)
+		}
+		return threads[i].ID < threads[j].ID
+	})
 	return threads, nil
 }
 

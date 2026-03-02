@@ -28,9 +28,17 @@ func RelativeTime(t time.Time) string {
 }
 
 // FormatDate formats t as a compact date string relative to now:
-// "Mon" (this week), "Jan 2" (this year), "Jan '23" (previous years).
+// "Today", "Yesterday", "Mon" (this week), "Jan 2" (this year), "Jan '23" (previous years).
 func FormatDate(t time.Time) string {
 	now := time.Now()
+
+	if sameDay(now, t) {
+		return "Today"
+	}
+
+	if sameDay(now.AddDate(0, 0, -1), t) {
+		return "Yesterday"
+	}
 
 	// Same week: show weekday abbreviation
 	startOfWeek := now.AddDate(0, 0, -int(now.Weekday()))
@@ -45,6 +53,12 @@ func FormatDate(t time.Time) string {
 
 	// Older: "Jan '23"
 	return t.Format("Jan '06")
+}
+
+func sameDay(a, b time.Time) bool {
+	ya, ma, da := a.Date()
+	yb, mb, db := b.Date()
+	return ya == yb && ma == mb && da == db
 }
 
 // FormatDateLong formats t as a full date string.

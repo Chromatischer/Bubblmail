@@ -4,9 +4,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/data"
+	"github.com/bubblmail/bubblmail/ui/icons"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // FolderView renders the full folder/label browser pane.
@@ -113,7 +114,7 @@ func (v *FolderView) View() string {
 	if len(v.folders) == 0 {
 		msg := lipgloss.NewStyle().
 			Foreground(theme.TextMuted).
-			Render("No folders")
+			Render(icons.Folder + " No folders")
 		return lipgloss.Place(v.width, v.height, lipgloss.Center, lipgloss.Center, msg)
 	}
 
@@ -121,7 +122,7 @@ func (v *FolderView) View() string {
 		Foreground(theme.Accent).
 		Bold(true).
 		Padding(0, 1).
-		Render("Folders — " + v.account)
+		Render(icons.Folder + " Folders — " + v.account)
 
 	divider := lipgloss.NewStyle().
 		Foreground(theme.Border).
@@ -192,6 +193,9 @@ func (v *FolderView) renderFolder(f *data.Folder, selected bool) string {
 		name = string(runes[:nameW-1]) + "…"
 	}
 
+	if icon := folderIcon(name); icon != "" {
+		name = icon + " " + name
+	}
 	line := lineStyle.Render(" " + indent + name)
 	lineW := lipgloss.Width(line)
 	gap := v.width - lineW - lipgloss.Width(unreadStr)
@@ -199,4 +203,25 @@ func (v *FolderView) renderFolder(f *data.Folder, selected bool) string {
 		gap = 0
 	}
 	return line + strings.Repeat(" ", gap) + unreadStr
+}
+
+func folderIcon(name string) string {
+	upper := strings.ToUpper(name)
+	switch upper {
+	case "INBOX":
+		return icons.Inbox
+	case "SENT", "SENT ITEMS", "SENT MAIL":
+		return icons.Sent
+	case "DRAFTS":
+		return icons.Drafts
+	case "TRASH", "DELETED", "BIN":
+		return icons.Trash
+	case "ARCHIVE", "ARCHIVES":
+		return icons.Archive
+	case "JUNK", "SPAM":
+		return icons.Junk
+	case "OUTBOX":
+		return icons.Outbox
+	}
+	return icons.Folder
 }

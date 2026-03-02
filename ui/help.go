@@ -3,6 +3,7 @@ package ui
 import (
 	"strings"
 
+	"github.com/bubblmail/bubblmail/ui/icons"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -44,7 +45,7 @@ func (h *HelpOverlay) View(w, height int) string {
 
 	lines := AllHelpLines()
 	var rows []string
-	rows = append(rows, titleStyle.Render("Keyboard Shortcuts"))
+	rows = append(rows, titleStyle.Render(icons.Help+" Keyboard Shortcuts"))
 	rows = append(rows, emptyStyle.Render(""))
 
 	for _, l := range lines {
