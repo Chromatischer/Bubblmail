@@ -93,6 +93,12 @@ func (sb *StatusBar) View(context string) string {
 			{"ctrl+f", "server search"},
 			{"esc", "close"},
 		}
+	case "sidebar":
+		hints = []hint{
+			{"j/k", "navigate"},
+			{"enter", "open folder"},
+			{"esc/\\", "cancel"},
+		}
 	case "folder":
 		hints = []hint{
 			{"enter", "open"},

@@ -28,9 +28,10 @@ const (
 	KeySearch    = "/"
 	KeyIMAPSearch = "ctrl+f"
 	KeyInbox     = "i"
-	KeySidebar   = "b"
-	KeyNextAcct  = "tab"
-	KeyPrevAcct  = "shift+tab"
+	KeySidebar      = "b"
+	KeySidebarFocus = "\\"
+	KeyNextAcct     = "tab"
+	KeyPrevAcct     = "shift+tab"
 	KeySync      = "ctrl+r"
 	KeyHelp      = "?"
 	KeyQuit      = "q"
@@ -66,6 +67,7 @@ func AllHelpLines() []HelpLine {
 		{"ctrl+f", "IMAP server search"},
 		{"i", "Jump to INBOX"},
 		{"b", "Toggle sidebar"},
+		{"\\", "Focus sidebar"},
 		{"Tab/Shift+Tab", "Next/prev account"},
 		{"ctrl+r", "Force sync"},
 		{"?", "Help"},

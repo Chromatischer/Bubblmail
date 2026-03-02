@@ -61,13 +61,14 @@ type App struct {
 	comp *composer.Composer
 
 	// State
-	width         int
-	height        int
-	showSidebar   bool
-	wantSidebar   bool
-	showHelp      bool
-	activeAccount string
-	activeFolder  string
+	width          int
+	height         int
+	showSidebar    bool
+	wantSidebar    bool
+	showHelp       bool
+	sidebarFocused bool
+	activeAccount  string
+	activeFolder   string
 
 	// Pagination
 	loadedMessages []*data.Message
@@ -380,7 +381,39 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
-	// 4. Global keys
+	// 4. Sidebar focus mode — routes navigation to sidebar
+	if a.sidebarFocused {
+		switch key {
+		case "j", "down":
+			a.sidebar.MoveDown()
+		case "k", "up":
+			a.sidebar.MoveUp()
+		case "g":
+			a.sidebar.GoToTop()
+		case "G":
+			a.sidebar.GoToBottom()
+		case "enter":
+			if acct, folder, ok := a.sidebar.Selected(); ok {
+				a.sidebarFocused = false
+				a.sidebar.SetFocused(false)
+				a.activeAccount = acct
+				a.activeFolder = folder
+				a.sidebar.SetActive(acct, folder)
+				a.header.SetAccount(acct)
+				a.header.SetFolder(folder)
+				a.viewID = ViewInbox
+				return a, a.fetchMessages()
+			}
+		case "esc", "h", "left", "\\":
+			a.sidebarFocused = false
+			a.sidebar.SetFocused(false)
+		case "q", "ctrl+c":
+			return a, tea.Quit
+		}
+		return a, nil
+	}
+
+	// 5. Global keys
 	switch key {
 	case "q", "ctrl+c":
 		return a, tea.Quit
@@ -391,6 +424,13 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "b":
 		a.wantSidebar = !a.wantSidebar
 		a.updateLayout()
+
+	case "\\":
+		if a.showSidebar {
+			a.sidebarFocused = true
+			a.sidebar.SetFocused(true)
+			a.sidebar.FocusAt(a.activeAccount, a.activeFolder)
+		}
 
 	case "i":
 		a.activeFolder = "INBOX"
@@ -974,6 +1014,9 @@ func (a *App) View() string {
 	}
 	if a.searchOverlay.IsActive() {
 		sbContext = "search"
+	}
+	if a.sidebarFocused {
+		sbContext = "sidebar"
 	}
 
 	statusbar := a.statusbar.View(sbContext)
