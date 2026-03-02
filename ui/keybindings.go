@@ -21,6 +21,7 @@ const (
 	KeyReplyAll  = "R"
 	KeyForward   = "f"
 	KeyDelete    = "d"
+	KeyMove      = "v"
 	KeyArchive   = "e"
 	KeyStar      = "s"
 	KeyMarkRead  = "m"
@@ -58,6 +59,7 @@ func AllHelpLines() []HelpLine {
 		{"f", "Forward"},
 		{"c", "Compose new"},
 		{"d", "Delete (move to Trash)"},
+		{"v", "Move to folder"},
 		{"e", "Archive"},
 		{"s", "Toggle starred"},
 		{"m", "Toggle read/unread"},

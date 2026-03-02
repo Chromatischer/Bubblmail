@@ -67,6 +67,15 @@ type MoveToTrashResultMsg struct {
 	Err     error
 }
 
+// MoveMessageResultMsg carries the result of MoveMessage.
+type MoveMessageResultMsg struct {
+	Account string
+	Folder  string
+	UID     uint32
+	Dest    string
+	Err     error
+}
+
 // --- tea.Cmd builders ---
 
 // FetchFolders returns a tea.Cmd that lists all IMAP folders.
@@ -121,6 +130,16 @@ func (c *Client) SetFlag(folder string, uid uint32, flag data.Flag, set bool) te
 		defer c.mu.Unlock()
 		err := c.setFlag(folder, uid, flag, set)
 		return SetFlagResultMsg{Account: c.cfg.Name, Folder: folder, UID: uid, Flag: flag, Set: set, Err: err}
+	}
+}
+
+// MoveMessage returns a tea.Cmd that moves a message to any destination folder.
+func (c *Client) MoveMessage(sourceFolder string, uid uint32, destFolder string) tea.Cmd {
+	return func() tea.Msg {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		err := c.moveToTrash(sourceFolder, uid, destFolder)
+		return MoveMessageResultMsg{Account: c.cfg.Name, Folder: sourceFolder, UID: uid, Dest: destFolder, Err: err}
 	}
 }
 

@@ -50,6 +50,7 @@ type App struct {
 	statusbar     *StatusBar
 	helpOverlay   *HelpOverlay
 	searchOverlay *SearchOverlay
+	folderPicker  *FolderPickerOverlay
 
 	// Main views
 	viewID     ViewID
@@ -100,6 +101,7 @@ func NewApp(cfg *config.Config, store *cache.Store) *App {
 	}
 
 	app.searchOverlay = NewSearchOverlay(styles)
+	app.folderPicker = NewFolderPickerOverlay(styles)
 	app.inboxView = views.NewInboxView(theme)
 	app.readerView = views.NewReaderView(theme)
 	app.folderView = views.NewFolderView(theme)
@@ -301,6 +303,21 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return a, nil
 
+	case imaplib.MoveMessageResultMsg:
+		if msg.Err != nil {
+			a.flash("Move failed: "+msg.Err.Error(), "err")
+			return a, nil
+		}
+		a.flash("Moved to "+msg.Dest, "ok")
+		a.loadedMessages = removeByUID(a.loadedMessages, msg.UID)
+		a.fetchedCount = len(a.loadedMessages)
+		threads := thread.BuildThreads(a.loadedMessages)
+		a.inboxView.SetThreads(threads)
+		if a.viewID == ViewReader {
+			a.viewID = ViewInbox
+		}
+		return a, nil
+
 	case imaplib.SearchResultMsg:
 		if msg.Err != nil {
 			a.flash("Search error: "+msg.Err.Error(), "err")
@@ -391,13 +408,26 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
-	// 3. Help overlay — any key closes it
+	// 3. Folder picker
+	if a.folderPicker.IsActive() {
+		closed := a.folderPicker.HandleKey(key)
+		if closed {
+			folder := a.folderPicker.Result()
+			a.folderPicker.Close()
+			if folder != nil {
+				return a, a.moveMessageToFolder(folder.Name)
+			}
+		}
+		return a, nil
+	}
+
+	// 4. Help overlay — any key closes it
 	if a.showHelp {
 		a.showHelp = false
 		return a, nil
 	}
 
-	// 4. Sidebar focus mode — routes navigation to sidebar
+	// 5. Sidebar focus mode — routes navigation to sidebar
 	if a.sidebarFocused {
 		switch key {
 		case "j", "down":
@@ -429,7 +459,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
-	// 5. Global keys
+	// 6. Global keys
 	switch key {
 	case "q", "ctrl+c":
 		return a, tea.Quit
@@ -535,6 +565,9 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "d":
 		return a, a.deleteMessage()
+
+	case "v":
+		a.openFolderPicker()
 
 	case "e":
 		return a, a.archiveMessage()
@@ -846,6 +879,35 @@ func (a *App) deleteMessage() tea.Cmd {
 	return client.MoveToTrash(a.activeFolder, msg.UID, trash)
 }
 
+func (a *App) openFolderPicker() {
+	var folders []*data.Folder
+	for _, acct := range a.accounts {
+		if acct.Name == a.activeAccount {
+			folders = acct.Folders
+			break
+		}
+	}
+	if len(folders) == 0 {
+		a.flash("No folders available", "err")
+		return
+	}
+	a.folderPicker.SetSize(a.width, a.height-a.headerHeight()-a.statusHeight())
+	a.folderPicker.Open(folders, a.activeFolder)
+}
+
+func (a *App) moveMessageToFolder(destFolder string) tea.Cmd {
+	msg := a.currentMessage()
+	if msg == nil {
+		return nil
+	}
+	client, ok := a.imapClients[a.activeAccount]
+	if !ok {
+		return nil
+	}
+	a.flash("Moving…", "info")
+	return client.MoveMessage(a.activeFolder, msg.UID, destFolder)
+}
+
 // findTrashFolder returns the IMAP name of the Trash folder for the given account.
 // It looks for a folder with the \Trash attribute, then falls back to common names.
 func (a *App) findTrashFolder(account string) string {
@@ -1047,6 +1109,9 @@ func (a *App) View() string {
 	if a.searchOverlay.IsActive() {
 		mainContent = a.searchOverlay.View()
 	}
+	if a.folderPicker.IsActive() {
+		mainContent = a.folderPicker.View()
+	}
 	if a.showHelp {
 		mainContent = a.helpOverlay.View(a.width, contentH)
 	}
@@ -1061,6 +1126,9 @@ func (a *App) View() string {
 	}
 	if a.searchOverlay.IsActive() {
 		sbContext = "search"
+	}
+	if a.folderPicker.IsActive() {
+		sbContext = "move"
 	}
 	if a.sidebarFocused {
 		sbContext = "sidebar"
