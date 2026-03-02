@@ -3,9 +3,9 @@ package ui
 import (
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
 	"github.com/bubblmail/bubblmail/data"
 	"github.com/bubblmail/bubblmail/util"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // SearchOverlay is a floating search box with FTS5 results list.
@@ -15,13 +15,22 @@ type SearchOverlay struct {
 	height  int
 	active  bool
 	query   string
-	results []*data.Message
+	results []*SearchResult
 	cursor  int
 	offset  int
+	loading bool
 
 	// debounce state
 	pendingQuery string
 	debounceID   int
+}
+
+// SearchResult holds a search match and labels.
+type SearchResult struct {
+	Message  *data.Message
+	Score    float32
+	Semantic bool
+	Similar  bool
 }
 
 // NewSearchOverlay creates a new search overlay.
@@ -42,6 +51,7 @@ func (s *SearchOverlay) Open() {
 	s.results = nil
 	s.cursor = 0
 	s.offset = 0
+	s.loading = false
 }
 
 // Close closes the overlay.
@@ -49,6 +59,7 @@ func (s *SearchOverlay) Close() {
 	s.active = false
 	s.query = ""
 	s.results = nil
+	s.loading = false
 }
 
 // IsActive returns true if the overlay is open.
@@ -63,9 +74,25 @@ func (s *SearchOverlay) Query() string {
 
 // SetResults updates the search results.
 func (s *SearchOverlay) SetResults(msgs []*data.Message) {
-	s.results = msgs
+	results := make([]*SearchResult, 0, len(msgs))
+	for _, msg := range msgs {
+		results = append(results, &SearchResult{Message: msg})
+	}
+	s.results = results
 	s.cursor = 0
 	s.offset = 0
+}
+
+// SetSearchResults updates streaming search results.
+func (s *SearchOverlay) SetSearchResults(results []*SearchResult, loading bool) {
+	s.results = results
+	s.loading = loading
+	if s.cursor >= len(s.results) {
+		s.cursor = len(s.results) - 1
+	}
+	if s.cursor < 0 {
+		s.cursor = 0
+	}
 }
 
 // SelectedMessage returns the currently selected message, or nil.
@@ -73,7 +100,7 @@ func (s *SearchOverlay) SelectedMessage() *data.Message {
 	if s.cursor < 0 || s.cursor >= len(s.results) {
 		return nil
 	}
-	return s.results[s.cursor]
+	return s.results[s.cursor].Message
 }
 
 // HandleKey processes a key press. Returns (queryChanged, closed, selected).
@@ -142,7 +169,7 @@ func (s *SearchOverlay) View() string {
 	inputStyle := lipgloss.NewStyle().
 		Foreground(theme.Text).
 		Background(theme.SurfaceAlt).
-		Width(boxWidth - 4).
+		Width(boxWidth-4).
 		Padding(0, 1)
 
 	queryDisplay := s.query
@@ -168,12 +195,18 @@ func (s *SearchOverlay) View() string {
 		emptyMsg := lipgloss.NewStyle().
 			Foreground(theme.TextFaint).
 			Background(theme.Surface).
-			Render("  No results")
+			Render(func() string {
+				if s.loading {
+					return "  Searching…"
+				}
+				return "  No results"
+			}())
 		resultLines = append(resultLines, emptyMsg)
 	}
 
 	for i := s.offset; i < len(s.results) && i < s.offset+visibleRows; i++ {
-		msg := s.results[i]
+		res := s.results[i]
+		msg := res.Message
 		isSelected := i == s.cursor
 
 		from := util.TruncateText(msg.FromString(), 20)
@@ -209,8 +242,25 @@ func (s *SearchOverlay) View() string {
 				Render("●")
 		}
 
+		badge := ""
+		if res.Semantic || res.Similar {
+			var tags []string
+			if res.Semantic {
+				tags = append(tags, "SEM")
+			}
+			if res.Similar {
+				tags = append(tags, "SIM")
+			}
+			badgeStyle := lipgloss.NewStyle().
+				Foreground(theme.Background).
+				Background(theme.Accent).
+				Padding(0, 1)
+			badge = badgeStyle.Render(strings.Join(tags, " "))
+		}
+
+		badgeW := lipgloss.Width(badge)
 		fromW := 20
-		subjectW := boxWidth - fromW - 12
+		subjectW := boxWidth - fromW - 12 - badgeW
 		if subjectW < 10 {
 			subjectW = 10
 		}
@@ -218,7 +268,11 @@ func (s *SearchOverlay) View() string {
 		subject = util.TruncateText(msg.Subject, subjectW)
 		subject = util.PadRight(subject, subjectW)
 
-		line := " " + unread + " " + lineStyle.Render(from+" "+subject) + " " + metaStyle.Render(date)
+		line := " " + unread + " " + lineStyle.Render(from+" "+subject)
+		if badge != "" {
+			line += " " + badge
+		}
+		line += " " + metaStyle.Render(date)
 		resultLines = append(resultLines, line)
 	}
 
@@ -230,11 +284,14 @@ func (s *SearchOverlay) View() string {
 
 	countLine := ""
 	if len(s.results) > 0 {
+		countLabel := util.PluralCount(len(s.results), "result", "results")
+		if s.loading {
+			countLabel += " · streaming"
+		}
 		countLine = lipgloss.NewStyle().
 			Foreground(theme.TextFaint).
 			Background(theme.Surface).
-			Render("  " + strings.Repeat("─", 10) + " " +
-				util.PluralCount(len(s.results), "result", "results"))
+			Render("  " + strings.Repeat("─", 10) + " " + countLabel)
 	}
 
 	content := strings.Join(append([]string{inputLine, countLine}, resultLines...), "\n")

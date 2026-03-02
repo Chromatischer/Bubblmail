@@ -39,6 +39,16 @@ CREATE TABLE IF NOT EXISTS message_tags (
     PRIMARY KEY (message_id, tag_id)
 );
 
+CREATE TABLE IF NOT EXISTS message_embeddings (
+    message_id   INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    model        TEXT    NOT NULL,
+    vector       BLOB    NOT NULL,
+    norm         REAL    NOT NULL,
+    content_hash TEXT    NOT NULL,
+    updated_at   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (message_id, model)
+);
+
 CREATE TABLE IF NOT EXISTS folders (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     account_name TEXT    NOT NULL,
@@ -75,3 +85,4 @@ END;
 CREATE INDEX IF NOT EXISTS idx_messages_account_folder ON messages(account_name, folder_name);
 CREATE INDEX IF NOT EXISTS idx_messages_thread_id      ON messages(thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_date           ON messages(date DESC);
+CREATE INDEX IF NOT EXISTS idx_embeddings_updated_at   ON message_embeddings(updated_at DESC);

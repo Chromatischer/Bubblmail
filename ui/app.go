@@ -1,19 +1,22 @@
 package ui
 
 import (
+	"context"
 	"fmt"
+	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/bubblmail/bubblmail/cache"
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/data"
+	"github.com/bubblmail/bubblmail/embeddings"
 	imaplib "github.com/bubblmail/bubblmail/imap"
 	outsmtp "github.com/bubblmail/bubblmail/smtp"
 	"github.com/bubblmail/bubblmail/thread"
 	"github.com/bubblmail/bubblmail/ui/composer"
 	"github.com/bubblmail/bubblmail/ui/views"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // ViewID identifies which main pane is active.
@@ -21,8 +24,8 @@ type ViewID int
 
 const (
 	ViewInbox  ViewID = iota
-	ViewReader         // reading a single message
-	ViewFolder         // folder browser
+	ViewReader        // reading a single message
+	ViewFolder        // folder browser
 )
 
 // syncMsg triggers a background sync.
@@ -36,10 +39,11 @@ type clearStatusMsg struct{}
 
 // App is the root Bubble Tea model.
 type App struct {
-	cfg    *config.Config
-	theme  *config.Theme
-	styles *Styles
-	store  *cache.Store
+	cfg       *config.Config
+	theme     *config.Theme
+	styles    *Styles
+	store     *cache.Store
+	embClient *embeddings.Client
 
 	// IMAP clients, one per account
 	imapClients map[string]*imaplib.Client
@@ -75,20 +79,37 @@ type App struct {
 	fetchedCount   int
 	loadingMore    bool
 	allLoaded      bool
+	searchSeq      int
+	searchState    *searchState
 
 	accounts []*data.Account
+}
+
+type searchState struct {
+	seq       int
+	queryVec  []float32
+	queryNorm float32
+	msgs      []*data.Message
+	vectors   [][]float32
+	norms     []float32
+	nextIndex int
+	results   []*embeddings.SearchHit
+	semHeap   *embeddings.TopKHeap
+	simHeap   *embeddings.TopKHeap
 }
 
 // NewApp creates the root application model.
 func NewApp(cfg *config.Config, store *cache.Store) *App {
 	theme := config.NewTheme(cfg)
 	styles := NewStyles(theme)
+	embClient, _ := embeddings.NewClient(cfg.Embeddings)
 
 	app := &App{
 		cfg:         cfg,
 		theme:       theme,
 		styles:      styles,
 		store:       store,
+		embClient:   embClient,
 		imapClients: make(map[string]*imaplib.Client),
 		header:      NewHeader(styles),
 		sidebar:     NewSidebar(styles),
@@ -273,6 +294,12 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.flash("Cache error: "+err.Error(), "err")
 			}
 		}
+		if msg.MsgID > 0 && a.embClient != nil && msg.Text != "" {
+			m := a.findMessageByID(msg.MsgID)
+			if m != nil {
+				return a, tea.Batch(a.embedMessage(m, msg.Text))
+			}
+		}
 		// Update reader view — works for both thread and single-message mode.
 		if a.viewID == ViewReader {
 			a.readerView.UpdateMessageBody(msg.UID, msg.Text, msg.HTML)
@@ -307,6 +334,22 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, nil
 		}
 		a.searchOverlay.SetResults(msg.Messages)
+		return a, nil
+
+	case embeddings.StreamSearchMsg:
+		if msg.Err != nil {
+			a.searchOverlay.SetSearchResults(nil, false)
+			a.flash("Search error: "+msg.Err.Error(), "err")
+			return a, nil
+		}
+		if msg.Seq != a.searchSeq {
+			return a, nil
+		}
+		results := convertSearchResults(msg.Results)
+		a.searchOverlay.SetSearchResults(results, msg.Loading)
+		if msg.Loading {
+			return a, a.searchStreamTick(msg.Seq)
+		}
 		return a, nil
 
 	case outsmtp.SendResultMsg:
@@ -376,6 +419,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if a.searchOverlay.IsActive() {
 		qChanged, closed, selected := a.searchOverlay.HandleKey(key)
 		if closed {
+			a.searchState = nil
 			if selected {
 				if msg := a.searchOverlay.SelectedMessage(); msg != nil {
 					return a, a.openMessage(msg)
@@ -385,7 +429,9 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else if qChanged {
 			q := a.searchOverlay.Query()
 			if q != "" {
-				return a, a.doLocalSearch(q)
+				a.searchOverlay.SetSearchResults(nil, true)
+				a.searchSeq++
+				return a, a.doStreamingSearch(q, a.searchSeq)
 			}
 		}
 		return a, nil
@@ -469,6 +515,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "/":
 		a.searchOverlay.SetSize(a.width, a.height-3)
 		a.searchOverlay.Open()
+		a.searchState = nil
 
 	case "ctrl+f":
 		// IMAP server search
@@ -884,6 +931,143 @@ func (a *App) doLocalSearch(q string) tea.Cmd {
 			return imaplib.SearchResultMsg{Err: err}
 		}
 		return imaplib.SearchResultMsg{Messages: msgs}
+	}
+}
+
+func (a *App) doStreamingSearch(q string, seq int) tea.Cmd {
+	return func() tea.Msg {
+		if a.embClient == nil {
+			return a.doLocalSearch(q)()
+		}
+		query := strings.TrimSpace(q)
+		if query == "" {
+			return embeddings.StreamSearchMsg{Seq: seq, Loading: false}
+		}
+		ctx := context.Background()
+		vecs, err := a.embClient.EmbedTexts(ctx, []string{query})
+		if err != nil || len(vecs) == 0 {
+			return embeddings.StreamSearchMsg{Seq: seq, Err: err}
+		}
+		queryVec := vecs[0]
+		queryNorm := embeddings.VectorNorm(queryVec)
+
+		maxCandidates := a.cfg.Embeddings.MaxCandidates
+		if maxCandidates <= 0 {
+			maxCandidates = 5000
+		}
+		msgs, vectors, norms, err := a.store.ListEmbeddingCandidates(a.activeAccount, a.cfg.Embeddings.Model, maxCandidates)
+		if err != nil {
+			return embeddings.StreamSearchMsg{Seq: seq, Err: err}
+		}
+		kSem := a.cfg.Embeddings.TopSemantic
+		kSim := a.cfg.Embeddings.TopSimilar
+		a.searchState = &searchState{
+			seq:       seq,
+			queryVec:  queryVec,
+			queryNorm: queryNorm,
+			msgs:      msgs,
+			vectors:   vectors,
+			norms:     norms,
+			nextIndex: 0,
+			results:   nil,
+			semHeap:   embeddings.NewTopKHeap(kSem),
+			simHeap:   embeddings.NewTopKHeap(kSim),
+		}
+		return a.searchStreamNext()
+	}
+}
+
+func (a *App) searchStreamTick(seq int) tea.Cmd {
+	return func() tea.Msg {
+		if a.searchState == nil || a.searchState.seq != seq {
+			return nil
+		}
+		return a.searchStreamNext()()
+	}
+}
+
+func (a *App) searchStreamNext() tea.Cmd {
+	return func() tea.Msg {
+		state := a.searchState
+		if state == nil {
+			return nil
+		}
+		batch := a.cfg.Embeddings.StreamBatch
+		if batch <= 0 {
+			batch = 128
+		}
+		total := len(state.msgs)
+		start := state.nextIndex
+		if start >= total {
+			return embeddings.StreamSearchMsg{Seq: state.seq, Results: state.results, Loading: false}
+		}
+		end := start + batch
+		if end > total {
+			end = total
+		}
+		for i := start; i < end; i++ {
+			score := embeddings.CosineSimilarity(state.queryVec, state.queryNorm, state.vectors[i], state.norms[i])
+			state.semHeap.Add(state.msgs[i], score)
+			state.simHeap.Add(state.msgs[i], score)
+		}
+		sem := state.semHeap.ItemsSorted()
+		sim := state.simHeap.ItemsSorted()
+		state.results = embeddings.MergeHits(sem, sim)
+		state.nextIndex = end
+		loading := end < total
+		return embeddings.StreamSearchMsg{Seq: state.seq, Results: state.results, Loading: loading}
+	}
+}
+
+func convertSearchResults(results []*embeddings.SearchHit) []*SearchResult {
+	converted := make([]*SearchResult, 0, len(results))
+	for _, res := range results {
+		converted = append(converted, &SearchResult{
+			Message:  res.Message,
+			Score:    res.Score,
+			Semantic: res.Semantic,
+			Similar:  res.Similar,
+		})
+	}
+	return converted
+}
+
+func (a *App) findMessageByID(id int64) *data.Message {
+	for _, msg := range a.loadedMessages {
+		if msg.ID == id {
+			return msg
+		}
+	}
+	return nil
+}
+
+func (a *App) embedMessage(msg *data.Message, body string) tea.Cmd {
+	return func() tea.Msg {
+		content := strings.TrimSpace(msg.Subject + "\n" + body)
+		if content == "" {
+			return nil
+		}
+		maxChars := a.cfg.Embeddings.MaxContentChars
+		if maxChars <= 0 {
+			maxChars = 8000
+		}
+		if len(content) > maxChars {
+			content = content[:maxChars]
+		}
+		hash := embeddings.HashContent(content)
+		upToDate, err := a.store.EmbeddingUpToDate(msg.ID, a.cfg.Embeddings.Model, hash)
+		if err != nil || upToDate {
+			return nil
+		}
+		ctx := context.Background()
+		vecs, err := a.embClient.EmbedTexts(ctx, []string{content})
+		if err != nil || len(vecs) == 0 {
+			return nil
+		}
+		vec := vecs[0]
+		norm := embeddings.VectorNorm(vec)
+		_ = a.store.SaveEmbedding(msg.ID, a.cfg.Embeddings.Model, vec, norm, hash)
+		return nil
 	}
 }
 
