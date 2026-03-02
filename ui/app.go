@@ -285,6 +285,22 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return a, nil
 
+	case imaplib.MoveToTrashResultMsg:
+		if msg.Err != nil {
+			a.flash("Move failed: "+msg.Err.Error(), "err")
+			return a, nil
+		}
+		a.flash("Moved to Trash", "ok")
+		// Remove the message from local state and refresh the inbox view.
+		a.loadedMessages = removeByUID(a.loadedMessages, msg.UID)
+		a.fetchedCount = len(a.loadedMessages)
+		threads := thread.BuildThreads(a.loadedMessages)
+		a.inboxView.SetThreads(threads)
+		if a.viewID == ViewReader {
+			a.viewID = ViewInbox
+		}
+		return a, nil
+
 	case imaplib.SearchResultMsg:
 		if msg.Err != nil {
 			a.flash("Search error: "+msg.Err.Error(), "err")
@@ -818,11 +834,42 @@ func (a *App) deleteMessage() tea.Cmd {
 		return nil
 	}
 	client, ok := a.imapClients[a.activeAccount]
-	if ok {
-		a.flash("Moving to Trash…", "info")
-		return client.SetFlag(a.activeFolder, msg.UID, data.FlagDeleted, true)
+	if !ok {
+		return nil
 	}
-	return nil
+	trash := a.findTrashFolder(a.activeAccount)
+	if trash == "" {
+		a.flash("No Trash folder found", "err")
+		return nil
+	}
+	a.flash("Moving to Trash…", "info")
+	return client.MoveToTrash(a.activeFolder, msg.UID, trash)
+}
+
+// findTrashFolder returns the IMAP name of the Trash folder for the given account.
+// It looks for a folder with the \Trash attribute, then falls back to common names.
+func (a *App) findTrashFolder(account string) string {
+	for _, acct := range a.accounts {
+		if acct.Name != account {
+			continue
+		}
+		// First pass: look for \Trash attribute
+		for _, f := range acct.Folders {
+			for _, attr := range f.Attributes {
+				if attr == `\Trash` {
+					return f.Name
+				}
+			}
+		}
+		// Second pass: common names
+		for _, f := range acct.Folders {
+			switch f.DisplayName {
+			case "Trash", "Deleted", "Deleted Items", "Deleted Messages", "Bin":
+				return f.Name
+			}
+		}
+	}
+	return ""
 }
 
 func (a *App) archiveMessage() tea.Cmd {
@@ -1052,6 +1099,16 @@ func (a *App) flash(msg, kind string) tea.Cmd {
 	return tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
 		return clearStatusMsg{}
 	})
+}
+
+func removeByUID(msgs []*data.Message, uid uint32) []*data.Message {
+	result := msgs[:0]
+	for _, m := range msgs {
+		if m.UID != uid {
+			result = append(result, m)
+		}
+	}
+	return result
 }
 
 func toggleFlag(flags []data.Flag, f data.Flag, add bool) []data.Flag {

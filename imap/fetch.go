@@ -59,11 +59,21 @@ type SetFlagResultMsg struct {
 	Err     error
 }
 
+// MoveToTrashResultMsg carries the result of MoveToTrash.
+type MoveToTrashResultMsg struct {
+	Account string
+	Folder  string
+	UID     uint32
+	Err     error
+}
+
 // --- tea.Cmd builders ---
 
 // FetchFolders returns a tea.Cmd that lists all IMAP folders.
 func (c *Client) FetchFolders() tea.Cmd {
 	return func() tea.Msg {
+		c.mu.Lock()
+		defer c.mu.Unlock()
 		folders, err := c.fetchFolders()
 		return FolderListMsg{Account: c.cfg.Name, Folders: folders, Err: err}
 	}
@@ -72,6 +82,8 @@ func (c *Client) FetchFolders() tea.Cmd {
 // FetchMessages returns a tea.Cmd that fetches the newest message envelopes from a folder.
 func (c *Client) FetchMessages(folder string, limit int) tea.Cmd {
 	return func() tea.Msg {
+		c.mu.Lock()
+		defer c.mu.Unlock()
 		msgs, err := c.fetchMessages(folder, 0, limit)
 		return MessageListMsg{Account: c.cfg.Name, Folder: folder, Messages: msgs, Err: err}
 	}
@@ -81,6 +93,8 @@ func (c *Client) FetchMessages(folder string, limit int) tea.Cmd {
 // skip is the count of newest messages already fetched.
 func (c *Client) FetchMoreMessages(folder string, skip, limit int) tea.Cmd {
 	return func() tea.Msg {
+		c.mu.Lock()
+		defer c.mu.Unlock()
 		msgs, err := c.fetchMessages(folder, skip, limit)
 		return MoreMessageListMsg{Account: c.cfg.Name, Folder: folder, Messages: msgs, Err: err}
 	}
@@ -89,6 +103,8 @@ func (c *Client) FetchMoreMessages(folder string, skip, limit int) tea.Cmd {
 // FetchBody returns a tea.Cmd that fetches the full body of a message.
 func (c *Client) FetchBody(folder string, uid uint32, msgID int64) tea.Cmd {
 	return func() tea.Msg {
+		c.mu.Lock()
+		defer c.mu.Unlock()
 		text, html, err := c.fetchBody(folder, uid)
 		return MessageBodyMsg{
 			Account: c.cfg.Name, Folder: folder,
@@ -101,8 +117,21 @@ func (c *Client) FetchBody(folder string, uid uint32, msgID int64) tea.Cmd {
 // SetFlag returns a tea.Cmd that sets or clears an IMAP flag.
 func (c *Client) SetFlag(folder string, uid uint32, flag data.Flag, set bool) tea.Cmd {
 	return func() tea.Msg {
+		c.mu.Lock()
+		defer c.mu.Unlock()
 		err := c.setFlag(folder, uid, flag, set)
 		return SetFlagResultMsg{Account: c.cfg.Name, Folder: folder, UID: uid, Flag: flag, Set: set, Err: err}
+	}
+}
+
+// MoveToTrash returns a tea.Cmd that moves a message to the trash folder.
+// trashFolder is the full IMAP name of the destination (e.g. "Trash").
+func (c *Client) MoveToTrash(sourceFolder string, uid uint32, trashFolder string) tea.Cmd {
+	return func() tea.Msg {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		err := c.moveToTrash(sourceFolder, uid, trashFolder)
+		return MoveToTrashResultMsg{Account: c.cfg.Name, Folder: sourceFolder, UID: uid, Err: err}
 	}
 }
 
@@ -240,6 +269,16 @@ func (c *Client) setFlag(folder string, uid uint32, flag data.Flag, set bool) er
 	}
 	cmd := c.conn.Store(uidSet, store, nil)
 	return cmd.Close()
+}
+
+func (c *Client) moveToTrash(sourceFolder string, uid uint32, trashFolder string) error {
+	if _, err := c.conn.Select(sourceFolder, nil).Wait(); err != nil {
+		return fmt.Errorf("selecting folder: %w", err)
+	}
+	uidSet := imaplib.UIDSetNum(imaplib.UID(uid))
+	// Move handles MOVE extension fallback (COPY + STORE \Deleted + EXPUNGE) automatically.
+	_, err := c.conn.Move(uidSet, trashFolder).Wait()
+	return err
 }
 
 // convertMessageBuffer converts a FetchMessageBuffer to a data.Message.

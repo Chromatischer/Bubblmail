@@ -17,6 +17,8 @@ type SearchResultMsg struct {
 // SearchIMAP returns a tea.Cmd that performs an IMAP SEARCH and fetches envelopes.
 func (c *Client) SearchIMAP(folder, query string) tea.Cmd {
 	return func() tea.Msg {
+		c.mu.Lock()
+		defer c.mu.Unlock()
 		msgs, err := c.searchIMAP(folder, query)
 		return SearchResultMsg{Account: c.cfg.Name, Folder: folder, Messages: msgs, Err: err}
 	}

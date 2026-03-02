@@ -4,15 +4,19 @@ package imap
 import (
 	"crypto/tls"
 	"fmt"
+	"sync"
 
 	imaplib "github.com/emersion/go-imap/v2/imapclient"
 	"github.com/bubblmail/bubblmail/config"
 )
 
 // Client wraps an IMAP connection for a single account.
+// mu serializes all IMAP operations so concurrent tea.Cmd goroutines don't
+// interleave SELECT + command sequences and slow each other down.
 type Client struct {
-	cfg    *config.AccountConfig
-	conn   *imaplib.Client
+	cfg  *config.AccountConfig
+	conn *imaplib.Client
+	mu   sync.Mutex
 }
 
 // Connect establishes a TLS IMAP connection.
