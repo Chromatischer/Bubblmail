@@ -13,6 +13,7 @@ import (
 func init() {
 	rootCmd.AddCommand(authCmd)
 	authCmd.AddCommand(authAddCmd)
+	authCmd.AddCommand(authEmbeddingsCmd)
 	authCmd.AddCommand(authListCmd)
 	authCmd.AddCommand(authStatusCmd)
 	authCmd.AddCommand(authRemoveCmd)
@@ -32,6 +33,18 @@ var authAddCmd = &cobra.Command{
 			return fmt.Errorf("loading config: %w", err)
 		}
 		return setup.RunWizard(cfg)
+	},
+}
+
+var authEmbeddingsCmd = &cobra.Command{
+	Use:   "embeddings",
+	Short: "Configure embeddings for semantic search",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := config.Load()
+		if err != nil {
+			return fmt.Errorf("loading config: %w", err)
+		}
+		return setup.RunEmbeddingsSetup(cfg)
 	},
 }
 

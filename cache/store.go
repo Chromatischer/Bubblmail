@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/bubblmail/bubblmail/data"
+	"github.com/bubblmail/bubblmail/embeddings"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -152,6 +153,97 @@ func (s *Store) UpsertBody(msgID int64, bodyText, bodyHTML string) error {
 	return err
 }
 
+// SaveEmbedding stores an embedding vector for a message.
+func (s *Store) SaveEmbedding(msgID int64, model string, vector []float32, norm float32, contentHash string) error {
+	encoded, err := embeddings.EncodeVector(vector)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`
+		INSERT INTO message_embeddings (message_id, model, vector, norm, content_hash, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(message_id, model) DO UPDATE SET
+			vector = excluded.vector,
+			norm = excluded.norm,
+			content_hash = excluded.content_hash,
+			updated_at = excluded.updated_at
+	`, msgID, model, encoded, norm, contentHash, time.Now().Unix())
+	return err
+}
+
+// EmbeddingUpToDate returns true if an embedding exists for the message with the same content hash.
+func (s *Store) EmbeddingUpToDate(msgID int64, model, contentHash string) (bool, error) {
+	var existing string
+	err := s.db.QueryRow(`
+		SELECT content_hash FROM message_embeddings WHERE message_id = ? AND model = ?
+	`, msgID, model).Scan(&existing)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return existing == contentHash, nil
+}
+
+// ListEmbeddingCandidates returns message embeddings for an account.
+func (s *Store) ListEmbeddingCandidates(account, model string, limit int) ([]*data.Message, [][]float32, []float32, error) {
+	rows, err := s.db.Query(`
+		SELECT m.id, m.uid, 0, m.message_id, m.in_reply_to, m.refs,
+		       m.subject, m.from_addr, m.to_addr, m.cc_addr, m.date,
+		       m.flags, m.size, m.snippet, m.thread_id,
+		       m.account_name, m.folder_name,
+		       e.vector, e.norm
+		FROM messages m
+		JOIN message_embeddings e ON e.message_id = m.id
+		WHERE m.account_name = ? AND e.model = ?
+		ORDER BY m.date DESC
+		LIMIT ?
+	`, account, model, limit)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer rows.Close()
+
+	var msgs []*data.Message
+	var vectors [][]float32
+	var norms []float32
+	for rows.Next() {
+		m := &data.Message{}
+		var fromStr, toStr, ccStr, flagsStr, refs string
+		var dateUnix int64
+		var vecBlob []byte
+		var norm float32
+		if err := rows.Scan(
+			&m.ID, &m.UID, &m.SeqNum, &m.MessageID, &m.InReplyTo, &refs,
+			&m.Subject, &fromStr, &toStr, &ccStr, &dateUnix, &flagsStr,
+			&m.Size, &m.Snippet, &m.ThreadID, &m.AccountName, &m.FolderName,
+			&vecBlob, &norm,
+		); err != nil {
+			return nil, nil, nil, err
+		}
+		m.Date = time.Unix(dateUnix, 0)
+		m.Flags = decodeFlags(flagsStr)
+		m.From = decodeAddresses(fromStr)
+		m.To = decodeAddresses(toStr)
+		m.CC = decodeAddresses(ccStr)
+		if refs != "" {
+			m.References = strings.Fields(refs)
+		}
+		vec, err := embeddings.DecodeVector(vecBlob)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		msgs = append(msgs, m)
+		vectors = append(vectors, vec)
+		norms = append(norms, norm)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+	return msgs, vectors, norms, nil
+}
+
 // GetMessages returns messages for an account/folder, newest first.
 func (s *Store) GetMessages(account, folder string, limit int) ([]*data.Message, error) {
 	rows, err := s.db.Query(`
@@ -226,6 +318,94 @@ func (s *Store) GetBody(msgID int64) (string, string, error) {
 		return "", "", nil
 	}
 	return bodyText, bodyHTML, err
+}
+
+// ListBodyPrefetchCandidates returns messages without cached bodies for an account.
+func (s *Store) ListBodyPrefetchCandidates(account string, limit int) ([]*data.Message, error) {
+	rows, err := s.db.Query(`
+		SELECT m.id, m.uid, 0, m.message_id, m.in_reply_to, m.refs,
+		       m.subject, m.from_addr, m.to_addr, m.cc_addr, m.date,
+		       m.flags, m.size, m.snippet, m.thread_id,
+		       m.account_name, m.folder_name
+		FROM messages m
+		LEFT JOIN bodies b ON b.message_id = m.id
+		WHERE m.account_name = ? AND b.message_id IS NULL
+		ORDER BY m.date DESC
+		LIMIT ?
+	`, account, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanMessagesWithAccount(rows)
+}
+
+// ListBodiesForEmbedding returns cached bodies for an account.
+// When force is false, it only returns messages without an embedding for the model.
+func (s *Store) ListBodiesForEmbedding(account, model string, force bool) ([]*data.Message, []string, error) {
+	var rows *sql.Rows
+	var err error
+	if force {
+		rows, err = s.db.Query(`
+			SELECT m.id, m.uid, 0, m.message_id, m.in_reply_to, m.refs,
+			       m.subject, m.from_addr, m.to_addr, m.cc_addr, m.date,
+			       m.flags, m.size, m.snippet, m.thread_id,
+			       m.account_name, m.folder_name,
+			       b.body_text
+			FROM messages m
+			JOIN bodies b ON b.message_id = m.id
+			WHERE m.account_name = ?
+			ORDER BY m.date DESC
+		`, account)
+	} else {
+		rows, err = s.db.Query(`
+			SELECT m.id, m.uid, 0, m.message_id, m.in_reply_to, m.refs,
+			       m.subject, m.from_addr, m.to_addr, m.cc_addr, m.date,
+			       m.flags, m.size, m.snippet, m.thread_id,
+			       m.account_name, m.folder_name,
+			       b.body_text
+			FROM messages m
+			JOIN bodies b ON b.message_id = m.id
+			LEFT JOIN message_embeddings e ON e.message_id = m.id AND e.model = ?
+			WHERE m.account_name = ? AND e.message_id IS NULL
+			ORDER BY m.date DESC
+		`, model, account)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+
+	var msgs []*data.Message
+	var bodies []string
+	for rows.Next() {
+		m := &data.Message{}
+		var fromStr, toStr, ccStr, flagsStr, refs string
+		var dateUnix int64
+		var bodyText string
+		if err := rows.Scan(
+			&m.ID, &m.UID, &m.SeqNum, &m.MessageID, &m.InReplyTo, &refs,
+			&m.Subject, &fromStr, &toStr, &ccStr, &dateUnix, &flagsStr,
+			&m.Size, &m.Snippet, &m.ThreadID, &m.AccountName, &m.FolderName,
+			&bodyText,
+		); err != nil {
+			return nil, nil, err
+		}
+		m.Date = time.Unix(dateUnix, 0)
+		m.Flags = decodeFlags(flagsStr)
+		m.From = decodeAddresses(fromStr)
+		m.To = decodeAddresses(toStr)
+		m.CC = decodeAddresses(ccStr)
+		if refs != "" {
+			m.References = strings.Fields(refs)
+		}
+		msgs = append(msgs, m)
+		bodies = append(bodies, bodyText)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return msgs, bodies, nil
 }
 
 // GetThreads returns thread groups for an account/folder, newest first.
@@ -446,6 +626,27 @@ func (s *Store) UpdateFolderCounts(account, folder string, unread, total int) er
 		UPDATE folders SET unread = ?, total = ? WHERE account_name = ? AND name = ?
 	`, unread, total, account, folder)
 	return err
+}
+
+// CountMessages returns total messages for an account.
+func (s *Store) CountMessages(account string) (int, error) {
+	var count int
+	err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM messages WHERE account_name = ?
+	`, account).Scan(&count)
+	return count, err
+}
+
+// CountEmbeddings returns total embeddings for an account and model.
+func (s *Store) CountEmbeddings(account, model string) (int, error) {
+	var count int
+	err := s.db.QueryRow(`
+		SELECT COUNT(*)
+		FROM message_embeddings e
+		JOIN messages m ON m.id = e.message_id
+		WHERE m.account_name = ? AND e.model = ?
+	`, account, model).Scan(&count)
+	return count, err
 }
 
 // --- helpers ---

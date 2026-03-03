@@ -1,12 +1,16 @@
 package ui
 
 import (
+	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/bubblmail/bubblmail/cache"
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/data"
+	"github.com/bubblmail/bubblmail/embeddings"
 	imaplib "github.com/bubblmail/bubblmail/imap"
 	outsmtp "github.com/bubblmail/bubblmail/smtp"
 	"github.com/bubblmail/bubblmail/thread"
@@ -32,6 +36,16 @@ type syncMsg struct{ account string }
 // spinnerTickMsg advances the loading spinner.
 type spinnerTickMsg struct{}
 
+// embeddingTickMsg refreshes embedding status.
+type embeddingTickMsg struct{}
+
+// embeddingStartedMsg reports embedding queue activity.
+type embeddingStartedMsg struct {
+	stats embeddingStats
+}
+
+type prefetchTickMsg struct{}
+
 // clearStatusMsg clears the flash message.
 type clearStatusMsg struct{}
 
@@ -40,10 +54,12 @@ type quitTimeoutMsg struct{}
 
 // App is the root Bubble Tea model.
 type App struct {
-	cfg    *config.Config
-	theme  *config.Theme
-	styles *Styles
-	store  *cache.Store
+	cfg       *config.Config
+	theme     *config.Theme
+	styles    *Styles
+	store     *cache.Store
+	embClient *embeddings.Client
+	embQueue  *embeddingQueue
 
 	// IMAP clients, one per account
 	imapClients map[string]*imaplib.Client
@@ -81,8 +97,24 @@ type App struct {
 	loadingMore    bool
 	allLoaded      bool
 	quitPending    bool
+	searchSeq      int
+	searchState    *searchState
+	prefetchSkip   map[int64]bool
 
 	accounts []*data.Account
+}
+
+type searchState struct {
+	seq       int
+	queryVec  []float32
+	queryNorm float32
+	msgs      []*data.Message
+	vectors   [][]float32
+	norms     []float32
+	nextIndex int
+	results   []*embeddings.SearchHit
+	semItems  []embeddings.TopKItem
+	simHeap   *embeddings.TopKHeap
 }
 
 func (a *App) canQuitNow() bool {
@@ -98,20 +130,28 @@ func (a *App) canQuitNow() bool {
 func NewApp(cfg *config.Config, store *cache.Store) *App {
 	theme := config.NewTheme(cfg)
 	styles := NewStyles(theme)
+	embClient, _ := embeddings.NewClient(cfg.Embeddings)
+	var embQueue *embeddingQueue
+	if embClient != nil {
+		embQueue = newEmbeddingQueue(cfg.Embeddings, embClient, store)
+	}
 
 	app := &App{
-		cfg:         cfg,
-		theme:       theme,
-		styles:      styles,
-		store:       store,
-		imapClients: make(map[string]*imaplib.Client),
-		header:      NewHeader(styles),
-		sidebar:     NewSidebar(styles),
-		statusbar:   NewStatusBar(styles),
-		helpOverlay: NewHelpOverlay(styles),
-		showSidebar: true,
-		wantSidebar: true,
-		viewID:      ViewInbox,
+		cfg:          cfg,
+		theme:        theme,
+		styles:       styles,
+		store:        store,
+		embClient:    embClient,
+		embQueue:     embQueue,
+		imapClients:  make(map[string]*imaplib.Client),
+		header:       NewHeader(styles),
+		sidebar:      NewSidebar(styles),
+		statusbar:    NewStatusBar(styles),
+		helpOverlay:  NewHelpOverlay(styles),
+		showSidebar:  true,
+		wantSidebar:  true,
+		viewID:       ViewInbox,
+		prefetchSkip: make(map[int64]bool),
 	}
 
 	app.searchOverlay = NewSearchOverlay(styles)
@@ -150,6 +190,17 @@ func (a *App) Init() tea.Cmd {
 	cmds := []tea.Cmd{
 		tea.SetWindowTitle("bubblmail"),
 	}
+	if a.embQueue != nil {
+		a.statusbar.SetEmbeddingStats(a.embQueue.Stats())
+		cmds = append(cmds, embeddingTick())
+	}
+	if a.cfg.Embeddings.PrefetchBodies {
+		interval := time.Duration(a.cfg.Embeddings.PrefetchIntervalSeconds) * time.Second
+		if interval <= 0 {
+			interval = 2 * time.Second
+		}
+		cmds = append(cmds, prefetchTick(interval))
+	}
 
 	if len(a.cfg.Accounts) == 0 {
 		return tea.Batch(cmds...)
@@ -185,6 +236,12 @@ type connectResultMsg struct {
 	client  *imaplib.Client
 }
 
+type embeddingBackfillMsg struct {
+	account string
+	queued  int
+	err     error
+}
+
 // scheduleSyncTick returns a cmd that fires a sync tick.
 func (a *App) scheduleSyncTick(account string) tea.Cmd {
 	interval := time.Duration(a.cfg.General.SyncIntervalMinutes) * time.Minute
@@ -200,6 +257,29 @@ func (a *App) scheduleSyncTick(account string) tea.Cmd {
 func spinnerTick() tea.Cmd {
 	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
 		return spinnerTickMsg{}
+	})
+}
+
+func (a *App) startEmbeddingBackfill(account string) tea.Cmd {
+	return func() tea.Msg {
+		if a.embQueue == nil {
+			return embeddingBackfillMsg{account: account}
+		}
+		queued, err := a.embQueue.BackfillAccount(account, false)
+		return embeddingBackfillMsg{account: account, queued: queued, err: err}
+	}
+}
+
+func prefetchTick(interval time.Duration) tea.Cmd {
+	return tea.Tick(interval, func(t time.Time) tea.Msg {
+		return prefetchTickMsg{}
+	})
+}
+
+// embeddingTick returns a tick cmd for embedding status updates.
+func embeddingTick() tea.Cmd {
+	return tea.Tick(200*time.Millisecond, func(t time.Time) tea.Msg {
+		return embeddingTickMsg{}
 	})
 }
 
@@ -219,6 +299,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, tea.Batch(
 			msg.client.FetchFolders(),
 			msg.client.FetchMessages(a.activeFolder, a.cfg.General.PageSize),
+			a.startEmbeddingBackfill(msg.account),
 		)
 
 	case imaplib.FolderListMsg:
@@ -238,6 +319,17 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		a.header.SetSyncState("synced")
+		return a, nil
+
+	case embeddingBackfillMsg:
+		if msg.err != nil {
+			a.flash("Embeddings backfill error: "+msg.err.Error(), "err")
+			return a, nil
+		}
+		if msg.queued > 0 && a.embQueue != nil {
+			a.statusbar.SetEmbeddingStats(a.embQueue.Stats())
+			return a, embeddingTick()
+		}
 		return a, nil
 
 	case imaplib.MessageListMsg:
@@ -280,13 +372,23 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case imaplib.MessageBodyMsg:
 		if msg.Err != nil {
-			a.flash("Body fetch error: "+msg.Err.Error(), "err")
+			details := fmt.Sprintf("Body fetch error (%s %s uid=%d id=%d): %s", msg.Account, msg.Folder, msg.UID, msg.MsgID, msg.Err.Error())
+			a.flash(details, "err")
+			if msg.MsgID > 0 {
+				a.prefetchSkip[msg.MsgID] = true
+			}
 			return a, nil
 		}
 		// Store body in cache
 		if msg.MsgID > 0 {
 			if err := a.store.UpsertBody(msg.MsgID, msg.Text, msg.HTML); err != nil {
 				a.flash("Cache error: "+err.Error(), "err")
+			}
+		}
+		if msg.MsgID > 0 && a.embQueue != nil && msg.Text != "" {
+			m := a.findMessageByID(msg.MsgID)
+			if m != nil {
+				return a, a.embedMessage(m, msg.Text)
 			}
 		}
 		// Update reader view — works for both thread and single-message mode.
@@ -334,10 +436,27 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case imaplib.SearchResultMsg:
 		if msg.Err != nil {
+			a.searchOverlay.SetSearchResults(nil, false)
 			a.flash("Search error: "+msg.Err.Error(), "err")
 			return a, nil
 		}
 		a.searchOverlay.SetResults(msg.Messages)
+		return a, nil
+
+	case embeddings.StreamSearchMsg:
+		if msg.Err != nil {
+			a.searchOverlay.SetSearchResults(nil, false)
+			a.flash("Search error: "+msg.Err.Error(), "err")
+			return a, nil
+		}
+		if msg.Seq != a.searchSeq {
+			return a, nil
+		}
+		results := convertSearchResults(msg.Results)
+		a.searchOverlay.SetSearchResults(results, msg.Loading)
+		if msg.Loading {
+			return a, a.searchStreamTick(msg.Seq)
+		}
 		return a, nil
 
 	case outsmtp.SendResultMsg:
@@ -366,6 +485,45 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, spinnerTick()
 		}
 		return a, nil
+
+	case embeddingStartedMsg:
+		a.statusbar.SetEmbeddingStats(msg.stats)
+		if msg.stats.Queued > 0 || msg.stats.InFlight > 0 {
+			return a, embeddingTick()
+		}
+		return a, nil
+
+	case embeddingTickMsg:
+		if a.embQueue != nil {
+			a.statusbar.SetEmbeddingStats(a.embQueue.Stats())
+			stats := a.embQueue.Stats()
+			if stats.Queued > 0 || stats.InFlight > 0 {
+				return a, embeddingTick()
+			}
+		}
+		return a, nil
+
+	case prefetchTickMsg:
+		if !a.cfg.Embeddings.PrefetchBodies {
+			return a, nil
+		}
+		batch := a.cfg.Embeddings.PrefetchBatch
+		if batch <= 0 {
+			batch = 10
+		}
+		cmds := a.prefetchBodies(batch)
+		if len(cmds) == 0 {
+			interval := time.Duration(a.cfg.Embeddings.PrefetchIntervalSeconds) * time.Second
+			if interval <= 0 {
+				interval = 2 * time.Second
+			}
+			return a, prefetchTick(interval)
+		}
+		interval := time.Duration(a.cfg.Embeddings.PrefetchIntervalSeconds) * time.Second
+		if interval <= 0 {
+			interval = 2 * time.Second
+		}
+		return a, tea.Batch(append(cmds, prefetchTick(interval))...)
 
 	case clearStatusMsg:
 		a.statusbar.ClearMessage()
@@ -442,6 +600,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if a.searchOverlay.IsActive() {
 		qChanged, closed, selected := a.searchOverlay.HandleKey(key)
 		if closed {
+			a.searchState = nil
 			if selected {
 				if msg := a.searchOverlay.SelectedMessage(); msg != nil {
 					return a, a.openMessage(msg)
@@ -450,9 +609,12 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.searchOverlay.Close()
 		} else if qChanged {
 			q := a.searchOverlay.Query()
-			if q != "" {
-				return a, a.doLocalSearch(q)
+			if a.searchOverlay.CanSearch() {
+				a.searchOverlay.SetSearchResults(nil, true)
+				a.searchSeq++
+				return a, a.doStreamingSearch(q, a.searchSeq)
 			}
+			a.searchOverlay.SetSearchResults(nil, false)
 		}
 		return a, nil
 	}
@@ -558,8 +720,13 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.cycleAccount(-1)
 
 	case "/":
-		a.searchOverlay.SetSize(a.width, a.height-3)
+		contentH := a.height - a.headerHeight() - a.statusHeight()
+		if contentH < 1 {
+			contentH = 1
+		}
+		a.searchOverlay.SetSize(a.width, contentH)
 		a.searchOverlay.Open()
+		a.searchState = nil
 
 	case "ctrl+f":
 		// IMAP server search
@@ -836,6 +1003,36 @@ func (a *App) fetchMessages() tea.Cmd {
 	)
 }
 
+func (a *App) prefetchBodies(limit int) []tea.Cmd {
+	if limit <= 0 {
+		return nil
+	}
+	var cmds []tea.Cmd
+	for _, acct := range a.accounts {
+		client, ok := a.imapClients[acct.Name]
+		if !ok {
+			continue
+		}
+		msgs, err := a.store.ListBodyPrefetchCandidates(acct.Name, limit)
+		if err != nil {
+			continue
+		}
+		for _, msg := range msgs {
+			if msg == nil {
+				continue
+			}
+			if msg.FolderName == "" {
+				continue
+			}
+			if a.prefetchSkip[msg.ID] {
+				continue
+			}
+			cmds = append(cmds, client.FetchBody(msg.FolderName, msg.UID, msg.ID))
+		}
+	}
+	return cmds
+}
+
 func (a *App) openCompose() tea.Cmd {
 	from := a.senderAddress()
 	a.comp.OpenNew(from)
@@ -1006,7 +1203,229 @@ func (a *App) doLocalSearch(q string) tea.Cmd {
 		if err != nil {
 			return imaplib.SearchResultMsg{Err: err}
 		}
+		items := make([]embeddings.TopKItem, 0, len(msgs))
+		for i, msg := range msgs {
+			if msg == nil {
+				continue
+			}
+			var score float32
+			if len(msgs) > 1 {
+				score = 1 - float32(i)/float32(len(msgs)-1)
+			} else {
+				score = 1
+			}
+			items = append(items, embeddings.TopKItem{Message: msg, Score: score})
+		}
+		if a.searchState != nil {
+			a.searchState.semItems = items
+		}
 		return imaplib.SearchResultMsg{Messages: msgs}
+	}
+}
+
+func (a *App) doStreamingSearch(q string, seq int) tea.Cmd {
+	return func() tea.Msg {
+		query := strings.TrimSpace(q)
+		if query == "" {
+			return embeddings.StreamSearchMsg{Seq: seq, Loading: false}
+		}
+
+		semItems := make([]embeddings.TopKItem, 0)
+		semMsgs, semErr := a.store.SearchLocal(query)
+		if semErr == nil {
+			semItems = make([]embeddings.TopKItem, 0, len(semMsgs))
+			for i, msg := range semMsgs {
+				if msg == nil {
+					continue
+				}
+				var score float32
+				if len(semMsgs) > 1 {
+					score = 1 - float32(i)/float32(len(semMsgs)-1)
+				} else {
+					score = 1
+				}
+				semItems = append(semItems, embeddings.TopKItem{Message: msg, Score: score})
+			}
+		}
+
+		if a.embClient == nil {
+			if semErr != nil {
+				return embeddings.StreamSearchMsg{Seq: seq, Err: semErr}
+			}
+			return embeddings.StreamSearchMsg{Seq: seq, Results: mergeSearchHits(semItems, nil), Loading: false}
+		}
+		ctx := context.Background()
+		vecs, err := a.embClient.EmbedTexts(ctx, []string{query})
+		if err != nil || len(vecs) == 0 {
+			if semErr != nil {
+				return embeddings.StreamSearchMsg{Seq: seq, Err: err}
+			}
+			return embeddings.StreamSearchMsg{Seq: seq, Results: mergeSearchHits(semItems, nil), Loading: false}
+		}
+		queryVec := vecs[0]
+		queryNorm := embeddings.VectorNorm(queryVec)
+
+		maxCandidates := a.cfg.Embeddings.MaxCandidates
+		if maxCandidates <= 0 {
+			maxCandidates = 5000
+		}
+		msgs, vectors, norms, err := a.store.ListEmbeddingCandidates(a.activeAccount, a.cfg.Embeddings.Model, maxCandidates)
+		if err != nil || len(msgs) == 0 {
+			if semErr != nil {
+				return embeddings.StreamSearchMsg{Seq: seq, Err: err}
+			}
+			return embeddings.StreamSearchMsg{Seq: seq, Results: mergeSearchHits(semItems, nil), Loading: false}
+		}
+		kSim := a.cfg.Embeddings.TopSimilar
+		if kSim <= 0 {
+			kSim = 30
+		}
+		simItems := embeddings.TopK(msgs, vectors, norms, queryVec, queryNorm, kSim)
+		results := mergeSearchHits(semItems, simItems)
+		return embeddings.StreamSearchMsg{Seq: seq, Results: results, Loading: false}
+	}
+}
+
+func (a *App) searchStreamTick(seq int) tea.Cmd {
+	return func() tea.Msg {
+		if a.searchState == nil || a.searchState.seq != seq {
+			return nil
+		}
+		return a.searchStreamNext()()
+	}
+}
+
+func (a *App) searchStreamNext() tea.Cmd {
+	return func() tea.Msg {
+		state := a.searchState
+		if state == nil {
+			return nil
+		}
+		batch := a.cfg.Embeddings.StreamBatch
+		if batch <= 0 {
+			batch = 128
+		}
+		total := len(state.msgs)
+		start := state.nextIndex
+		if start >= total {
+			return embeddings.StreamSearchMsg{Seq: state.seq, Results: state.results, Loading: false}
+		}
+		end := start + batch
+		if end > total {
+			end = total
+		}
+		for i := start; i < end; i++ {
+			score := embeddings.CosineSimilarity(state.queryVec, state.queryNorm, state.vectors[i], state.norms[i])
+			state.simHeap.Add(state.msgs[i], score)
+		}
+		sem := state.semItems
+		sim := state.simHeap.ItemsSorted()
+		state.results = mergeSearchHits(sem, sim)
+		state.nextIndex = end
+		loading := end < total
+		return embeddings.StreamSearchMsg{Seq: state.seq, Results: state.results, Loading: loading}
+	}
+}
+
+func mergeSearchHits(sem []embeddings.TopKItem, sim []embeddings.TopKItem) []*embeddings.SearchHit {
+	denomSem := float32(0)
+	if len(sem) > 1 {
+		denomSem = float32(len(sem) - 1)
+	}
+	denomSim := float32(0)
+	if len(sim) > 1 {
+		denomSim = float32(len(sim) - 1)
+	}
+
+	byID := make(map[int64]*embeddings.SearchHit)
+	for i, item := range sem {
+		if item.Message == nil {
+			continue
+		}
+		score := float32(1)
+		if denomSem > 0 {
+			score = 1 - float32(i)/denomSem
+		}
+		entry, ok := byID[item.Message.ID]
+		if !ok {
+			entry = &embeddings.SearchHit{Message: item.Message}
+			byID[item.Message.ID] = entry
+		}
+		entry.Semantic = true
+		entry.Score += score
+	}
+	for i, item := range sim {
+		if item.Message == nil {
+			continue
+		}
+		score := float32(1)
+		if denomSim > 0 {
+			score = 1 - float32(i)/denomSim
+		}
+		entry, ok := byID[item.Message.ID]
+		if !ok {
+			entry = &embeddings.SearchHit{Message: item.Message}
+			byID[item.Message.ID] = entry
+		}
+		entry.Similar = true
+		entry.Score += score
+	}
+
+	merged := make([]*embeddings.SearchHit, 0, len(byID))
+	for _, entry := range byID {
+		merged = append(merged, entry)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].Score == merged[j].Score {
+			return merged[i].Message.Date.After(merged[j].Message.Date)
+		}
+		return merged[i].Score > merged[j].Score
+	})
+
+	withBoth := merged[:0]
+	onlySem := make([]*embeddings.SearchHit, 0, len(merged))
+	onlySim := make([]*embeddings.SearchHit, 0, len(merged))
+	for _, entry := range merged {
+		if entry.Semantic && entry.Similar {
+			withBoth = append(withBoth, entry)
+		} else if entry.Semantic {
+			onlySem = append(onlySem, entry)
+		} else if entry.Similar {
+			onlySim = append(onlySim, entry)
+		}
+	}
+	return append(append(withBoth, onlySem...), onlySim...)
+}
+
+func convertSearchResults(results []*embeddings.SearchHit) []*SearchResult {
+	converted := make([]*SearchResult, 0, len(results))
+	for _, res := range results {
+		converted = append(converted, &SearchResult{
+			Message:  res.Message,
+			Score:    res.Score,
+			Semantic: res.Semantic,
+			Similar:  res.Similar,
+		})
+	}
+	return converted
+}
+
+func (a *App) findMessageByID(id int64) *data.Message {
+	for _, msg := range a.loadedMessages {
+		if msg.ID == id {
+			return msg
+		}
+	}
+	return nil
+}
+
+func (a *App) embedMessage(msg *data.Message, body string) tea.Cmd {
+	return func() tea.Msg {
+		if a.embQueue == nil {
+			return nil
+		}
+		a.embQueue.Enqueue(msg, body)
+		return embeddingStartedMsg{stats: a.embQueue.Stats()}
 	}
 }
 

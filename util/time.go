@@ -51,8 +51,8 @@ func FormatDate(t time.Time) string {
 		return t.Format("Jan 2")
 	}
 
-	// Older: "Jan '23"
-	return t.Format("Jan '06")
+	// Older: "Jan'23"
+	return t.Format("Jan'06")
 }
 
 func sameDay(a, b time.Time) bool {

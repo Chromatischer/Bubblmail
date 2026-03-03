@@ -11,23 +11,33 @@ import (
 
 // SearchOverlay is a floating search box with FTS5 results list.
 type SearchOverlay struct {
-	styles  *Styles
-	width   int
-	height  int
-	active  bool
-	query   string
-	results []*data.Message
-	cursor  int
-	offset  int
+	styles   *Styles
+	width    int
+	height   int
+	active   bool
+	query    string
+	results  []*SearchResult
+	cursor   int
+	offset   int
+	loading  bool
+	minChars int
 
 	// debounce state
 	pendingQuery string
 	debounceID   int
 }
 
+// SearchResult holds a search match and labels.
+type SearchResult struct {
+	Message  *data.Message
+	Score    float32
+	Semantic bool
+	Similar  bool
+}
+
 // NewSearchOverlay creates a new search overlay.
 func NewSearchOverlay(styles *Styles) *SearchOverlay {
-	return &SearchOverlay{styles: styles}
+	return &SearchOverlay{styles: styles, minChars: 5}
 }
 
 // SetSize sets the overlay dimensions.
@@ -43,6 +53,7 @@ func (s *SearchOverlay) Open() {
 	s.results = nil
 	s.cursor = 0
 	s.offset = 0
+	s.loading = false
 }
 
 // Close closes the overlay.
@@ -50,6 +61,7 @@ func (s *SearchOverlay) Close() {
 	s.active = false
 	s.query = ""
 	s.results = nil
+	s.loading = false
 }
 
 // IsActive returns true if the overlay is open.
@@ -62,11 +74,40 @@ func (s *SearchOverlay) Query() string {
 	return s.query
 }
 
+// CanSearch reports whether the current query is long enough to trigger search.
+func (s *SearchOverlay) CanSearch() bool {
+	return len([]rune(strings.TrimSpace(s.query))) >= s.minChars
+}
+
 // SetResults updates the search results.
 func (s *SearchOverlay) SetResults(msgs []*data.Message) {
-	s.results = msgs
+	results := make([]*SearchResult, 0, len(msgs))
+	for _, msg := range msgs {
+		results = append(results, &SearchResult{Message: msg})
+	}
+	s.results = results
+	s.loading = false
 	s.cursor = 0
 	s.offset = 0
+}
+
+// SetSearchResults updates streaming search results.
+func (s *SearchOverlay) SetSearchResults(results []*SearchResult, loading bool) {
+	if results == nil {
+		results = []*SearchResult{}
+	}
+	s.results = results
+	s.loading = loading
+	if len(s.results) == 0 {
+		s.cursor = 0
+		s.offset = 0
+	}
+	if s.cursor >= len(s.results) {
+		s.cursor = len(s.results) - 1
+	}
+	if s.cursor < 0 {
+		s.cursor = 0
+	}
 }
 
 // SelectedMessage returns the currently selected message, or nil.
@@ -74,7 +115,7 @@ func (s *SearchOverlay) SelectedMessage() *data.Message {
 	if s.cursor < 0 || s.cursor >= len(s.results) {
 		return nil
 	}
-	return s.results[s.cursor]
+	return s.results[s.cursor].Message
 }
 
 // HandleKey processes a key press. Returns (queryChanged, closed, selected).
@@ -147,11 +188,11 @@ func (s *SearchOverlay) View() string {
 		Padding(0, 1)
 
 	queryDisplay := s.query
-	if queryDisplay == "" {
+	if strings.TrimSpace(queryDisplay) == "" {
 		queryDisplay = lipgloss.NewStyle().
 			Foreground(theme.TextFaint).
 			Background(theme.SurfaceAlt).
-			Render(icons.Search + " Type to search…")
+			Render("Type at least 5 characters…")
 	} else {
 		queryDisplay = inputStyle.Render(s.query + "▌")
 	}
@@ -165,20 +206,29 @@ func (s *SearchOverlay) View() string {
 	}
 
 	var resultLines []string
-	if len(s.results) == 0 && s.query != "" {
+	if len(s.results) == 0 && strings.TrimSpace(s.query) != "" {
 		emptyMsg := lipgloss.NewStyle().
 			Foreground(theme.TextFaint).
 			Background(theme.Surface).
-			Render("  " + icons.Search + " No results")
+			Render(func() string {
+				if !s.CanSearch() {
+					return "  Keep typing…"
+				}
+				if s.loading {
+					return "  Searching…"
+				}
+				return "  No results"
+			}())
 		resultLines = append(resultLines, emptyMsg)
 	}
 
 	for i := s.offset; i < len(s.results) && i < s.offset+visibleRows; i++ {
-		msg := s.results[i]
+		res := s.results[i]
+		msg := res.Message
 		isSelected := i == s.cursor
 
-		from := util.TruncateText(msg.FromString(), 20)
-		subject := util.TruncateText(msg.Subject, boxWidth-30)
+		from := util.TruncateText(util.SingleLine(msg.FromString()), 20)
+		subject := util.TruncateText(util.SingleLine(msg.Subject), boxWidth-30)
 		date := util.FormatDate(msg.Date)
 
 		var lineStyle, metaStyle lipgloss.Style
@@ -210,16 +260,40 @@ func (s *SearchOverlay) View() string {
 				Render(icons.Unread)
 		}
 
+		badge := ""
+		if res.Semantic || res.Similar {
+			var tags []string
+			if res.Semantic {
+				tags = append(tags, "SEM")
+			}
+			if res.Similar {
+				tags = append(tags, "SIM")
+			}
+			badgeStyle := lipgloss.NewStyle().
+				Foreground(theme.Background).
+				Background(theme.Accent).
+				Padding(0, 1)
+			badge = badgeStyle.Render(strings.Join(tags, " "))
+		}
+
 		fromW := 20
-		subjectW := boxWidth - fromW - 12
+		from = util.PadRight(from, fromW)
+
+		prefix := " " + unread + " " + lineStyle.Render(from+" ")
+		suffix := ""
+		if badge != "" {
+			suffix += " " + badge
+		}
+		suffix += " " + metaStyle.Render(date)
+
+		subjectW := boxWidth - util.VisibleWidth(prefix) - util.VisibleWidth(suffix)
 		if subjectW < 10 {
 			subjectW = 10
 		}
-		from = util.PadRight(from, fromW)
-		subject = util.TruncateText(msg.Subject, subjectW)
+		subject = util.TruncateText(util.SingleLine(msg.Subject), subjectW)
 		subject = util.PadRight(subject, subjectW)
 
-		line := " " + unread + " " + lineStyle.Render(from+" "+subject) + " " + metaStyle.Render(date)
+		line := prefix + lineStyle.Render(subject) + suffix
 		resultLines = append(resultLines, line)
 	}
 
@@ -231,11 +305,14 @@ func (s *SearchOverlay) View() string {
 
 	countLine := ""
 	if len(s.results) > 0 {
+		countLabel := util.PluralCount(len(s.results), "result", "results")
+		if s.loading {
+			countLabel += " · streaming"
+		}
 		countLine = lipgloss.NewStyle().
 			Foreground(theme.TextFaint).
 			Background(theme.Surface).
-			Render("  " + strings.Repeat("─", 10) + " " +
-				util.PluralCount(len(s.results), "result", "results"))
+			Render("  " + strings.Repeat("─", 10) + " " + countLabel)
 	}
 
 	content := strings.Join(append([]string{inputLine, countLine}, resultLines...), "\n")

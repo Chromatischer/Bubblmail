@@ -10,12 +10,13 @@ import (
 
 // StatusBar renders the bottom hint bar with context-sensitive keys and flash messages.
 type StatusBar struct {
-	styles  *Styles
-	width   int
-	message string
-	msgKind string // "info", "ok", "err"
-	spinner int
-	loading bool
+	styles    *Styles
+	width     int
+	message   string
+	msgKind   string // "info", "ok", "err"
+	spinner   int
+	loading   bool
+	embedding embeddingStats
 }
 
 var spinnerFrames = []string{
@@ -52,6 +53,11 @@ func (sb *StatusBar) ClearMessage() {
 // SetLoading sets the spinner state.
 func (sb *StatusBar) SetLoading(loading bool) {
 	sb.loading = loading
+}
+
+// SetEmbeddingStats updates the embedding queue state.
+func (sb *StatusBar) SetEmbeddingStats(stats embeddingStats) {
+	sb.embedding = stats
 }
 
 // AdvanceSpinner advances the spinner frame.
@@ -154,8 +160,8 @@ func (sb *StatusBar) View(context string) string {
 
 	hintsStr := strings.Join(parts, sepStyle.Render("  "))
 
-	// Right side: flash message or spinner
-	var rightStr string
+	// Right side: flash message + status
+	var statusParts []string
 	if sb.message != "" {
 		var color lipgloss.Color
 		switch sb.msgKind {
@@ -166,13 +172,24 @@ func (sb *StatusBar) View(context string) string {
 		default:
 			color = theme.TextMuted
 		}
-		rightStr = lipgloss.NewStyle().
+		statusParts = append(statusParts, lipgloss.NewStyle().
 			Foreground(color).
-			Render(sb.message)
-	} else if sb.loading {
-		rightStr = lipgloss.NewStyle().
+			Render(sb.message))
+	}
+	if sb.loading {
+		statusParts = append(statusParts, lipgloss.NewStyle().
 			Foreground(theme.TextMuted).
-			Render(fmt.Sprintf("%s Loading…", icons.Syncing))
+			Render(fmt.Sprintf("%s Loading…", icons.Syncing)))
+	}
+	if sb.embedding.Queued > 0 || sb.embedding.InFlight > 0 {
+		label := fmt.Sprintf("Embeddings %d in flight · %d queued", sb.embedding.InFlight, sb.embedding.Queued)
+		statusParts = append(statusParts, lipgloss.NewStyle().
+			Foreground(theme.TextMuted).
+			Render(label))
+	}
+	var rightStr string
+	if len(statusParts) > 0 {
+		rightStr = strings.Join(statusParts, sepStyle.Render("  •  "))
 	}
 
 	rightW := lipgloss.Width(rightStr)
