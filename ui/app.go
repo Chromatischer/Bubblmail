@@ -572,8 +572,10 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if key == "q" && !a.canQuitNow() {
-		a.quitPending = false
-		key = "esc"
+		if !a.searchOverlay.IsActive() {
+			a.quitPending = false
+			key = "esc"
+		}
 	}
 
 	const minW, minH = 80, 24
