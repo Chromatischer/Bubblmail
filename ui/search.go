@@ -228,7 +228,7 @@ func (s *SearchOverlay) View() string {
 		isSelected := i == s.cursor
 
 		from := util.TruncateText(util.SingleLine(msg.FromString()), 20)
-		subject := util.TruncateText(util.SingleLine(msg.Subject), boxWidth-30)
+		subject := ""
 		date := util.FormatDate(msg.Date)
 
 		var lineStyle, metaStyle lipgloss.Style
@@ -276,24 +276,37 @@ func (s *SearchOverlay) View() string {
 			badge = badgeStyle.Render(strings.Join(tags, " "))
 		}
 
-		fromW := 20
-		from = util.PadRight(from, fromW)
+		// Fixed-width layout — all widths computed from plain strings only,
+		// never from pre-rendered ANSI spans. Each segment uses Width() so
+		// lipgloss self-pads it; no gap arithmetic against ANSI strings.
+		const fromW = 20
+		const prefixW = 3 // " " + unread(1) + " "
 
-		prefix := " " + unread + " " + lineStyle.Render(from+" ")
-		suffix := ""
+		dateW := util.VisibleWidth(date)
+		badgeW := 0
 		if badge != "" {
-			suffix += " " + badge
+			badgeW = util.VisibleWidth(badge) + 1 // +1 for leading space
 		}
-		suffix += " " + metaStyle.Render(date)
+		suffixW := 1 + dateW + badgeW // leading space before date (or badge)
 
-		subjectW := boxWidth - util.VisibleWidth(prefix) - util.VisibleWidth(suffix)
-		if subjectW < 10 {
-			subjectW = 10
+		subjectW := boxWidth - prefixW - fromW - 1 - suffixW // -1 for space between from and subject
+		if subjectW < 1 {
+			subjectW = 1
 		}
+
 		subject = util.TruncateText(util.SingleLine(msg.Subject), subjectW)
-		subject = util.PadRight(subject, subjectW)
 
-		line := prefix + lineStyle.Render(subject) + suffix
+		// Render each segment with an explicit Width() so it self-pads exactly.
+		fromCell := lineStyle.Width(fromW).Render(from)
+		subjectCell := lineStyle.Width(subjectW).Render(subject)
+
+		suffixParts := ""
+		if badge != "" {
+			suffixParts += " " + badge
+		}
+		suffixParts += " " + metaStyle.Render(date)
+
+		line := " " + unread + " " + fromCell + " " + subjectCell + suffixParts
 		resultLines = append(resultLines, line)
 	}
 

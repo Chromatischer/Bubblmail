@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/mattn/go-runewidth"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // TruncateText truncates s to at most maxCols terminal columns, appending "…" if needed.
@@ -12,15 +12,21 @@ func TruncateText(s string, maxCols int) string {
 	if maxCols <= 0 {
 		return ""
 	}
-	return runewidth.Truncate(s, maxCols, "…")
+	return ansi.Truncate(s, maxCols, "…")
 }
 
 // SingleLine replaces newline and carriage-return characters with spaces so
-// the result never spans more than one terminal line.
+// the result never spans more than one terminal line. It also removes ZWJ
+// (U+200D) characters so that ZWJ emoji sequences (e.g. 🧑‍🍳) are broken into
+// their individual components, preventing layout corruption in terminals such
+// as Alacritty that do not compose ZWJ glyphs.
 func SingleLine(s string) string {
 	return strings.Map(func(r rune) rune {
 		if r == '\n' || r == '\r' {
 			return ' '
+		}
+		if r == 0x200D { // ZWJ — drop it
+			return -1
 		}
 		return r
 	}, s)
@@ -29,13 +35,13 @@ func SingleLine(s string) string {
 // VisibleWidth returns the number of terminal columns occupied by s.
 // ANSI escape codes (CSI and OSC) are stripped before measurement.
 func VisibleWidth(s string) int {
-	return runewidth.StringWidth(StripANSI(s))
+	return ansi.StringWidth(s)
 }
 
 // PadRight pads s with spaces on the right to reach targetCols.
-// Uses runewidth for correct Unicode handling.
+// Uses grapheme-cluster-aware width measurement for correct emoji handling.
 func PadRight(s string, targetCols int) string {
-	w := runewidth.StringWidth(s)
+	w := ansi.StringWidth(s)
 	if w >= targetCols {
 		return s
 	}
@@ -58,7 +64,7 @@ func WrapText(s string, maxCols int) []string {
 	currentW := 0
 
 	for _, word := range words {
-		wordW := runewidth.StringWidth(word)
+		wordW := ansi.StringWidth(word)
 		if currentW == 0 {
 			current = word
 			currentW = wordW
@@ -149,7 +155,7 @@ func splitToWrapWords(s string) []wrapWord {
 
 			// The visible width is the display text between the two BELs.
 			displayText := s[j:k]
-			visW := runewidth.StringWidth(StripANSI(displayText))
+			visW := ansi.StringWidth(displayText)
 
 			words = append(words, wrapWord{raw: s[i:linkEnd], visW: visW})
 			segStart = linkEnd
@@ -185,15 +191,15 @@ func clampWrapWord(w wrapWord, maxCols int) wrapWord {
 			closeIdx := strings.Index(afterBel, osc8Close)
 			if closeIdx >= 0 {
 				displayText := afterBel[:closeIdx]
-				truncated := runewidth.Truncate(StripANSI(displayText), maxCols, "…")
+				truncated := ansi.Truncate(StripANSI(displayText), maxCols, "…")
 				newRaw := osc8Prefix + url + "\x07" + truncated + osc8Close
-				return wrapWord{raw: newRaw, visW: runewidth.StringWidth(truncated)}
+				return wrapWord{raw: newRaw, visW: ansi.StringWidth(truncated)}
 			}
 		}
 	}
 	// Plain (or unrecognised): strip ANSI and truncate.
-	plain := runewidth.Truncate(StripANSI(w.raw), maxCols, "…")
-	return wrapWord{raw: plain, visW: runewidth.StringWidth(plain)}
+	plain := ansi.Truncate(StripANSI(w.raw), maxCols, "…")
+	return wrapWord{raw: plain, visW: ansi.StringWidth(plain)}
 }
 
 func wrapANSILine(s string, maxCols int) []string {

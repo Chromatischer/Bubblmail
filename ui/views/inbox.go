@@ -281,45 +281,46 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool, index int) []str
 		}
 	}
 
-	// Date — right side of row 1
-	dateRendered := sel(lipgloss.NewStyle().Foreground(fgMuted)).Render(util.FormatDate(t.LastDate))
-	dateW := util.VisibleWidth(dateRendered)
+	// Date — right side of row 1. dateW is the plain visible width (no ANSI).
+	dateStr := util.FormatDate(t.LastDate)
+	dateW := util.VisibleWidth(dateStr)
 	tagW := util.VisibleWidth(tagStr)
-	rightPad := sel(lipgloss.NewStyle()).Render(" ")
-	rightPadW := util.VisibleWidth(rightPad)
 
-	// Prefix: flag + space + dot + space
-	prefix := flag + sel(lipgloss.NewStyle()).Render(" ") + dot + sel(lipgloss.NewStyle()).Render(" ")
-	prefixW := util.VisibleWidth(prefix)
+	// Prefix: flag(1) + space(1) + dot(1) + space(1) = 4 cols, always fixed.
+	const prefixW = 4
 	spaceBeforeTags := 0
 	if tagStr != "" {
 		spaceBeforeTags = 1
 	}
-	fromW := w - prefixW - tagW - dateW - spaceBeforeTags - 1
+	fromW := w - prefixW - tagW - dateW - spaceBeforeTags - 1 // -1 for rightPad
 	if fromW < 5 {
 		fromW = 5
 	}
 	fromTrunc := util.TruncateText(fromStr, fromW)
 
-	fromStyle := lipgloss.NewStyle()
+	fromStyle := lipgloss.NewStyle().Width(fromW)
 	if t.HasUnread && !selected {
 		fromStyle = sel(fromStyle.Foreground(theme.Text).Bold(true))
 	} else {
 		fromStyle = sel(fromStyle.Foreground(fgMain))
 	}
-	fromRendered := fromStyle.Render(util.PadRight(fromTrunc, fromW))
+	fromRendered := fromStyle.Render(fromTrunc)
 
-	// Row 1: flag + space + dot + space + from [+ tags] + gap + date
-	row1Parts := prefix + fromRendered
-	if tagStr != "" {
-		row1Parts += " " + tagStr
-	}
-	gap1 := w - util.VisibleWidth(row1Parts) - dateW - rightPadW
-	if gap1 < 1 {
-		gap1 = 1
-	}
-	gapStr1 := sel(lipgloss.NewStyle()).Render(strings.Repeat(" ", gap1))
-	row1 := sel(lipgloss.NewStyle().Width(w)).Render(row1Parts + gapStr1 + dateRendered + rightPad)
+	// Row 1: each segment has a fixed known width; no gap measurement needed.
+	// prefix(4) + from(fromW) [+ space(1) + tags(tagW)] + date(dateW) + pad(1) = w
+	row1 := sel(lipgloss.NewStyle().Width(w)).Render(
+		flag + sel(lipgloss.NewStyle()).Render(" ") +
+			dot + sel(lipgloss.NewStyle()).Render(" ") +
+			fromRendered +
+			func() string {
+				if tagStr != "" {
+					return " " + tagStr
+				}
+				return ""
+			}() +
+			sel(lipgloss.NewStyle().Foreground(fgMuted)).Render(dateStr) +
+			sel(lipgloss.NewStyle()).Render(" "),
+	)
 
 	// Row 2: indent + subject + gap + count
 	subject := util.SingleLine(t.Subject)
@@ -335,20 +336,17 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool, index int) []str
 	}
 	countW := util.VisibleWidth(countStr)
 
+	// Row 2: [indent(prefixW) + subject(textW)] + count(countW) + pad(1) = w
+	// The subject cell is Width(prefixW+textW) so lipgloss self-pads it exactly.
+	textW := w - prefixW - countW - 1 // visible cols available for subject text
+	if textW < 1 {
+		textW = 1
+	}
+	subjectTrunc := util.TruncateText(subject, textW)
 	indent := strings.Repeat(" ", prefixW)
-	subjectW := w - prefixW - countW
-	if subjectW < 5 {
-		subjectW = 5
-	}
-	subjectTrunc := util.TruncateText(subject, subjectW)
-	subjectRendered := sel(lipgloss.NewStyle().Foreground(fgMuted)).Render(indent + subjectTrunc)
+	subjectRendered := sel(lipgloss.NewStyle().Foreground(fgMuted).Width(prefixW + textW)).Render(indent + subjectTrunc)
 
-	gap2 := w - util.VisibleWidth(subjectRendered) - countW - rightPadW
-	if gap2 < 1 {
-		gap2 = 1
-	}
-	gapStr2 := sel(lipgloss.NewStyle()).Render(strings.Repeat(" ", gap2))
-	row2 := sel(lipgloss.NewStyle().Width(w)).Render(subjectRendered + gapStr2 + countStr + rightPad)
+	row2 := sel(lipgloss.NewStyle().Width(w)).Render(subjectRendered + countStr + sel(lipgloss.NewStyle()).Render(" "))
 
 	return []string{row1, row2}
 }
