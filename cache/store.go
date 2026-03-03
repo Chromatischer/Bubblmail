@@ -171,6 +171,162 @@ func (s *Store) SaveEmbedding(msgID int64, model string, vector []float32, norm 
 	return err
 }
 
+// GetEmbedding returns the stored embedding for a message, or nil if missing.
+func (s *Store) GetEmbedding(msgID int64, model string) ([]float32, float32, error) {
+	var vecBlob []byte
+	var norm float32
+	err := s.db.QueryRow(`
+		SELECT vector, norm FROM message_embeddings WHERE message_id = ? AND model = ?
+	`, msgID, model).Scan(&vecBlob, &norm)
+	if err == sql.ErrNoRows {
+		return nil, 0, nil
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	vec, err := embeddings.DecodeVector(vecBlob)
+	if err != nil {
+		return nil, 0, err
+	}
+	return vec, norm, nil
+}
+
+// UpsertFolderEmbedding stores a centroid embedding for a folder.
+func (s *Store) UpsertFolderEmbedding(account, folder, model string, vector []float32, norm float32, sampleCount int) error {
+	encoded, err := embeddings.EncodeVector(vector)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`
+		INSERT INTO folder_embeddings (account_name, folder_name, model, vector, norm, sample_count, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(account_name, folder_name, model) DO UPDATE SET
+			vector = excluded.vector,
+			norm = excluded.norm,
+			sample_count = excluded.sample_count,
+			updated_at = excluded.updated_at
+	`, account, folder, model, encoded, norm, sampleCount, time.Now().Unix())
+	return err
+}
+
+// ListFolderEmbeddings returns all folder embeddings for an account.
+func (s *Store) ListFolderEmbeddings(account, model string) ([]*data.Folder, [][]float32, []float32, []int, error) {
+	rows, err := s.db.Query(`
+		SELECT f.name, f.display_name, f.delimiter, f.attributes, f.depth,
+		       e.vector, e.norm, e.sample_count
+		FROM folder_embeddings e
+		JOIN folders f ON f.account_name = e.account_name AND f.name = e.folder_name
+		WHERE e.account_name = ? AND e.model = ?
+	`, account, model)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	defer rows.Close()
+
+	var folders []*data.Folder
+	var vectors [][]float32
+	var norms []float32
+	var counts []int
+	for rows.Next() {
+		f := &data.Folder{AccountName: account}
+		var attrs string
+		var vecBlob []byte
+		var norm float32
+		var count int
+		if err := rows.Scan(&f.Name, &f.DisplayName, &f.Delimiter, &attrs, &f.Depth, &vecBlob, &norm, &count); err != nil {
+			return nil, nil, nil, nil, err
+		}
+		if attrs != "" {
+			f.Attributes = strings.Split(attrs, " ")
+		}
+		vec, err := embeddings.DecodeVector(vecBlob)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		folders = append(folders, f)
+		vectors = append(vectors, vec)
+		norms = append(norms, norm)
+		counts = append(counts, count)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return folders, vectors, norms, counts, nil
+}
+
+// BuildFolderEmbeddings aggregates message embeddings per folder and stores centroids.
+func (s *Store) BuildFolderEmbeddings(account, model string, perFolderLimit int) error {
+	rows, err := s.db.Query(`
+		SELECT m.folder_name, e.vector, e.norm
+		FROM messages m
+		JOIN message_embeddings e ON e.message_id = m.id
+		WHERE m.account_name = ? AND e.model = ?
+		ORDER BY m.date DESC
+	`, account, model)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type agg struct {
+		sum   []float64
+		count int
+	}
+	aggs := make(map[string]*agg)
+
+	for rows.Next() {
+		var folder string
+		var vecBlob []byte
+		var norm float32
+		if err := rows.Scan(&folder, &vecBlob, &norm); err != nil {
+			return err
+		}
+		if perFolderLimit > 0 {
+			if a := aggs[folder]; a != nil && a.count >= perFolderLimit {
+				continue
+			}
+		}
+		vec, err := embeddings.DecodeVector(vecBlob)
+		if err != nil {
+			return err
+		}
+		a := aggs[folder]
+		if a == nil {
+			a = &agg{sum: make([]float64, len(vec))}
+			aggs[folder] = a
+		}
+		if len(a.sum) != len(vec) {
+			continue
+		}
+		for i, v := range vec {
+			a.sum[i] += float64(v)
+		}
+		a.count++
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for folder, a := range aggs {
+		if a.count == 0 {
+			continue
+		}
+		centroid := make([]float32, len(a.sum))
+		inv := 1.0 / float64(a.count)
+		for i, v := range a.sum {
+			centroid[i] = float32(v * inv)
+		}
+		norm := embeddings.VectorNorm(centroid)
+		if norm == 0 {
+			continue
+		}
+		if err := s.UpsertFolderEmbedding(account, folder, model, centroid, norm, a.count); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // EmbeddingUpToDate returns true if an embedding exists for the message with the same content hash.
 func (s *Store) EmbeddingUpToDate(msgID int64, model, contentHash string) (bool, error) {
 	var existing string

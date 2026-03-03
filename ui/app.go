@@ -46,6 +46,16 @@ type embeddingStartedMsg struct {
 
 type prefetchTickMsg struct{}
 
+type quickMoveResultMsg struct {
+	msgID   int64
+	account string
+	folder  string
+	uid     uint32
+	dest    string
+	score   float32
+	err     error
+}
+
 // clearStatusMsg clears the flash message.
 type clearStatusMsg struct{}
 
@@ -100,8 +110,22 @@ type App struct {
 	searchSeq      int
 	searchState    *searchState
 	prefetchSkip   map[int64]bool
+	quickMenu      *quickMenuState
 
 	accounts []*data.Account
+}
+
+type quickMenuSide int
+
+const (
+	quickMenuNone quickMenuSide = iota
+	quickMenuLeft
+	quickMenuRight
+)
+
+type quickMenuState struct {
+	side quickMenuSide
+	step int
 }
 
 type searchState struct {
@@ -152,6 +176,7 @@ func NewApp(cfg *config.Config, store *cache.Store) *App {
 		wantSidebar:  true,
 		viewID:       ViewInbox,
 		prefetchSkip: make(map[int64]bool),
+		quickMenu:    &quickMenuState{side: quickMenuNone},
 	}
 
 	app.searchOverlay = NewSearchOverlay(styles)
@@ -318,6 +343,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				acct.Folders = msg.Folders
 			}
 		}
+		_ = a.store.BuildFolderEmbeddings(msg.Account, a.cfg.Embeddings.Model, a.cfg.Embeddings.FolderSampleLimit)
 		a.header.SetSyncState("synced")
 		return a, nil
 
@@ -347,6 +373,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		threads := thread.BuildThreads(a.loadedMessages)
 		a.inboxView.SetThreads(threads)
+		a.applyQuickMenuState()
 		a.statusbar.SetLoading(false)
 		return a, a.scheduleSyncTick(msg.Account)
 
@@ -368,6 +395,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		threads := thread.BuildThreads(a.loadedMessages)
 		a.inboxView.AppendThreads(threads)
+		a.applyQuickMenuState()
 		return a, nil
 
 	case imaplib.MessageBodyMsg:
@@ -388,7 +416,14 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.MsgID > 0 && a.embQueue != nil && msg.Text != "" {
 			m := a.findMessageByID(msg.MsgID)
 			if m != nil {
-				return a, a.embedMessage(m, msg.Text)
+				cmd := a.embedMessage(m, msg.Text)
+				if a.cfg.Embeddings.FolderSampleLimit > 0 {
+					return a, tea.Batch(cmd, func() tea.Msg {
+						_ = a.store.BuildFolderEmbeddings(m.AccountName, a.cfg.Embeddings.Model, a.cfg.Embeddings.FolderSampleLimit)
+						return nil
+					})
+				}
+				return a, cmd
 			}
 		}
 		// Update reader view — works for both thread and single-message mode.
@@ -524,6 +559,20 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			interval = 2 * time.Second
 		}
 		return a, tea.Batch(append(cmds, prefetchTick(interval))...)
+
+	case quickMoveResultMsg:
+		if msg.err != nil {
+			a.flash("Quick move failed: "+msg.err.Error(), "err")
+			return a, nil
+		}
+		if msg.dest == "" {
+			a.openFolderPicker()
+			return a, nil
+		}
+		if client, ok := a.imapClients[msg.account]; ok {
+			return a, client.MoveMessage(msg.folder, msg.uid, msg.dest)
+		}
+		return a, nil
 
 	case clearStatusMsg:
 		a.statusbar.ClearMessage()
@@ -741,32 +790,77 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// View-specific navigation
 	case "j", "down":
+		a.closeQuickMenu()
 		a.moveDown()
 		return a, a.maybeLoadMore()
 
 	case "k", "up":
+		a.closeQuickMenu()
 		a.moveUp()
 
 	case "ctrl+d":
+		a.closeQuickMenu()
 		a.pageDown()
 		return a, a.maybeLoadMore()
 
 	case "ctrl+u":
+		a.closeQuickMenu()
 		a.pageUp()
 
 	case "g":
+		a.closeQuickMenu()
 		a.goToTop()
 
 	case "G":
+		a.closeQuickMenu()
 		a.goToBottom()
 		return a, a.maybeLoadMore()
 
 	case "enter":
+		if a.viewID == ViewInbox && a.quickMenu != nil && a.quickMenu.side != quickMenuNone {
+			cmd := a.handleQuickMenuEnter()
+			return a, cmd
+		}
 		return a, a.handleEnter()
 
-	case "esc", "h", "left":
+	case "left":
+		if a.viewID == ViewInbox {
+			if a.quickMenu != nil && a.quickMenu.side == quickMenuLeft {
+				// Same direction again — close
+				a.closeQuickMenu()
+				return a, nil
+			}
+			if a.quickMenu != nil && a.quickMenu.side == quickMenuRight {
+				// Already on right, pressing left advances step
+				cmd := a.openQuickMenu(quickMenuRight)
+				return a, cmd
+			}
+			// Fresh open — left arrow reveals right panel (natural: swipe left → right panel)
+			cmd := a.openQuickMenu(quickMenuRight)
+			return a, cmd
+		}
+		fallthrough
+	case "esc", "h":
 		if a.viewID == ViewReader || a.viewID == ViewFolder {
 			a.viewID = ViewInbox
+		}
+		a.closeQuickMenu()
+
+	case "right":
+		if a.viewID == ViewInbox {
+			if a.quickMenu != nil && a.quickMenu.side == quickMenuRight {
+				// Same direction again — close
+				a.closeQuickMenu()
+				return a, nil
+			}
+			if a.quickMenu != nil && a.quickMenu.side == quickMenuLeft {
+				// Already on left, pressing right advances step
+				cmd := a.openQuickMenu(quickMenuLeft)
+				return a, cmd
+			}
+			// Fresh open — right arrow reveals left panel
+			cmd := a.openQuickMenu(quickMenuLeft)
+			return a, cmd
 		}
 
 	case "c":
@@ -892,6 +986,23 @@ func (a *App) goToBottom() {
 	case ViewFolder:
 		a.folderView.GoToBottom()
 	}
+}
+
+func (a *App) applyQuickMenuState() {
+	if a.inboxView == nil || a.quickMenu == nil {
+		return
+	}
+	if a.quickMenu.side == quickMenuNone || a.viewID != ViewInbox {
+		a.inboxView.SetQuickMenu("", 0)
+		return
+	}
+	side := ""
+	if a.quickMenu.side == quickMenuLeft {
+		side = "left"
+	} else if a.quickMenu.side == quickMenuRight {
+		side = "right"
+	}
+	a.inboxView.SetQuickMenu(side, a.quickMenu.step)
 }
 
 func (a *App) handleEnter() tea.Cmd {
@@ -1117,6 +1228,169 @@ func (a *App) toggleRead() tea.Cmd {
 	client, ok := a.imapClients[a.activeAccount]
 	if ok {
 		return client.SetFlag(a.activeFolder, msg.UID, data.FlagSeen, !read)
+	}
+	return nil
+}
+
+func (a *App) quickMoveMessage() tea.Cmd {
+	if a.viewID != ViewInbox {
+		return nil
+	}
+	msg := a.currentMessage()
+	if msg == nil {
+		return nil
+	}
+	if a.embClient == nil {
+		a.openFolderPicker()
+		return nil
+	}
+	account := a.activeAccount
+	folder := a.activeFolder
+	uid := msg.UID
+	msgID := msg.ID
+
+	return func() tea.Msg {
+		model := a.cfg.Embeddings.Model
+		if model == "" {
+			model = "openai/text-embedding-3-small"
+		}
+		vec, norm, err := a.store.GetEmbedding(msgID, model)
+		if err != nil {
+			return quickMoveResultMsg{msgID: msgID, account: account, folder: folder, uid: uid, err: err}
+		}
+		if vec == nil {
+			bodyText, _, err := a.store.GetBody(msgID)
+			if err != nil {
+				return quickMoveResultMsg{msgID: msgID, account: account, folder: folder, uid: uid, err: err}
+			}
+			content := strings.TrimSpace(msg.Subject + "\n" + bodyText)
+			if bodyText == "" && msg.Snippet != "" {
+				content = strings.TrimSpace(msg.Subject + "\n" + msg.Snippet)
+			}
+			maxChars := a.cfg.Embeddings.MaxContentChars
+			if maxChars <= 0 {
+				maxChars = 8000
+			}
+			if len(content) > maxChars {
+				content = content[:maxChars]
+			}
+			if content != "" {
+				vecs, err := a.embClient.EmbedTexts(context.Background(), []string{content})
+				if err == nil && len(vecs) > 0 {
+					vec = vecs[0]
+					norm = embeddings.VectorNorm(vec)
+					hash := embeddings.HashContent(content)
+					_ = a.store.SaveEmbedding(msgID, model, vec, norm, hash)
+					_ = a.store.BuildFolderEmbeddings(account, model, a.cfg.Embeddings.FolderSampleLimit)
+				}
+			}
+		}
+		if vec == nil || norm == 0 {
+			return quickMoveResultMsg{msgID: msgID, account: account, folder: folder, uid: uid, dest: ""}
+		}
+		folders, vectors, norms, _, err := a.store.ListFolderEmbeddings(account, model)
+		if err != nil {
+			return quickMoveResultMsg{msgID: msgID, account: account, folder: folder, uid: uid, err: err}
+		}
+		bestScore := float32(0)
+		bestFolder := ""
+		for i, f := range folders {
+			if f == nil {
+				continue
+			}
+			if !f.IsSelectable() {
+				continue
+			}
+			if f.Name == folder {
+				continue
+			}
+			if isSystemFolder(f.DisplayName, f.Name) {
+				continue
+			}
+			score := embeddings.CosineSimilarity(vec, norm, vectors[i], norms[i])
+			if score > bestScore {
+				bestScore = score
+				bestFolder = f.Name
+			}
+		}
+		threshold := float32(a.cfg.Embeddings.AutoMoveThreshold)
+		if threshold <= 0 {
+			threshold = 0.27
+		}
+		if bestFolder == "" || bestScore < threshold {
+			return quickMoveResultMsg{msgID: msgID, account: account, folder: folder, uid: uid, dest: "", score: bestScore}
+		}
+		return quickMoveResultMsg{msgID: msgID, account: account, folder: folder, uid: uid, dest: bestFolder, score: bestScore}
+	}
+}
+
+func isSystemFolder(displayName, name string) bool {
+	label := strings.ToLower(strings.TrimSpace(displayName))
+	full := strings.ToLower(strings.TrimSpace(name))
+	if full == "inbox" {
+		return true
+	}
+	system := []string{"inbox", "trash", "deleted", "deleted items", "deleted messages", "bin", "sent", "sent items", "sent mail", "drafts", "archive", "all mail", "junk", "spam"}
+	for _, s := range system {
+		if label == s || full == s {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) closeQuickMenu() {
+	if a.quickMenu == nil {
+		return
+	}
+	a.quickMenu.side = quickMenuNone
+	a.quickMenu.step = 0
+	a.applyQuickMenuState()
+}
+
+func (a *App) openQuickMenu(side quickMenuSide) tea.Cmd {
+	if a.quickMenu == nil {
+		a.quickMenu = &quickMenuState{}
+	}
+	if a.quickMenu.side != side {
+		// Switching sides — reset to step 0
+		a.quickMenu.side = side
+		a.quickMenu.step = 0
+		a.applyQuickMenuState()
+		return nil
+	}
+	// Same side — advance step. If already on the last step, execute it.
+	const maxSteps = 2
+	if a.quickMenu.step >= maxSteps-1 {
+		return a.handleQuickMenuEnter()
+	}
+	a.quickMenu.step++
+	a.applyQuickMenuState()
+	return nil
+}
+
+func (a *App) handleQuickMenuEnter() tea.Cmd {
+	if a.quickMenu == nil || a.quickMenu.side == quickMenuNone {
+		return nil
+	}
+	side := a.quickMenu.side
+	step := a.quickMenu.step
+	a.closeQuickMenu()
+	if side == quickMenuLeft {
+		switch step {
+		case 0:
+			return a.toggleRead()
+		case 1:
+			return a.quickMoveMessage()
+		}
+	}
+	if side == quickMenuRight {
+		switch step {
+		case 0:
+			return a.toggleStar()
+		case 1:
+			return a.deleteMessage()
+		}
 	}
 	return nil
 }
@@ -1614,6 +1888,9 @@ func (a *App) View() string {
 	}
 	if a.sidebarFocused {
 		sbContext = "sidebar"
+	}
+	if a.viewID == ViewInbox && a.quickMenu != nil && a.quickMenu.side != quickMenuNone {
+		sbContext = "quick"
 	}
 
 	statusbar := a.statusbar.View(sbContext)

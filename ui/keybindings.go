@@ -55,6 +55,7 @@ func AllHelpLines() []HelpLine {
 		{"g/G", "Top/bottom"},
 		{"", ""},
 		{"Enter", "Open thread/message"},
+		{icons.ArrowLeftRight + " left/right", "Quick actions"},
 		{"Esc/q/h/" + icons.ArrowLeft, "Back to inbox"},
 		{"", ""},
 		{icons.Reply + "/" + icons.ReplyAll + " r/R", "Reply / Reply All"},

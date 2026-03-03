@@ -10,6 +10,7 @@ import (
 	"github.com/bubblmail/bubblmail/ui/icons"
 	"github.com/bubblmail/bubblmail/util"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // InboxView displays a scrollable list of email threads.
@@ -24,11 +25,27 @@ type InboxView struct {
 	threads []*data.Thread
 	cursor  int // focused thread index
 	offset  int // first visible thread
+	quick   *QuickMenuRender
+}
+
+// QuickMenuRender controls the inline quick action hint rendering.
+type QuickMenuRender struct {
+	Side string
+	Step int
 }
 
 // NewInboxView creates a new inbox view.
 func NewInboxView(theme *config.Theme) *InboxView {
 	return &InboxView{theme: theme}
+}
+
+// SetQuickMenu updates the inline quick action state.
+func (v *InboxView) SetQuickMenu(side string, step int) {
+	if side == "" {
+		v.quick = nil
+		return
+	}
+	v.quick = &QuickMenuRender{Side: side, Step: step}
 }
 
 // SetSize sets the view dimensions.
@@ -181,17 +198,31 @@ func (v *InboxView) View() string {
 }
 
 func (v *InboxView) renderThread(t *data.Thread, selected bool, index int) []string {
-	w := v.width
+	fullW := v.width
 	theme := v.theme
+	quickActive := selected && v.quick != nil
+
+	// We always render mail content at fullW.
+	// When a quick menu is active we build a wider virtual card:
+	//
+	//   [ leftBadge(6) | content(fullW) | rightBadge(6) ]
+	//       total = fullW + 12
+	//
+	// Both side panels are always exactly 6 cols wide so the content never
+	// shifts position. At step 1 the active panel splits its 6 cols into two
+	// tiles (2-col icon + 4-col icon/label) without changing the total width.
+	//
+	// Then we crop a fullW-wide window from it:
+	//   - resting:    crop [6 .. 6+fullW]  → only content visible
+	//   - left slide: crop [0 .. fullW]    → leftBadge + content[:fullW-6]
+	//   - right slide:crop [12 .. 12+fullW]→ content[6:] + rightBadge
+	contentW := fullW
 
 	rowBg := lipgloss.Color("")
 	if !selected && index%2 == 1 {
 		rowBg = theme.Surface
 	}
 
-	// sel applies the selection background to any style when this row is selected.
-	// Every pre-rendered span must go through sel() so that ANSI resets inside
-	// them don't leave gaps in the selection highlight.
 	sel := func(s lipgloss.Style) lipgloss.Style {
 		if selected {
 			return s.Background(theme.Selected)
@@ -209,14 +240,14 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool, index int) []str
 		fgMuted = theme.Background
 	}
 
-	// Flag column: accent ▌ bar for starred/flagged messages, blank otherwise
+	// Flag column
 	flagCh := " "
 	if t.Starred {
 		flagCh = icons.Flag
 	}
 	flag := sel(lipgloss.NewStyle().Foreground(theme.Starred)).Render(flagCh)
 
-	// Status dot: ● unread, blank for read
+	// Status dot
 	var dot string
 	if t.HasUnread {
 		dot = sel(lipgloss.NewStyle().Foreground(theme.Unread)).Render(icons.Unread)
@@ -240,12 +271,12 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool, index int) []str
 			Background(theme.Accent).
 			Padding(0, 1)
 		minFromW := 5
-		maxTagW := w - 3 - lipgloss.Width(util.FormatDate(t.LastDate)) - 2 - minFromW
+		maxTagW := contentW - 3 - lipgloss.Width(util.FormatDate(t.LastDate)) - 2 - minFromW
 		if maxTagW > 0 {
 			var tagParts []string
 			usedW := 0
 			for _, tag := range t.Tags {
-				if len(tagParts) >= 2 { // show at most 2 tags
+				if len(tagParts) >= 2 {
 					break
 				}
 				remaining := maxTagW - usedW
@@ -281,18 +312,16 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool, index int) []str
 		}
 	}
 
-	// Date — right side of row 1. dateW is the plain visible width (no ANSI).
 	dateStr := util.FormatDate(t.LastDate)
 	dateW := util.VisibleWidth(dateStr)
 	tagW := util.VisibleWidth(tagStr)
 
-	// Prefix: flag(1) + space(1) + dot(1) + space(1) = 4 cols, always fixed.
 	const prefixW = 4
 	spaceBeforeTags := 0
 	if tagStr != "" {
 		spaceBeforeTags = 1
 	}
-	fromW := w - prefixW - tagW - dateW - spaceBeforeTags - 1 // -1 for rightPad
+	fromW := contentW - prefixW - tagW - dateW - spaceBeforeTags - 1
 	if fromW < 5 {
 		fromW = 5
 	}
@@ -306,9 +335,7 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool, index int) []str
 	}
 	fromRendered := fromStyle.Render(fromTrunc)
 
-	// Row 1: each segment has a fixed known width; no gap measurement needed.
-	// prefix(4) + from(fromW) [+ space(1) + tags(tagW)] + date(dateW) + pad(1) = w
-	row1 := sel(lipgloss.NewStyle().Width(w)).Render(
+	row1Content := sel(lipgloss.NewStyle().Width(contentW)).Render(
 		flag + sel(lipgloss.NewStyle()).Render(" ") +
 			dot + sel(lipgloss.NewStyle()).Render(" ") +
 			fromRendered +
@@ -322,7 +349,6 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool, index int) []str
 			sel(lipgloss.NewStyle()).Render(" "),
 	)
 
-	// Row 2: indent + subject + gap + count
 	subject := util.SingleLine(t.Subject)
 	if subject == "" {
 		if latest := t.Latest(); latest != nil {
@@ -336,9 +362,7 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool, index int) []str
 	}
 	countW := util.VisibleWidth(countStr)
 
-	// Row 2: [indent(prefixW) + subject(textW)] + count(countW) + pad(1) = w
-	// The subject cell is Width(prefixW+textW) so lipgloss self-pads it exactly.
-	textW := w - prefixW - countW - 1 // visible cols available for subject text
+	textW := contentW - prefixW - countW - 1
 	if textW < 1 {
 		textW = 1
 	}
@@ -346,7 +370,138 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool, index int) []str
 	indent := strings.Repeat(" ", prefixW)
 	subjectRendered := sel(lipgloss.NewStyle().Foreground(fgMuted).Width(prefixW + textW)).Render(indent + subjectTrunc)
 
-	row2 := sel(lipgloss.NewStyle().Width(w)).Render(subjectRendered + countStr + sel(lipgloss.NewStyle()).Render(" "))
+	row2Content := sel(lipgloss.NewStyle().Width(contentW)).Render(
+		subjectRendered + countStr + sel(lipgloss.NewStyle()).Render(" "),
+	)
+
+	if !quickActive {
+		return []string{row1Content, row2Content}
+	}
+
+	// Badge widths:
+	//   badgeW  = width of the step-0 tile (READ / STAR) — stays the same at step 1
+	//   moveW   = width of the step-1 tile (MOVE / DEL)  — wider than badgeW
+	//
+	// Left panel layout:
+	//   step 0: [ READ(badgeW) ]
+	//   step 1: [ MOVE(moveW) | READ(badgeW) ]   ← MOVE grows to the left of READ
+	//
+	// Right panel layout:
+	//   step 0: [ STAR(badgeW) ]
+	//   step 1: [ STAR(badgeW) | DEL(moveW) ]    ← DEL grows to the right of STAR
+	//
+	// cropStart keeps READ / STAR anchored at the same screen edge:
+	//   left  → cropStart always 0 (left edge of left panel is the viewport left edge)
+	//   right → cropStart = leftW + rightW so the window ends flush with the card right edge
+	const (
+		badgeW = 6
+		moveW  = 9
+	)
+
+	// panelWidth returns the total column width for one side's panel.
+	panelWidth := func(isActiveSide bool, step int) int {
+		if isActiveSide && step == 1 {
+			return badgeW + moveW
+		}
+		return badgeW
+	}
+
+	activeSide := v.quick.Side
+	leftW := panelWidth(activeSide == "left", v.quick.Step)
+	rightW := panelWidth(activeSide == "right", v.quick.Step)
+
+	// Build each side panel as a single-row string (we split badges by "\n"
+	// and handle row0/row1 separately).
+	buildPanel := func(side string, totalW int) (row0, row1 string) {
+		isActiveSide := side == activeSide
+		step := 0
+		if isActiveSide {
+			step = v.quick.Step
+		}
+
+		type actionSpec struct {
+			icon  string
+			label string
+			bg    lipgloss.Color
+		}
+
+		actions := func() []actionSpec {
+			if side == "left" {
+				a0 := func() actionSpec {
+					if t.HasUnread {
+						return actionSpec{icons.Read, "READ", v.theme.Unread}
+					}
+					return actionSpec{icons.Unread, "UNRD", v.theme.Unread}
+				}()
+				a1 := actionSpec{icons.FolderOpen, "MOVE", v.theme.Accent}
+				return []actionSpec{a0, a1}
+			}
+			return []actionSpec{
+				{icons.Star, "STAR", v.theme.Starred},
+				{icons.Trash, "DEL", v.theme.Error},
+			}
+		}()
+
+		renderTile := func(a actionSpec, w int, active bool) (string, string) {
+			bg := a.bg
+			fg := v.theme.Background
+			if !active {
+				bg = v.theme.Surface
+				fg = v.theme.TextFaint
+			}
+			r0 := lipgloss.NewStyle().
+				Width(w).Align(lipgloss.Center, lipgloss.Center).
+				Background(bg).Foreground(fg).Bold(active).Height(1).
+				Render(a.icon)
+			r1 := lipgloss.NewStyle().
+				Width(w).Align(lipgloss.Center, lipgloss.Center).
+				Background(bg).Foreground(fg).
+				Render(a.label)
+			return r0, r1
+		}
+
+		if !isActiveSide || step == 0 {
+			// Single tile — active side at step 0, or inactive side (always step 0 appearance).
+			active := isActiveSide // inactive side is dimmed
+			t0, t1 := renderTile(actions[0], totalW, active)
+			return t0, t1
+		}
+
+		// Step 1: two tiles.
+		// Left:  [ MOVE(moveW, active) | READ(badgeW, dimmed) ]
+		// Right: [ STAR(badgeW, dimmed) | DEL(moveW, active) ]
+		if side == "left" {
+			t0r0, t0r1 := renderTile(actions[1], moveW, true)   // MOVE — active, wider, left
+			t1r0, t1r1 := renderTile(actions[0], badgeW, false) // READ — dimmed, same width, right
+			return t0r0 + t1r0, t0r1 + t1r1
+		}
+		// right side
+		t0r0, t0r1 := renderTile(actions[0], badgeW, false) // STAR — dimmed, same width, left
+		t1r0, t1r1 := renderTile(actions[1], moveW, true)   // DEL  — active, wider, right
+		return t0r0 + t1r0, t0r1 + t1r1
+	}
+
+	lb0, lb1 := buildPanel("left", leftW)
+	rb0, rb1 := buildPanel("right", rightW)
+
+	card1 := lipgloss.JoinHorizontal(lipgloss.Top, lb0, row1Content, rb0)
+	card2 := lipgloss.JoinHorizontal(lipgloss.Top, lb1, row2Content, rb1)
+
+	// Crop a fullW-wide window from the virtual card:
+	//   [ leftPanel(leftW) | content(fullW) | rightPanel(rightW) ]
+	//
+	// Left active  → cropStart=0: left panel is already flush at the left edge.
+	// Right active → cropStart = leftW + rightW: window ends flush at the card's
+	//                right edge, keeping STAR / DEL anchored at the right edge.
+	cropStart := 0
+	if activeSide == "right" {
+		cropStart = leftW + rightW
+	}
+
+	cropEnd := cropStart + fullW
+
+	row1 := ansi.Cut(card1, cropStart, cropEnd)
+	row2 := ansi.Cut(card2, cropStart, cropEnd)
 
 	return []string{row1, row2}
 }

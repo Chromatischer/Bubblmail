@@ -114,6 +114,13 @@ func (sb *StatusBar) View(context string) string {
 			{icons.FolderOpen, "enter", "move here"},
 			{icons.Close, "esc", "cancel"},
 		}
+	case "quick":
+		hints = []hint{
+			{icons.ArrowLeftRight, "←/→", "quick actions"},
+			{icons.Check, "enter", "apply"},
+			{icons.ArrowUpDown, "j/k", "navigate"},
+			{icons.Close, "esc", "close"},
+		}
 	case "sidebar":
 		hints = []hint{
 			{icons.ArrowUpDown, "j/k", "navigate"},

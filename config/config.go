@@ -50,19 +50,21 @@ type CacheConfig struct {
 
 // EmbeddingsConfig holds settings for semantic search embeddings.
 type EmbeddingsConfig struct {
-	Model                   string `toml:"model"`
-	APIKey                  string `toml:"api_key"`
-	APIKeyCmd               string `toml:"api_key_cmd"`
-	BaseURL                 string `toml:"base_url"`
-	BatchSize               int    `toml:"batch_size"`
-	StreamBatch             int    `toml:"stream_batch"`
-	TopSemantic             int    `toml:"top_semantic"`
-	TopSimilar              int    `toml:"top_similar"`
-	MaxCandidates           int    `toml:"max_candidates"`
-	MaxContentChars         int    `toml:"max_content_chars"`
-	PrefetchBodies          bool   `toml:"prefetch_bodies"`
-	PrefetchBatch           int    `toml:"prefetch_batch"`
-	PrefetchIntervalSeconds int    `toml:"prefetch_interval_seconds"`
+	Model                   string  `toml:"model"`
+	APIKey                  string  `toml:"api_key"`
+	APIKeyCmd               string  `toml:"api_key_cmd"`
+	BaseURL                 string  `toml:"base_url"`
+	BatchSize               int     `toml:"batch_size"`
+	StreamBatch             int     `toml:"stream_batch"`
+	TopSemantic             int     `toml:"top_semantic"`
+	TopSimilar              int     `toml:"top_similar"`
+	MaxCandidates           int     `toml:"max_candidates"`
+	MaxContentChars         int     `toml:"max_content_chars"`
+	FolderSampleLimit       int     `toml:"folder_sample_limit"`
+	AutoMoveThreshold       float64 `toml:"auto_move_threshold"`
+	PrefetchBodies          bool    `toml:"prefetch_bodies"`
+	PrefetchBatch           int     `toml:"prefetch_batch"`
+	PrefetchIntervalSeconds int     `toml:"prefetch_interval_seconds"`
 }
 
 // DefaultConfig returns a config with sensible defaults.
@@ -89,6 +91,8 @@ func DefaultConfig() *Config {
 			TopSimilar:              30,
 			MaxCandidates:           5000,
 			MaxContentChars:         8000,
+			FolderSampleLimit:       200,
+			AutoMoveThreshold:       0.27,
 			PrefetchBodies:          true,
 			PrefetchBatch:           10,
 			PrefetchIntervalSeconds: 2,
@@ -151,6 +155,12 @@ func Load() (*Config, error) {
 	}
 	if cfg.Embeddings.MaxContentChars == 0 {
 		cfg.Embeddings.MaxContentChars = 8000
+	}
+	if cfg.Embeddings.FolderSampleLimit == 0 {
+		cfg.Embeddings.FolderSampleLimit = 200
+	}
+	if cfg.Embeddings.AutoMoveThreshold == 0 {
+		cfg.Embeddings.AutoMoveThreshold = 0.27
 	}
 	if cfg.Embeddings.PrefetchBatch == 0 {
 		cfg.Embeddings.PrefetchBatch = 10

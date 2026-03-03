@@ -164,6 +164,9 @@ func runEmbeddingsBackfill(force bool) error {
 					return err
 				}
 			}
+			if err := store.BuildFolderEmbeddings(a.Name, model, cfg.Embeddings.FolderSampleLimit); err != nil {
+				return fmt.Errorf("building folder embeddings: %w", err)
+			}
 			batchTexts = batchTexts[:0]
 			batchIDs = batchIDs[:0]
 			batchHashes = batchHashes[:0]

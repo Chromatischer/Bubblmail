@@ -62,6 +62,17 @@ CREATE TABLE IF NOT EXISTS folders (
     UNIQUE(account_name, name)
 );
 
+CREATE TABLE IF NOT EXISTS folder_embeddings (
+    account_name TEXT    NOT NULL,
+    folder_name  TEXT    NOT NULL,
+    model        TEXT    NOT NULL,
+    vector       BLOB    NOT NULL,
+    norm         REAL    NOT NULL,
+    sample_count INTEGER NOT NULL DEFAULT 0,
+    updated_at   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (account_name, folder_name, model)
+);
+
 -- FTS4 virtual table for full-text search (enabled by default in go-sqlite3)
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts4(
     subject,
@@ -86,3 +97,4 @@ CREATE INDEX IF NOT EXISTS idx_messages_account_folder ON messages(account_name,
 CREATE INDEX IF NOT EXISTS idx_messages_thread_id      ON messages(thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_date           ON messages(date DESC);
 CREATE INDEX IF NOT EXISTS idx_embeddings_updated_at   ON message_embeddings(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_folder_embeddings_updated_at ON folder_embeddings(updated_at DESC);
