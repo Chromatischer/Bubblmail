@@ -90,6 +90,7 @@ type App struct {
 	store     *cache.Store
 	embClient *embeddings.Client
 	embQueue  *embeddingQueue
+	debugFile *os.File
 
 	// Classification (smart folders)
 	classifyClient  *classifylib.Client
@@ -541,8 +542,17 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.MsgID > 0 {
 			m := a.findMessageByID(msg.MsgID)
-			if m != nil && a.viewID == ViewReader && a.readerView.CurrentMessage() != nil && a.readerView.CurrentMessage().ID == msg.MsgID {
-				return a, a.loadSuggestedEvent(m)
+			if m != nil && a.viewID == ViewReader {
+				// Single-message mode: trigger when the open message body arrives.
+				if a.readerView.CurrentMessage() != nil && a.readerView.CurrentMessage().ID == msg.MsgID {
+					return a, a.loadSuggestedEvent(m)
+				}
+				// Thread mode: trigger when the latest message's body arrives.
+				if t := a.readerView.CurrentThread(); t != nil {
+					if latest := t.Latest(); latest != nil && latest.ID == msg.MsgID {
+						return a, a.loadSuggestedEvent(latest)
+					}
+				}
 			}
 		}
 		return a, nil
@@ -733,10 +743,18 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case r := <-a.suggestResults:
 				if r.Err != nil && r.Event == nil {
 					a.flash("Suggested event error: "+r.Err.Error(), "err")
-					continue
+					r.Event = &data.SuggestedEvent{
+						MessageID:    r.MessageID,
+						GenerationOK: false,
+						ParseError:   r.Err.Error(),
+					}
 				}
 				if cur := a.readerView.CurrentMessage(); cur != nil && cur.ID == r.MessageID {
 					a.readerView.SetSuggestedEvent(r.Event)
+				} else if t := a.readerView.CurrentThread(); t != nil {
+					if latest := t.Latest(); latest != nil && latest.ID == r.MessageID {
+						a.readerView.SetSuggestedEvent(r.Event)
+					}
 				}
 				if r.Event != nil && !r.Event.GenerationOK && r.Err != nil {
 					a.flash("Suggested event parse error: "+r.Err.Error(), "err")
@@ -1061,7 +1079,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if a.viewID == ViewReader && a.readerView.AttachFocusActive() {
 			return a, a.executeAttachmentAction()
 		}
-		if a.viewID == ViewReader && a.readerView.CurrentMessage() != nil {
+		if a.viewID == ViewReader && a.readerView.HasFocusableEvent() {
 			if cmd := a.copySuggestedEvent(); cmd != nil {
 				return a, cmd
 			}
@@ -1077,7 +1095,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.readerView.FocusNextAttachmentAction(-1)
 			return a, nil
 		}
-		if a.viewID == ViewReader && a.readerView.CurrentMessage() != nil {
+		if a.viewID == ViewReader && a.readerView.HasFocusableEvent() {
 			a.readerView.FocusNextEventAction(-1)
 			return a, nil
 		}
@@ -1108,7 +1126,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.readerView.FocusNextAttachmentAction(1)
 			return a, nil
 		}
-		if a.viewID == ViewReader && a.readerView.CurrentMessage() != nil {
+		if a.viewID == ViewReader && a.readerView.HasFocusableEvent() {
 			a.readerView.FocusNextEventAction(1)
 			return a, nil
 		}
@@ -1358,6 +1376,14 @@ func (a *App) openThread(t *data.Thread) tea.Cmd {
 		}
 	}
 
+	// Trigger suggested event extraction for the latest message.
+	if latest != nil {
+		a.debugLog("openThread: calling loadSuggestedEvent for msg.ID=%d", latest.ID)
+		if cmd := a.loadSuggestedEvent(latest); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+
 	return tea.Batch(cmds...)
 }
 
@@ -1365,7 +1391,9 @@ func (a *App) loadSuggestedEvent(msg *data.Message) tea.Cmd {
 	if msg == nil {
 		return nil
 	}
+	a.debugLog("loadSuggestedEvent: msg.ID=%d", msg.ID)
 	if cached, err := a.store.GetSuggestedEvent(msg.ID); err == nil && cached != nil {
+		a.debugLog("loadSuggestedEvent: found cached GenerationOK=%v HasEvent=%v", cached.GenerationOK, cached.HasEvent)
 		if a.readerView != nil {
 			a.readerView.SetSuggestedEvent(cached)
 		}
@@ -1373,12 +1401,21 @@ func (a *App) loadSuggestedEvent(msg *data.Message) tea.Cmd {
 			return nil
 		}
 	}
-	if a.suggestQueue != nil {
+	if a.suggestQueue == nil {
+		// No extraction client configured — show a clear unavailable state
+		// instead of leaving the view stuck on "Loading suggestion...".
 		if a.readerView != nil {
-			a.readerView.SetSuggestedEvent(nil)
+			a.readerView.SetSuggestedEvent(&data.SuggestedEvent{
+				MessageID:    msg.ID,
+				GenerationOK: false,
+			})
 		}
-		a.suggestQueue.Submit(msg)
+		return nil
 	}
+	if a.readerView != nil {
+		a.readerView.SetSuggestedEvent(nil)
+	}
+	a.suggestQueue.Submit(msg)
 	return nil
 }
 
@@ -2398,4 +2435,15 @@ func (a *App) refreshSmartCounts() {
 		a.smartCounts = counts
 		a.sidebar.SetSmartCounts(a.smartCounts, a.cfg.Classification.Categories)
 	}
+}
+
+func (a *App) debugLog(format string, args ...any) {
+	if a.debugFile == nil {
+		f, err := os.OpenFile("/tmp/bubblmail-debug.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return
+		}
+		a.debugFile = f
+	}
+	fmt.Fprintf(a.debugFile, format+"\n", args...)
 }

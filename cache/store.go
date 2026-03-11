@@ -118,12 +118,23 @@ func (s *Store) UpsertMessages(msgs []*data.Message) error {
 		flags := encodeFlags(m.Flags)
 		refs := strings.Join(m.References, " ")
 
-		if _, err := stmt.Exec(
+		res, err := stmt.Exec(
 			m.AccountName, m.FolderName, m.UID, m.MessageID, m.InReplyTo, refs,
 			m.Subject, string(fromJSON), string(toJSON), string(ccJSON),
 			m.Date.Unix(), flags, m.Size, m.Snippet, m.ThreadID,
-		); err != nil {
+		)
+		if err != nil {
 			return err
+		}
+		if id, err := res.LastInsertId(); err == nil && id > 0 {
+			m.ID = id
+		} else {
+			// ON CONFLICT DO UPDATE: SQLite returns 0 for last_insert_rowid on
+			// a pure update. Look up the existing row ID explicitly.
+			_ = tx.QueryRow(
+				`SELECT id FROM messages WHERE account_name=? AND folder_name=? AND uid=?`,
+				m.AccountName, m.FolderName, m.UID,
+			).Scan(&m.ID)
 		}
 	}
 	return tx.Commit()
@@ -999,6 +1010,107 @@ func (s *Store) GetCategoryCounts(accountName string) (map[string]int, error) {
 	return counts, rows.Err()
 }
 
+// UpsertSuggestedEvent stores or updates the extracted event for a message.
+func (s *Store) UpsertSuggestedEvent(ev *data.SuggestedEvent) error {
+	if ev == nil {
+		return nil
+	}
+	_, err := s.db.Exec(`
+		INSERT INTO suggested_events (
+			message_id, has_event, summary, date, start_time, end_time,
+			location, calendar, status, all_day, recurring, description,
+			model, generated_at, source_hash, plain_text, json_text,
+			parse_error, generation_ok
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(message_id) DO UPDATE SET
+			has_event = excluded.has_event,
+			summary = excluded.summary,
+			date = excluded.date,
+			start_time = excluded.start_time,
+			end_time = excluded.end_time,
+			location = excluded.location,
+			calendar = excluded.calendar,
+			status = excluded.status,
+			all_day = excluded.all_day,
+			recurring = excluded.recurring,
+			description = excluded.description,
+			model = excluded.model,
+			generated_at = excluded.generated_at,
+			source_hash = excluded.source_hash,
+			plain_text = excluded.plain_text,
+			json_text = excluded.json_text,
+			parse_error = excluded.parse_error,
+			generation_ok = excluded.generation_ok
+	`,
+		ev.MessageID,
+		boolToInt(ev.HasEvent),
+		ev.Summary,
+		ev.Date,
+		ev.Start,
+		ev.End,
+		ev.Location,
+		ev.Calendar,
+		ev.Status,
+		boolToInt(ev.AllDay),
+		boolToInt(ev.Recurring),
+		ev.Description,
+		ev.Model,
+		ev.GeneratedAt,
+		ev.SourceHash,
+		ev.PlainText,
+		ev.JSONText,
+		ev.ParseError,
+		boolToInt(ev.GenerationOK),
+	)
+	return err
+}
+
+// GetSuggestedEvent returns the cached suggested event for a message.
+func (s *Store) GetSuggestedEvent(messageID int64) (*data.SuggestedEvent, error) {
+	ev := &data.SuggestedEvent{}
+	var hasEvent, allDay, recurring, generationOK int
+	err := s.db.QueryRow(`
+		SELECT message_id, has_event, summary, date, start_time, end_time,
+		       location, calendar, status, all_day, recurring, description,
+		       model, generated_at, source_hash, plain_text, json_text,
+		       parse_error, generation_ok
+		FROM suggested_events
+		WHERE message_id = ?
+	`, messageID).Scan(
+		&ev.MessageID,
+		&hasEvent,
+		&ev.Summary,
+		&ev.Date,
+		&ev.Start,
+		&ev.End,
+		&ev.Location,
+		&ev.Calendar,
+		&ev.Status,
+		&allDay,
+		&recurring,
+		&ev.Description,
+		&ev.Model,
+		&ev.GeneratedAt,
+		&ev.SourceHash,
+		&ev.PlainText,
+		&ev.JSONText,
+		&ev.ParseError,
+		&generationOK,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	ev.HasEvent = hasEvent != 0
+	ev.AllDay = allDay != 0
+	ev.Recurring = recurring != 0
+	ev.GenerationOK = generationOK != 0
+	return ev, nil
+}
+
 // GetUnclassifiedInboxMessages returns messages from INBOX for an account that
 // have not yet been classified. Limit controls the maximum number returned.
 func (s *Store) GetUnclassifiedInboxMessages(accountName string, limit int) ([]*data.Message, error) {
@@ -1019,4 +1131,11 @@ func (s *Store) GetUnclassifiedInboxMessages(accountName string, limit int) ([]*
 	}
 	defer rows.Close()
 	return scanMessagesWithAccount(rows)
+}
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }

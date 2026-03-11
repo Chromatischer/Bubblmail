@@ -93,6 +93,8 @@ func (sb *StatusBar) View(context string) string {
 	case "reader":
 		hints = []hint{
 			{icons.ArrowUpDown, "j/k", "scroll"},
+			{icons.ArrowLeftRight, "←/→", "event action"},
+			{icons.FloppyDisk, "enter", "copy event"},
 			{icons.Reply, "r", "reply"},
 			{icons.ReplyAll, "R", "reply all"},
 			{icons.Forward, "f", "forward"},

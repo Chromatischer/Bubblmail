@@ -51,7 +51,7 @@ func (h *Header) View() string {
 	appName := lipgloss.NewStyle().
 		Foreground(theme.Accent).
 		Bold(true).
-		Render("bubblmail")
+		Render(icons.Ghost + " Bubblmail")
 
 	var syncStr string
 	switch h.syncState {

@@ -280,7 +280,7 @@ func (sb *Sidebar) View() string {
 		sectionStyle := lipgloss.NewStyle().
 			Foreground(theme.TextMuted).
 			Bold(true)
-		sectionLine := sectionStyle.Render("  " + icons.Robot + " SMART FOLDERS")
+		sectionLine := sectionStyle.Render("  " + icons.Ghost + " SMART FOLDERS")
 		lines = append(lines, sectionLine)
 		row++
 
@@ -442,17 +442,17 @@ func folderIcon(name string, selected bool) string {
 func smartFolderIcon(category string) string {
 	switch strings.ToUpper(category) {
 	case "IMPORTANT":
-		return icons.Lightning
+		return icons.Shield
 	case "GITHUB":
 		return icons.Code
 	case "DELIVERIES":
-		return icons.Package
+		return icons.Outbox
 	case "NEWSLETTERS":
-		return icons.Newspaper
+		return icons.Star
 	case "RECEIPTS":
-		return icons.Receipt
+		return icons.Edit
 	case "SPAM":
-		return icons.Junk
+		return icons.Trash
 	}
 	return icons.Sparkle
 }

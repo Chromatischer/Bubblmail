@@ -90,6 +90,11 @@ func (v *ReaderView) SetSuggestedEvent(ev *data.SuggestedEvent) {
 	v.rebuildLines()
 }
 
+// HasFocusableEvent reports whether the reader has a suggested event with copy actions available.
+func (v *ReaderView) HasFocusableEvent() bool {
+	return v.event != nil && v.event.HasEvent
+}
+
 // FocusNextEventAction advances the copy action focus.
 func (v *ReaderView) FocusNextEventAction(delta int) {
 	if v.event == nil || !v.event.HasEvent {
@@ -362,14 +367,28 @@ func (v *ReaderView) buildThreadLines() {
 	v.msgLineOffsets = make([]int, len(msgs))
 	var all []string
 
+	divider := lipgloss.NewStyle().Foreground(v.theme.Border).Render(strings.Repeat("─", v.width))
 	for i, msg := range msgs {
 		v.msgLineOffsets[i] = len(all)
+		isLatest := i == len(msgs)-1
 
 		if i == 0 {
 			all = append(all, v.fullMsgHeader(msg)...)
 		} else {
 			all = append(all, "") // blank spacer before separator
 			all = append(all, v.compactMsgHeader(msg))
+		}
+
+		// Inject suggested event section after the latest message's header.
+		if isLatest {
+			if extra := v.renderSuggestedEventSection(); len(extra) > 0 {
+				if i > 0 {
+					// compactMsgHeader has no trailing divider — add one before the event.
+					all = append(all, divider)
+				}
+				all = append(all, extra...)
+				all = append(all, divider)
+			}
 		}
 
 		textWidth := v.width - 2

@@ -182,7 +182,7 @@ func (c *Composer) HandleKey(key string) {
 			c.result = &Result{Action: "cancel"}
 			c.active = false
 			return
-		case "ctrl+enter":
+		case "ctrl+s", "ctrl+enter":
 			c.submit()
 			return
 		case "tab":
@@ -214,7 +214,7 @@ func (c *Composer) HandleKey(key string) {
 	f := c.fields[c.focused]
 
 	switch key {
-	case "ctrl+enter":
+	case "ctrl+s", "ctrl+enter":
 		c.submit()
 		return
 	case "esc":
@@ -647,7 +647,7 @@ func (c *Composer) View() string {
 		anonDesc = "anonymize ON"
 	}
 	composerHints := []hintItem{
-		{icons.Send, "ctrl+enter", "send"},
+		{icons.Send, "ctrl+s", "send"},
 		{icons.ChevronRight, "tab", "next field"},
 		{icons.ArrowUpDown, "pgup/pgdn", "scroll"},
 		{icons.Attachment, "@", "attach"},

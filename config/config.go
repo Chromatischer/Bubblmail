@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -253,9 +254,12 @@ func (a *AccountConfig) ResolvePassword() (string, error) {
 	if a.PasswordCmd == "" {
 		return "", nil
 	}
-	parts := strings.Fields(a.PasswordCmd)
-	out, err := exec.Command(parts[0], parts[1:]...).Output()
+	cmd := exec.Command("sh", "-c", a.PasswordCmd)
+	out, err := cmd.Output()
 	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+			return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(ee.Stderr)))
+		}
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
@@ -267,9 +271,12 @@ func (e *EmbeddingsConfig) ResolveAPIKey() (string, error) {
 		return e.APIKey, nil
 	}
 	if e.APIKeyCmd != "" {
-		parts := strings.Fields(e.APIKeyCmd)
-		out, err := exec.Command(parts[0], parts[1:]...).Output()
+		cmd := exec.Command("sh", "-c", e.APIKeyCmd)
+		out, err := cmd.Output()
 		if err != nil {
+			if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+				return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(ee.Stderr)))
+			}
 			return "", err
 		}
 		return strings.TrimSpace(string(out)), nil
