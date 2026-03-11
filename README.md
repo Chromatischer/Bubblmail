@@ -39,6 +39,9 @@ A keyboard-driven terminal email client built for people who live in the shell. 
 - **Full-text search** — FTS4 keyword search across subject, snippet, and body; live results as you type
 - **Email threading** — JWZ-style threading groups conversations correctly across folders
 - **Compose, reply, reply-all, forward** — full composer with To/CC/Subject/Body fields
+- **Semantic search** — embed mail bodies via OpenRouter and rank results by vector similarity alongside keyword search; background backfill keeps the index fresh
+- **Quick actions** — press `←`/`→` in the inbox to reveal action panels that slide in from the edges of the selected row; press again to expose a second action, press a third time to execute; `Enter` executes the highlighted action at any step
+- **Smart move** — the MOVE quick action uses OpenRouter embeddings and cosine similarity to suggest the best destination folder automatically; falls back to the folder picker if no confident match is found
 - **Move to folder** — folder picker with QWERTY quick-select for fast filing
 - **Star and mark read/unread** — local flag changes synced back to IMAP
 - **Delete** — moves to Trash on the server
@@ -52,7 +55,6 @@ A keyboard-driven terminal email client built for people who live in the shell. 
 
 ## Planned Features
 
-- **Semantic search** — embed mail bodies with a local model (Ollama or bundled ONNX) and add vector similarity search alongside keyword search
 - **Tag picker UI** — local labels with color support; backend already implemented, UI overlay pending
 - **Archive action** — `e` key is wired; server-side archive move not yet implemented
 - **HTML rendering improvements** — richer conversion of HTML email to terminal output
@@ -172,11 +174,22 @@ bubblmail list counts             Show unread/total counts per folder
 | `ctrl+d` / `ctrl+u` | Page down/up |
 | `g` / `G` | Jump to top/bottom |
 | `Enter` | Open thread or message |
-| `Esc` / `q` / `h` / `←` | Go back |
+| `←` / `→` | Quick actions (inbox); `←` / `Esc` / `q` / `h` go back elsewhere |
 | `i` | Jump to INBOX |
 | `b` | Toggle sidebar |
 | `\` | Focus sidebar |
 | `Tab` / `Shift+Tab` | Next/prev account |
+
+### Quick Actions (Inbox)
+
+Press `←` or `→` on a selected thread to slide in an action panel from that edge. Press the same direction again to reveal the second action. Press once more to execute it, or press `Enter` at any step.
+
+| Key | Step 0 | Step 1 |
+|-----|--------|--------|
+| `→` | Mark read/unread | Move (smart move) |
+| `←` | Star/unstar | Delete |
+
+Pressing the opposite direction, or any navigation key (`j`/`k` etc.), closes the menu.
 
 ### Mail Actions
 

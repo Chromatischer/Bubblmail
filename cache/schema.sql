@@ -98,3 +98,14 @@ CREATE INDEX IF NOT EXISTS idx_messages_thread_id      ON messages(thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_date           ON messages(date DESC);
 CREATE INDEX IF NOT EXISTS idx_embeddings_updated_at   ON message_embeddings(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_folder_embeddings_updated_at ON folder_embeddings(updated_at DESC);
+
+-- Smart folder classification results (local-only, never synced to IMAP)
+CREATE TABLE IF NOT EXISTS message_categories (
+    message_id     INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    category       TEXT    NOT NULL,
+    confidence     REAL    NOT NULL DEFAULT 1.0,
+    model          TEXT    NOT NULL DEFAULT '',
+    classified_at  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_message_categories_category ON message_categories(category);

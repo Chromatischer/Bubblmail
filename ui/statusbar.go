@@ -114,6 +114,12 @@ func (sb *StatusBar) View(context string) string {
 			{icons.FolderOpen, "enter", "move here"},
 			{icons.Close, "esc", "cancel"},
 		}
+	case "new-folder":
+		hints = []hint{
+			{"", "type", "folder name"},
+			{icons.Check, "enter", "create"},
+			{icons.Close, "esc", "cancel"},
+		}
 	case "quick":
 		hints = []hint{
 			{icons.ArrowLeftRight, "←/→", "quick actions"},
@@ -125,6 +131,7 @@ func (sb *StatusBar) View(context string) string {
 		hints = []hint{
 			{icons.ArrowUpDown, "j/k", "navigate"},
 			{icons.FolderOpen, "enter", "open folder"},
+			{icons.FolderNew, "n", "new folder"},
 			{icons.Close, "esc/\\", "cancel"},
 		}
 	case "folder":

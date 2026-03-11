@@ -73,6 +73,7 @@ func AllHelpLines() []HelpLine {
 		{icons.Inbox + " i", "Jump to INBOX"},
 		{icons.FolderTree + " b", "Toggle sidebar"},
 		{"\\", "Focus sidebar"},
+		{icons.FolderNew + " n", "New folder (sidebar)"},
 		{"Tab/Shift+Tab", "Next/prev account"},
 		{icons.Refresh + " ctrl+r", "Force sync"},
 		{icons.Help + " ?", "Help"},

@@ -28,6 +28,10 @@ type Sidebar struct {
 	hitZones      []sidebarHitZone
 	rowOffset     int // scroll offset within sidebar
 
+	// Smart folders
+	smartCounts     map[string]int
+	smartCategories []string
+
 	// Keyboard focus navigation
 	focused       bool
 	cursorAccount string
@@ -62,6 +66,13 @@ func (sb *Sidebar) SetFolders(account string, folders []*data.Folder) {
 func (sb *Sidebar) SetActive(account, folder string) {
 	sb.activeAccount = account
 	sb.activeFolder = folder
+}
+
+// SetSmartCounts updates the category counts and category list for the smart
+// folders section. Pass nil counts to hide the section.
+func (sb *Sidebar) SetSmartCounts(counts map[string]int, categories []string) {
+	sb.smartCounts = counts
+	sb.smartCategories = categories
 }
 
 // SetFocused enables or disables keyboard navigation mode.
@@ -215,7 +226,7 @@ func (sb *Sidebar) View() string {
 			if name == "" {
 				name = f.Name
 			}
-			if icon := folderIcon(f.Name); icon != "" {
+			if icon := folderIcon(f.Name, isActive || isCursor); icon != "" {
 				name = icon + " " + name
 			}
 
@@ -260,6 +271,88 @@ func (sb *Sidebar) View() string {
 			row++
 		}
 		// Spacer between accounts
+		lines = append(lines, "")
+		row++
+	}
+
+	// Smart Folders section — only rendered when categories are configured
+	if len(sb.smartCategories) > 0 {
+		sectionStyle := lipgloss.NewStyle().
+			Foreground(theme.TextMuted).
+			Bold(true)
+		sectionLine := sectionStyle.Render("  " + icons.Robot + " SMART FOLDERS")
+		lines = append(lines, sectionLine)
+		row++
+
+		for _, cat := range sb.smartCategories {
+			isActive := sb.activeAccount == "" && sb.activeFolder == cat
+			isCursor := sb.focused && sb.cursorAccount == "" && sb.cursorFolder == cat
+
+			var folderStyle lipgloss.Style
+			var padStyle lipgloss.Style
+			if isActive {
+				folderStyle = lipgloss.NewStyle().
+					Foreground(theme.Background).
+					Background(theme.Accent).
+					Bold(true)
+				padStyle = lipgloss.NewStyle().Background(theme.Accent)
+			} else if isCursor {
+				folderStyle = lipgloss.NewStyle().
+					Foreground(theme.Text).
+					Background(theme.Surface)
+				padStyle = lipgloss.NewStyle().Background(theme.Surface)
+			} else {
+				folderStyle = lipgloss.NewStyle().
+					Foreground(theme.Text)
+				padStyle = lipgloss.NewStyle()
+			}
+
+			catIcon := smartFolderIcon(cat)
+			name := titleCase(cat)
+			if catIcon != "" {
+				name = catIcon + " " + name
+			}
+
+			var indent string
+			if isCursor {
+				marker := lipgloss.NewStyle().Foreground(theme.Accent)
+				if isActive {
+					marker = marker.Background(theme.Accent).Foreground(theme.Background)
+				}
+				indent = "  " + marker.Render(">") + " "
+			} else {
+				indent = "    "
+			}
+
+			count := sb.smartCounts[cat]
+			var line string
+			if count > 0 && !isActive {
+				countStyle := lipgloss.NewStyle().Foreground(theme.Unread)
+				countStr := countStyle.Render(fmt.Sprintf(" %d", count))
+				available := sb.width - lipgloss.Width(indent) - 2 - lipgloss.Width(countStr)
+				if available < 0 {
+					available = 0
+				}
+				nameTrunc := truncateFolderName(name, available)
+				line = folderStyle.Render(indent+nameTrunc) + countStr
+			} else {
+				line = folderStyle.Render(indent + name)
+			}
+
+			// Pad to full width
+			lineW := lipgloss.Width(line)
+			if lineW < sb.width {
+				line += padStyle.Render(strings.Repeat(" ", sb.width-lineW))
+			}
+
+			sb.hitZones = append(sb.hitZones, sidebarHitZone{
+				y: row, folder: cat, accountName: "",
+			})
+			lines = append(lines, line)
+			row++
+		}
+
+		// Trailing spacer
 		lines = append(lines, "")
 		row++
 	}
@@ -321,7 +414,7 @@ func truncateFolderName(name string, maxCols int) string {
 	return string(runes[:maxCols-1]) + "…"
 }
 
-func folderIcon(name string) string {
+func folderIcon(name string, selected bool) string {
 	upper := strings.ToUpper(name)
 	switch upper {
 	case "INBOX":
@@ -339,5 +432,36 @@ func folderIcon(name string) string {
 	case "OUTBOX":
 		return icons.Outbox
 	}
+	if selected {
+		return icons.FolderOpen
+	}
 	return icons.Folder
+}
+
+// smartFolderIcon returns the icon for a smart folder category.
+func smartFolderIcon(category string) string {
+	switch strings.ToUpper(category) {
+	case "IMPORTANT":
+		return icons.Lightning
+	case "GITHUB":
+		return icons.Code
+	case "DELIVERIES":
+		return icons.Package
+	case "NEWSLETTERS":
+		return icons.Newspaper
+	case "RECEIPTS":
+		return icons.Receipt
+	case "SPAM":
+		return icons.Junk
+	}
+	return icons.Sparkle
+}
+
+// titleCase converts "GITHUB" → "Github", "IMPORTANT" → "Important".
+func titleCase(s string) string {
+	if s == "" {
+		return s
+	}
+	lower := strings.ToLower(s)
+	return strings.ToUpper(lower[:1]) + lower[1:]
 }

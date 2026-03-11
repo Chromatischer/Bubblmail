@@ -11,11 +11,12 @@ import (
 
 // Config is the top-level configuration.
 type Config struct {
-	General    GeneralConfig    `toml:"general"`
-	Theme      ThemeConfig      `toml:"theme"`
-	Accounts   []AccountConfig  `toml:"account"`
-	Cache      CacheConfig      `toml:"cache"`
-	Embeddings EmbeddingsConfig `toml:"embeddings"`
+	General        GeneralConfig        `toml:"general"`
+	Theme          ThemeConfig          `toml:"theme"`
+	Accounts       []AccountConfig      `toml:"account"`
+	Cache          CacheConfig          `toml:"cache"`
+	Embeddings     EmbeddingsConfig     `toml:"embeddings"`
+	Classification ClassificationConfig `toml:"classification"`
 }
 
 // GeneralConfig holds general app settings.
@@ -46,6 +47,44 @@ type AccountConfig struct {
 // CacheConfig holds cache settings.
 type CacheConfig struct {
 	Dir string `toml:"dir"`
+}
+
+// ClassificationConfig holds settings for AI-powered smart folder categorization.
+type ClassificationConfig struct {
+	Enabled    bool     `toml:"enabled"`
+	Model      string   `toml:"model"`
+	APIKey     string   `toml:"api_key"`
+	APIKeyCmd  string   `toml:"api_key_cmd"`
+	BaseURL    string   `toml:"base_url"`
+	Categories []string `toml:"categories"`
+}
+
+// DefaultCategories are the built-in smart folder categories.
+var DefaultCategories = []string{
+	"IMPORTANT",
+	"GITHUB",
+	"DELIVERIES",
+	"NEWSLETTERS",
+	"RECEIPTS",
+	"SPAM",
+}
+
+// ResolveAPIKey returns the classification API key. Falls back to the
+// embeddings API key resolution logic (same OPENROUTER_API_KEY env var).
+func (c *ClassificationConfig) ResolveAPIKey(embCfg EmbeddingsConfig) (string, error) {
+	if c.APIKey != "" {
+		return c.APIKey, nil
+	}
+	if c.APIKeyCmd != "" {
+		parts := strings.Fields(c.APIKeyCmd)
+		out, err := exec.Command(parts[0], parts[1:]...).Output()
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(out)), nil
+	}
+	// Fall back to embeddings key (same OpenRouter account)
+	return embCfg.ResolveAPIKey()
 }
 
 // EmbeddingsConfig holds settings for semantic search embeddings.
@@ -96,6 +135,12 @@ func DefaultConfig() *Config {
 			PrefetchBodies:          true,
 			PrefetchBatch:           10,
 			PrefetchIntervalSeconds: 2,
+		},
+		Classification: ClassificationConfig{
+			Enabled:    true,
+			Model:      "google/gemini-2.0-flash-lite-001",
+			BaseURL:    "https://openrouter.ai/api/v1",
+			Categories: DefaultCategories,
 		},
 	}
 }
@@ -167,6 +212,15 @@ func Load() (*Config, error) {
 	}
 	if cfg.Embeddings.PrefetchIntervalSeconds == 0 {
 		cfg.Embeddings.PrefetchIntervalSeconds = 2
+	}
+	if cfg.Classification.Model == "" {
+		cfg.Classification.Model = "google/gemini-2.0-flash-lite-001"
+	}
+	if cfg.Classification.BaseURL == "" {
+		cfg.Classification.BaseURL = "https://openrouter.ai/api/v1"
+	}
+	if len(cfg.Classification.Categories) == 0 {
+		cfg.Classification.Categories = DefaultCategories
 	}
 
 	return cfg, nil

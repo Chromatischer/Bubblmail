@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bubblmail/bubblmail/cache"
+	classifylib "github.com/bubblmail/bubblmail/classify"
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/data"
 	"github.com/bubblmail/bubblmail/embeddings"
@@ -25,9 +26,10 @@ import (
 type ViewID int
 
 const (
-	ViewInbox  ViewID = iota
-	ViewReader        // reading a single message
-	ViewFolder        // folder browser
+	ViewInbox       ViewID = iota
+	ViewReader             // reading a single message
+	ViewFolder             // folder browser
+	ViewSmartFolder        // AI-categorized smart folder
 )
 
 // syncMsg triggers a background sync.
@@ -62,6 +64,18 @@ type clearStatusMsg struct{}
 // quitTimeoutMsg clears the pending quit state.
 type quitTimeoutMsg struct{}
 
+// classifyResultMsg is sent when the classification queue produces results.
+type classifyResultMsg struct {
+	account  string
+	category string
+}
+
+// classifyBackfillMsg reports the result of a backfill classification pass.
+type classifyBackfillMsg struct {
+	account string
+	queued  int
+}
+
 // App is the root Bubble Tea model.
 type App struct {
 	cfg       *config.Config
@@ -70,6 +84,13 @@ type App struct {
 	store     *cache.Store
 	embClient *embeddings.Client
 	embQueue  *embeddingQueue
+
+	// Classification (smart folders)
+	classifyClient  *classifylib.Client
+	classifyQueue   *classifylib.Queue
+	classifyResults chan classifylib.ResultMsg
+	smartFolder     string // active smart folder name (when viewID == ViewSmartFolder)
+	smartCounts     map[string]int
 
 	// IMAP clients, one per account
 	imapClients map[string]*imaplib.Client
@@ -81,6 +102,7 @@ type App struct {
 	helpOverlay   *HelpOverlay
 	searchOverlay *SearchOverlay
 	folderPicker  *FolderPickerOverlay
+	newFolder     *NewFolderOverlay
 
 	// Main views
 	viewID     ViewID
@@ -142,10 +164,11 @@ type searchState struct {
 }
 
 func (a *App) canQuitNow() bool {
-	return a.viewID == ViewInbox &&
+	return (a.viewID == ViewInbox || a.viewID == ViewSmartFolder) &&
 		!a.sidebarFocused &&
 		!a.searchOverlay.IsActive() &&
 		!a.folderPicker.IsActive() &&
+		!a.newFolder.IsActive() &&
 		!a.showHelp &&
 		!a.comp.IsActive()
 }
@@ -160,27 +183,39 @@ func NewApp(cfg *config.Config, store *cache.Store) *App {
 		embQueue = newEmbeddingQueue(cfg.Embeddings, embClient, store)
 	}
 
+	classifyClient, _ := classifylib.NewClient(cfg.Classification, cfg.Embeddings)
+	classifyResults := make(chan classifylib.ResultMsg, 256)
+	var classifyQueue *classifylib.Queue
+	if classifyClient != nil {
+		classifyQueue = classifylib.NewQueue(classifyClient, store, classifyResults)
+	}
+
 	app := &App{
-		cfg:          cfg,
-		theme:        theme,
-		styles:       styles,
-		store:        store,
-		embClient:    embClient,
-		embQueue:     embQueue,
-		imapClients:  make(map[string]*imaplib.Client),
-		header:       NewHeader(styles),
-		sidebar:      NewSidebar(styles),
-		statusbar:    NewStatusBar(styles),
-		helpOverlay:  NewHelpOverlay(styles),
-		showSidebar:  true,
-		wantSidebar:  true,
-		viewID:       ViewInbox,
-		prefetchSkip: make(map[int64]bool),
-		quickMenu:    &quickMenuState{side: quickMenuNone},
+		cfg:             cfg,
+		theme:           theme,
+		styles:          styles,
+		store:           store,
+		embClient:       embClient,
+		embQueue:        embQueue,
+		classifyClient:  classifyClient,
+		classifyQueue:   classifyQueue,
+		classifyResults: classifyResults,
+		smartCounts:     make(map[string]int),
+		imapClients:     make(map[string]*imaplib.Client),
+		header:          NewHeader(styles),
+		sidebar:         NewSidebar(styles),
+		statusbar:       NewStatusBar(styles),
+		helpOverlay:     NewHelpOverlay(styles),
+		showSidebar:     true,
+		wantSidebar:     true,
+		viewID:          ViewInbox,
+		prefetchSkip:    make(map[int64]bool),
+		quickMenu:       &quickMenuState{side: quickMenuNone},
 	}
 
 	app.searchOverlay = NewSearchOverlay(styles)
 	app.folderPicker = NewFolderPickerOverlay(styles)
+	app.newFolder = NewNewFolderOverlay(styles)
 	app.inboxView = views.NewInboxView(theme)
 	app.readerView = views.NewReaderView(theme)
 	app.folderView = views.NewFolderView(theme)
@@ -225,6 +260,14 @@ func (a *App) Init() tea.Cmd {
 			interval = 2 * time.Second
 		}
 		cmds = append(cmds, prefetchTick(interval))
+	}
+	if a.classifyQueue != nil {
+		cmds = append(cmds, classifyResultsTick())
+	}
+	// Load any previously cached classification counts immediately so the
+	// sidebar is populated on first render without waiting for new messages.
+	if len(a.cfg.Classification.Categories) > 0 || a.classifyQueue != nil {
+		a.refreshSmartCounts()
 	}
 
 	if len(a.cfg.Accounts) == 0 {
@@ -295,6 +338,21 @@ func (a *App) startEmbeddingBackfill(account string) tea.Cmd {
 	}
 }
 
+// startClassifyBackfill queues unclassified inbox messages for an account.
+func (a *App) startClassifyBackfill(account string) tea.Cmd {
+	return func() tea.Msg {
+		if a.classifyQueue == nil {
+			return classifyBackfillMsg{account: account}
+		}
+		msgs, err := a.store.GetUnclassifiedInboxMessages(account, 200)
+		if err != nil || len(msgs) == 0 {
+			return classifyBackfillMsg{account: account}
+		}
+		a.classifyQueue.Submit(msgs)
+		return classifyBackfillMsg{account: account, queued: len(msgs)}
+	}
+}
+
 func prefetchTick(interval time.Duration) tea.Cmd {
 	return tea.Tick(interval, func(t time.Time) tea.Msg {
 		return prefetchTickMsg{}
@@ -307,6 +365,16 @@ func embeddingTick() tea.Cmd {
 		return embeddingTickMsg{}
 	})
 }
+
+// classifyResultsTick polls the classification results channel.
+func classifyResultsTick() tea.Cmd {
+	return tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg {
+		return classifyPollMsg{}
+	})
+}
+
+// classifyPollMsg is the tick that drains the classify results channel.
+type classifyPollMsg struct{}
 
 // Update implements tea.Model.
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -325,6 +393,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			msg.client.FetchFolders(),
 			msg.client.FetchMessages(a.activeFolder, a.cfg.General.PageSize),
 			a.startEmbeddingBackfill(msg.account),
+			a.startClassifyBackfill(msg.account),
 		)
 
 	case imaplib.FolderListMsg:
@@ -375,6 +444,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.inboxView.SetThreads(threads)
 		a.applyQuickMenuState()
 		a.statusbar.SetLoading(false)
+		// Submit new inbox messages for classification
+		if a.classifyQueue != nil {
+			a.classifyQueue.Submit(msg.Messages)
+		}
 		return a, a.scheduleSyncTick(msg.Account)
 
 	case imaplib.MoreMessageListMsg:
@@ -396,6 +469,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		threads := thread.BuildThreads(a.loadedMessages)
 		a.inboxView.AppendThreads(threads)
 		a.applyQuickMenuState()
+		// Submit newly loaded messages for classification
+		if a.classifyQueue != nil {
+			a.classifyQueue.Submit(msg.Messages)
+		}
 		return a, nil
 
 	case imaplib.MessageBodyMsg:
@@ -451,6 +528,18 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.inboxView.SetThreads(threads)
 		if a.viewID == ViewReader {
 			a.viewID = ViewInbox
+		}
+		return a, nil
+
+	case imaplib.CreateFolderResultMsg:
+		if msg.Err != nil {
+			a.flash(fmt.Sprintf("%s Failed to create folder: %s", icons.Error, msg.Err.Error()), "err")
+			return a, nil
+		}
+		a.flash(fmt.Sprintf("%s Folder '%s' created", icons.FolderNew, msg.Name), "ok")
+		// Refresh folder list for the active account.
+		if client, ok := a.imapClients[a.activeAccount]; ok {
+			return a, client.FetchFolders()
 		}
 		return a, nil
 
@@ -537,6 +626,46 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return a, nil
+
+	case classifyBackfillMsg:
+		// No-op for now; backfill is fire-and-forget
+		return a, nil
+
+	case smartFolderMsg:
+		if msg.err != nil {
+			a.flash("Smart folder error: "+msg.err.Error(), "err")
+			return a, nil
+		}
+		threads := thread.BuildThreads(msg.messages)
+		a.inboxView.SetThreads(threads)
+		return a, nil
+
+	case classifyPollMsg:
+		if a.classifyQueue == nil {
+			return a, nil
+		}
+		// Drain all pending results without blocking
+		changed := false
+		for {
+			select {
+			case r := <-a.classifyResults:
+				if r.Err == nil && r.Category != "" {
+					a.smartCounts[r.Category]++
+					changed = true
+				}
+			default:
+				goto drained
+			}
+		}
+	drained:
+		if changed {
+			a.refreshSmartCounts()
+			// If viewing a smart folder, refresh its thread list
+			if a.viewID == ViewSmartFolder && a.smartFolder != "" {
+				return a, tea.Batch(classifyResultsTick(), a.fetchSmartFolder(a.smartFolder))
+			}
+		}
+		return a, classifyResultsTick()
 
 	case prefetchTickMsg:
 		if !a.cfg.Embeddings.PrefetchBodies {
@@ -683,13 +812,28 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
-	// 4. Help overlay — any key closes it
+	// 4. New folder dialog
+	if a.newFolder.IsActive() {
+		closed := a.newFolder.HandleKey(key)
+		if closed {
+			submitted := a.newFolder.WasSubmitted()
+			name := a.newFolder.Result()
+			a.newFolder.Close()
+			a.newFolder.ClearResult()
+			if submitted && name != "" {
+				return a, a.createFolder(name)
+			}
+		}
+		return a, nil
+	}
+
+	// 5. Help overlay — any key closes it
 	if a.showHelp {
 		a.showHelp = false
 		return a, nil
 	}
 
-	// 5. Sidebar focus mode — routes navigation to sidebar
+	// 6. Sidebar focus mode — routes navigation to sidebar
 	if a.sidebarFocused {
 		switch key {
 		case "j", "down":
@@ -700,10 +844,20 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.sidebar.GoToTop()
 		case "G":
 			a.sidebar.GoToBottom()
+		case "n":
+			a.openNewFolderDialog()
 		case "enter":
 			if acct, folder, ok := a.sidebar.Selected(); ok {
 				a.sidebarFocused = false
 				a.sidebar.SetFocused(false)
+				// Check if the selected item is a smart folder
+				if acct == "" {
+					// Smart folder selected (no account)
+					a.smartFolder = folder
+					a.viewID = ViewSmartFolder
+					a.header.SetFolder(folder)
+					return a, a.fetchSmartFolder(folder)
+				}
 				a.activeAccount = acct
 				a.activeFolder = folder
 				a.sidebar.SetActive(acct, folder)
@@ -721,7 +875,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
-	// 6. Global keys
+	// 7. Global keys
 	switch key {
 	case "ctrl+c":
 		return a, tea.Quit
@@ -907,6 +1061,13 @@ func (a *App) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			contentY := msg.Y - a.headerHeight()
 			acct, folder, ok := a.sidebar.HitTest(msg.X, contentY)
 			if ok && folder != "" {
+				if acct == "" {
+					// Smart folder clicked
+					a.smartFolder = folder
+					a.viewID = ViewSmartFolder
+					a.header.SetFolder(folder)
+					return a, a.fetchSmartFolder(folder)
+				}
 				a.activeAccount = acct
 				a.activeFolder = folder
 				a.sidebar.SetActive(acct, folder)
@@ -1429,6 +1590,24 @@ func (a *App) openFolderPicker() {
 	a.folderPicker.Open(folders, a.activeFolder)
 }
 
+func (a *App) openNewFolderDialog() {
+	contentH := a.height - a.headerHeight() - a.statusHeight()
+	if contentH < 1 {
+		contentH = 1
+	}
+	a.newFolder.SetSize(a.width, contentH)
+	a.newFolder.Open()
+}
+
+func (a *App) createFolder(name string) tea.Cmd {
+	client, ok := a.imapClients[a.activeAccount]
+	if !ok {
+		return a.flash(fmt.Sprintf("%s Not connected", icons.Error), "err")
+	}
+	a.flash(fmt.Sprintf("%s Creating folder '%s'…", icons.FolderNew, name), "info")
+	return client.CreateFolder(name)
+}
+
 func (a *App) moveMessageToFolder(destFolder string) tea.Cmd {
 	msg := a.currentMessage()
 	if msg == nil {
@@ -1807,6 +1986,7 @@ func (a *App) updateLayout() {
 	a.folderView.SetSize(contentW, contentH)
 	a.comp.SetSize(a.width, a.height)
 	a.searchOverlay.SetSize(a.width, contentH)
+	a.newFolder.SetSize(a.width, contentH)
 }
 
 // View implements tea.Model.
@@ -1849,6 +2029,8 @@ func (a *App) View() string {
 		viewContent = a.readerView.View()
 	case ViewFolder:
 		viewContent = a.folderView.View()
+	case ViewSmartFolder:
+		viewContent = a.inboxView.View()
 	}
 
 	if a.showSidebar {
@@ -1868,6 +2050,9 @@ func (a *App) View() string {
 	if a.folderPicker.IsActive() {
 		mainContent = a.folderPicker.View()
 	}
+	if a.newFolder.IsActive() {
+		mainContent = a.newFolder.View()
+	}
 	if a.showHelp {
 		mainContent = a.helpOverlay.View(a.width, contentH)
 	}
@@ -1879,12 +2064,17 @@ func (a *App) View() string {
 		sbContext = "reader"
 	case ViewFolder:
 		sbContext = "folder"
+	case ViewSmartFolder:
+		sbContext = "inbox" // same hints as inbox
 	}
 	if a.searchOverlay.IsActive() {
 		sbContext = "search"
 	}
 	if a.folderPicker.IsActive() {
 		sbContext = "move"
+	}
+	if a.newFolder.IsActive() {
+		sbContext = "new-folder"
 	}
 	if a.sidebarFocused {
 		sbContext = "sidebar"
@@ -1949,4 +2139,31 @@ func toggleFlag(flags []data.Flag, f data.Flag, add bool) []data.Flag {
 		result = append(result, f)
 	}
 	return result
+}
+
+// fetchSmartFolder loads messages for a smart folder category into the inbox view.
+func (a *App) fetchSmartFolder(category string) tea.Cmd {
+	return func() tea.Msg {
+		msgs, err := a.store.GetMessagesByCategory(a.activeAccount, category)
+		if err != nil {
+			return smartFolderMsg{category: category, err: err}
+		}
+		return smartFolderMsg{category: category, messages: msgs}
+	}
+}
+
+// smartFolderMsg delivers messages for a smart folder.
+type smartFolderMsg struct {
+	category string
+	messages []*data.Message
+	err      error
+}
+
+// refreshSmartCounts reloads category counts from the database for the active account.
+func (a *App) refreshSmartCounts() {
+	counts, err := a.store.GetCategoryCounts(a.activeAccount)
+	if err == nil {
+		a.smartCounts = counts
+		a.sidebar.SetSmartCounts(a.smartCounts, a.cfg.Classification.Categories)
+	}
 }

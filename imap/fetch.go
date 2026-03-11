@@ -6,11 +6,11 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/bubblmail/bubblmail/data"
 	tea "github.com/charmbracelet/bubbletea"
 	imaplib "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 	gomail "github.com/emersion/go-message/mail"
-	"github.com/bubblmail/bubblmail/data"
 )
 
 // --- Message types returned by tea.Cmd ---
@@ -64,6 +64,13 @@ type MoveToTrashResultMsg struct {
 	Account string
 	Folder  string
 	UID     uint32
+	Err     error
+}
+
+// CreateFolderResultMsg carries the result of CreateFolder.
+type CreateFolderResultMsg struct {
+	Account string
+	Name    string
 	Err     error
 }
 
@@ -151,6 +158,16 @@ func (c *Client) MoveToTrash(sourceFolder string, uid uint32, trashFolder string
 		defer c.mu.Unlock()
 		err := c.moveToTrash(sourceFolder, uid, trashFolder)
 		return MoveToTrashResultMsg{Account: c.cfg.Name, Folder: sourceFolder, UID: uid, Err: err}
+	}
+}
+
+// CreateFolder returns a tea.Cmd that creates a new IMAP mailbox with the given name.
+func (c *Client) CreateFolder(name string) tea.Cmd {
+	return func() tea.Msg {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		err := c.conn.Create(name, nil).Wait()
+		return CreateFolderResultMsg{Account: c.cfg.Name, Name: name, Err: err}
 	}
 }
 

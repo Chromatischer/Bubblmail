@@ -927,3 +927,96 @@ func scanMessagesWithAccount(rows *sql.Rows) ([]*data.Message, error) {
 	}
 	return msgs, rows.Err()
 }
+
+// UpsertCategory stores or updates the classification result for a message.
+func (s *Store) UpsertCategory(messageID int64, category, model string, confidence float32) error {
+	_, err := s.db.Exec(`
+		INSERT INTO message_categories (message_id, category, confidence, model, classified_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(message_id) DO UPDATE SET
+			category      = excluded.category,
+			confidence    = excluded.confidence,
+			model         = excluded.model,
+			classified_at = excluded.classified_at
+	`, messageID, category, confidence, model, time.Now().Unix())
+	return err
+}
+
+// GetCategory returns the stored category for a message, or ("", nil) if none.
+func (s *Store) GetCategory(messageID int64) (string, error) {
+	var category string
+	err := s.db.QueryRow(
+		`SELECT category FROM message_categories WHERE message_id = ?`, messageID,
+	).Scan(&category)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return category, err
+}
+
+// GetMessagesByCategory returns all messages across all folders for an account
+// that have been classified into the given category, ordered newest first.
+func (s *Store) GetMessagesByCategory(accountName, category string) ([]*data.Message, error) {
+	rows, err := s.db.Query(`
+		SELECT m.id, m.uid, 0, m.message_id, m.in_reply_to, m.refs,
+		       m.subject, m.from_addr, m.to_addr, m.cc_addr,
+		       m.date, m.flags, m.size, m.snippet, m.thread_id,
+		       m.account_name, m.folder_name
+		FROM messages m
+		JOIN message_categories mc ON mc.message_id = m.id
+		WHERE m.account_name = ? AND mc.category = ?
+		ORDER BY m.date DESC
+	`, accountName, category)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanMessagesWithAccount(rows)
+}
+
+// GetCategoryCounts returns a map of category → message count for an account.
+func (s *Store) GetCategoryCounts(accountName string) (map[string]int, error) {
+	rows, err := s.db.Query(`
+		SELECT mc.category, COUNT(*) as cnt
+		FROM message_categories mc
+		JOIN messages m ON m.id = mc.message_id
+		WHERE m.account_name = ?
+		GROUP BY mc.category
+	`, accountName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	counts := make(map[string]int)
+	for rows.Next() {
+		var cat string
+		var cnt int
+		if err := rows.Scan(&cat, &cnt); err != nil {
+			return nil, err
+		}
+		counts[cat] = cnt
+	}
+	return counts, rows.Err()
+}
+
+// GetUnclassifiedInboxMessages returns messages from INBOX for an account that
+// have not yet been classified. Limit controls the maximum number returned.
+func (s *Store) GetUnclassifiedInboxMessages(accountName string, limit int) ([]*data.Message, error) {
+	rows, err := s.db.Query(`
+		SELECT m.id, m.uid, 0, m.message_id, m.in_reply_to, m.refs,
+		       m.subject, m.from_addr, m.to_addr, m.cc_addr,
+		       m.date, m.flags, m.size, m.snippet, m.thread_id,
+		       m.account_name, m.folder_name
+		FROM messages m
+		LEFT JOIN message_categories mc ON mc.message_id = m.id
+		WHERE m.account_name = ? AND UPPER(m.folder_name) = 'INBOX'
+		  AND mc.message_id IS NULL
+		ORDER BY m.date DESC
+		LIMIT ?
+	`, accountName, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanMessagesWithAccount(rows)
+}

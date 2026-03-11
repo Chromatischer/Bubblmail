@@ -121,4 +121,15 @@ const (
 	Heartbeat    = ""
 	HeartEmpty   = ""
 	HeartCracked = ""
+
+	// Smart folder / AI classification icons
+	Robot     = ""
+	Sparkle   = ""
+	Sparkles  = ""
+	Lightning = "陸"
+	Package   = ""
+	Newspaper = ""
+	Receipt   = "ﻙ"
+	ShieldOff = "陋"
+	StarFour  = ""
 )
