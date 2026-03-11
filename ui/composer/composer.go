@@ -1,6 +1,8 @@
 package composer
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/bubblmail/bubblmail/config"
@@ -24,12 +26,18 @@ type Composer struct {
 	height  int
 	active  bool
 	result  *Result
-	focused int // 0=To, 1=CC, 2=Subject, 3=Body
+	focused int // 0=To, 1=CC, 2=Subject, 3=Body, 4=Attachments
 	mode    string
 	bodyTop int
 
 	fields []*Field
 	from   data.Address
+
+	// File attachments
+	attachments  []Attachment
+	filePicker   *filePicker
+	anonymize    bool
+	attachCursor int // selected index in attachment list when focused==4
 }
 
 const (
@@ -39,7 +47,10 @@ const (
 
 // NewComposer creates a new composer overlay.
 func NewComposer(theme *config.Theme) *Composer {
-	return &Composer{theme: theme}
+	return &Composer{
+		theme:      theme,
+		filePicker: newFilePicker(theme),
+	}
 }
 
 // OpenNew opens the composer for a new email.
@@ -50,6 +61,9 @@ func (c *Composer) OpenNew(from data.Address) {
 	c.focused = 0
 	c.mode = "New Message"
 	c.bodyTop = 0
+	c.attachments = nil
+	c.anonymize = false
+	c.attachCursor = 0
 	c.fields = []*Field{
 		{Label: "To", Kind: FieldText},
 		{Label: "CC", Kind: FieldText},
@@ -65,6 +79,9 @@ func (c *Composer) OpenReply(from data.Address, orig *data.Message, replyAll boo
 	c.result = nil
 	c.focused = 3 // jump to body
 	c.bodyTop = 0
+	c.attachments = nil
+	c.anonymize = false
+	c.attachCursor = 0
 	if replyAll {
 		c.mode = "Reply All"
 	} else {
@@ -99,6 +116,9 @@ func (c *Composer) OpenForward(from data.Address, orig *data.Message) {
 	c.focused = 0
 	c.mode = "Forward"
 	c.bodyTop = 0
+	c.attachments = nil
+	c.anonymize = false
+	c.attachCursor = 0
 
 	subject := orig.Subject
 	if !strings.HasPrefix(strings.ToLower(subject), "fwd:") {
@@ -141,9 +161,56 @@ func (c *Composer) HandleKey(key string) {
 	if !c.active {
 		return
 	}
-	if c.focused < 0 || c.focused >= len(c.fields) {
+
+	// If file picker is open, route all keys to it.
+	if c.filePicker.isActive() {
+		path, isDir, accepted, _ := c.filePicker.handleKey(key)
+		if accepted {
+			c.addAttachment(path, isDir)
+		}
+		return
+	}
+
+	if c.focused < 0 || c.focused > len(c.fields) {
 		c.focused = 0
 	}
+
+	// ── Attachment list focus ─────────────────────────────────────────────
+	if c.focused == len(c.fields) { // attachment list
+		switch key {
+		case "esc":
+			c.result = &Result{Action: "cancel"}
+			c.active = false
+			return
+		case "ctrl+enter":
+			c.submit()
+			return
+		case "tab":
+			c.focused = 0
+			return
+		case "shift+tab":
+			c.focused = len(c.fields) - 1
+			return
+		case "up":
+			if c.attachCursor > 0 {
+				c.attachCursor--
+			}
+			return
+		case "down":
+			if c.attachCursor < len(c.attachments)-1 {
+				c.attachCursor++
+			}
+			return
+		case "backspace", "delete":
+			c.removeAttachment(c.attachCursor)
+			return
+		case "ctrl+r":
+			c.anonymize = !c.anonymize
+			return
+		}
+		return
+	}
+
 	f := c.fields[c.focused]
 
 	switch key {
@@ -155,10 +222,26 @@ func (c *Composer) HandleKey(key string) {
 		c.active = false
 		return
 	case "tab":
-		c.focused = (c.focused + 1) % len(c.fields)
+		next := c.focused + 1
+		if next == len(c.fields) && len(c.attachments) == 0 {
+			next = 0
+		}
+		c.focused = next % (len(c.fields) + 1)
 		return
 	case "shift+tab":
-		c.focused = (c.focused - 1 + len(c.fields)) % len(c.fields)
+		prev := c.focused - 1
+		if prev < 0 {
+			if len(c.attachments) > 0 {
+				c.focused = len(c.fields)
+			} else {
+				c.focused = len(c.fields) - 1
+			}
+			return
+		}
+		c.focused = prev
+		return
+	case "ctrl+r":
+		c.anonymize = !c.anonymize
 		return
 	case "up":
 		if f.Kind == FieldTextArea {
@@ -180,7 +263,6 @@ func (c *Composer) HandleKey(key string) {
 		if f.Kind == FieldTextArea {
 			f.insert("\n")
 		} else {
-			// Move to next field
 			c.focused = (c.focused + 1) % len(c.fields)
 		}
 		return
@@ -201,10 +283,55 @@ func (c *Composer) HandleKey(key string) {
 		return
 	default:
 		if len(key) == 1 && key[0] >= 32 {
+			// Trigger file picker when @ is typed in the body field.
+			if key == "@" && c.focused == 3 {
+				c.filePicker.activate()
+				return
+			}
 			f.insert(key)
 		}
 	}
 	c.ensureBodyVisible()
+}
+
+// addAttachment attaches a path. If isDir is true, zip it first.
+func (c *Composer) addAttachment(path string, isDir bool) {
+	if isDir {
+		zipPath, err := zipDir(path)
+		if err != nil {
+			return // silently ignore; could surface as status msg
+		}
+		c.attachments = append(c.attachments, Attachment{
+			Path:        zipPath,
+			DisplayName: filepath.Base(path) + ".zip",
+			IsDir:       true,
+			Compressed:  true,
+			TempFile:    true,
+		})
+	} else {
+		c.attachments = append(c.attachments, Attachment{
+			Path:        path,
+			DisplayName: filepath.Base(path),
+		})
+	}
+}
+
+// removeAttachment removes the attachment at idx, clamping the cursor.
+func (c *Composer) removeAttachment(idx int) {
+	if idx < 0 || idx >= len(c.attachments) {
+		return
+	}
+	a := c.attachments[idx]
+	if a.TempFile {
+		_ = os.Remove(a.Path)
+	}
+	c.attachments = append(c.attachments[:idx], c.attachments[idx+1:]...)
+	if c.attachCursor >= len(c.attachments) && c.attachCursor > 0 {
+		c.attachCursor--
+	}
+	if len(c.attachments) == 0 && c.focused == len(c.fields) {
+		c.focused = len(c.fields) - 1
+	}
 }
 
 // HandleMouse processes mouse input for composer scrolling.
@@ -236,23 +363,49 @@ func (c *Composer) submit() {
 	to := parseAddresses(toStr)
 	cc := parseAddresses(ccStr)
 
+	var smtpAttachments []outsmtp.Attachment
+	for i, a := range c.attachments {
+		smtpAttachments = append(smtpAttachments, outsmtp.Attachment{
+			Path:     a.Path,
+			Filename: a.sendName(i, c.anonymize),
+		})
+	}
+
 	draft := &outsmtp.ComposedMessage{
-		From:    c.from,
-		To:      to,
-		CC:      cc,
-		Subject: subject,
-		Body:    body,
+		From:        c.from,
+		To:          to,
+		CC:          cc,
+		Subject:     subject,
+		Body:        body,
+		Attachments: smtpAttachments,
 	}
 
 	c.result = &Result{Action: "send", Draft: draft}
 	c.active = false
 }
 
-// composerBodyOverhead is the total number of rows consumed outside the body
-// area: title(1) + from(1) + divider(1) + To(1) + CC(1) + Subject(1) +
-// sectionDiv(1) + divider(1) + hints(1) = 9 content rows, plus box border(2)
-// + box padding top/bottom(2) = 13 total.
-const composerBodyOverhead = 13
+// ── Layout helpers ────────────────────────────────────────────────────────────
+
+// attachSectionRows returns the number of rows the attachment section occupies.
+func (c *Composer) attachSectionRows() int {
+	if len(c.attachments) == 0 {
+		return 0
+	}
+	return 1 + len(c.attachments) // header + one row per attachment
+}
+
+// bodyHeight computes available rows for the body / file picker area.
+func (c *Composer) bodyHeight() int {
+	// Fixed rows consumed: title(1) + from(1) + topDivider(1) + 3 header fields(3) + sectionDiv(1) = 8
+	// After body: attachSection + divider(1) + hints(1)
+	// Box overhead: padding top(1) + padding bot(1) + border top(1) + border bot(1) = 4
+	fixed := 8 + 1 + 1 + 4 + c.attachSectionRows()
+	h := c.height - fixed
+	if h < 3 {
+		h = 3
+	}
+	return h
+}
 
 // View renders the composer overlay.
 func (c *Composer) View() string {
@@ -317,11 +470,10 @@ func (c *Composer) View() string {
 
 	rows = append(rows, sectionDiv)
 
-	// ── Body field ───────────────────────────────────────────────────────────
+	// ── Body / File Picker area ───────────────────────────────────────────────
 	bodyF := c.fields[3]
 	bodyFocused := c.focused == 3
 
-	// Label / separator colours follow focus state.
 	var bodyLabelFg, bodySepFg lipgloss.Color
 	var bodySepStr string
 	if bodyFocused {
@@ -343,8 +495,6 @@ func (c *Composer) View() string {
 
 	bodySep := lipgloss.NewStyle().Foreground(bodySepFg).Background(theme.Surface).Render(bodySepStr)
 
-	// Use plain char counts — never measure pre-rendered ANSI strings.
-	// composerLabelWidth(10) + sepStr(3) = 13 chars of prefix.
 	const bodyPrefixWidth = composerLabelWidth + 3
 	indent := lipgloss.NewStyle().Background(theme.Surface).Render(strings.Repeat(" ", bodyPrefixWidth))
 	textW := innerW - bodyPrefixWidth
@@ -352,61 +502,159 @@ func (c *Composer) View() string {
 		textW = 1
 	}
 
-	bodyLines := strings.Split(bodyF.Value, "\n")
-	bodyH := c.height - len(rows) - 6 // matches composerBodyOverhead
-	if bodyH < 3 {
-		bodyH = 3
-	}
-	start, end := c.bodyWindow(bodyF, bodyH)
-	visible := bodyLines[start:end]
+	bodyH := c.bodyHeight()
 
-	for idx, line := range visible {
-		lineStyle := lipgloss.NewStyle().
-			Foreground(theme.Text).
-			Background(theme.SurfaceAlt).
-			Width(textW)
+	if c.filePicker.isActive() {
+		// Replace body rows with the file picker.
+		pickerLines := strings.Split(c.filePicker.view(textW, bodyH), "\n")
+		for idx, line := range pickerLines {
+			prefix := indent
+			if idx == 0 {
+				prefix = bodyLabel + bodySep
+			}
+			rows = append(rows, prefix+line)
+		}
+		// Pad remaining rows so the box height stays stable.
+		for i := len(pickerLines); i < bodyH; i++ {
+			rows = append(rows, indent+lipgloss.NewStyle().
+				Background(theme.Surface).Width(textW).Render(""))
+		}
+	} else {
+		bodyLines := strings.Split(bodyF.Value, "\n")
+		start, end := c.bodyWindow(bodyF, bodyH)
+		visible := bodyLines[start:end]
 
-		display := line
-		if bodyFocused {
-			cursorLine := c.cursorLine(bodyF)
-			if cursorLine == start+idx {
-				col := c.cursorColumn(bodyF)
-				lineRunes := []rune(line)
-				if col > len(lineRunes) {
-					col = len(lineRunes)
+		for idx, line := range visible {
+			lineStyle := lipgloss.NewStyle().
+				Foreground(theme.Text).
+				Background(theme.SurfaceAlt).
+				Width(textW)
+
+			display := line
+			if bodyFocused {
+				cursorLine := c.cursorLine(bodyF)
+				if cursorLine == start+idx {
+					col := c.cursorColumn(bodyF)
+					lineRunes := []rune(line)
+					if col > len(lineRunes) {
+						col = len(lineRunes)
+					}
+					display = string(lineRunes[:col]) + "▌" + string(lineRunes[col:])
 				}
-				display = string(lineRunes[:col]) + "▌" + string(lineRunes[col:])
+			}
+
+			prefix := indent
+			if idx == 0 {
+				prefix = bodyLabel + bodySep
+			}
+			rows = append(rows, prefix+lineStyle.Render(display))
+		}
+		// Pad empty lines to keep height stable.
+		for i := len(visible); i < bodyH; i++ {
+			prefix := indent
+			if i == 0 {
+				prefix = bodyLabel + bodySep
+			}
+			rows = append(rows, prefix+lipgloss.NewStyle().
+				Background(theme.SurfaceAlt).Width(textW).Render(""))
+		}
+	}
+
+	// ── Attachments section ───────────────────────────────────────────────────
+	if len(c.attachments) > 0 {
+		attachFocused := c.focused == len(c.fields)
+
+		var attachLabelFg lipgloss.Color
+		var attachSepStr string
+		var attachSepFg lipgloss.Color
+		if attachFocused {
+			attachLabelFg = theme.Accent
+			attachSepFg = theme.Accent
+			attachSepStr = " ▸ "
+		} else {
+			attachLabelFg = theme.TextMuted
+			attachSepFg = theme.Border
+			attachSepStr = " │ "
+		}
+
+		attachLabelSt := lipgloss.NewStyle().
+			Foreground(attachLabelFg).
+			Background(theme.Surface).
+			Width(composerLabelWidth).
+			Align(lipgloss.Right)
+
+		attachSepSt := lipgloss.NewStyle().Foreground(attachSepFg).Background(theme.Surface)
+
+		fileW := innerW - composerLabelWidth - 3
+		if fileW < 1 {
+			fileW = 1
+		}
+
+		// Build the label for the first row: "Files:" right-aligned.
+		// Subsequent rows get an empty label + separator-width indent.
+		blankIndent := attachLabelSt.Render("") +
+			attachSepSt.Render(strings.Repeat(" ", len(attachSepStr)))
+
+		for i, a := range c.attachments {
+			displayName := a.DisplayName
+			if c.anonymize {
+				displayName = a.sendName(i, true)
+			}
+			selected := attachFocused && i == c.attachCursor
+			var entrySt lipgloss.Style
+			if selected {
+				entrySt = lipgloss.NewStyle().
+					Foreground(theme.Accent).
+					Background(theme.SurfaceAlt).
+					Bold(true).
+					Width(fileW)
+			} else {
+				entrySt = lipgloss.NewStyle().
+					Foreground(theme.Text).
+					Background(theme.Surface).
+					Width(fileW)
+			}
+
+			icon := icons.Attachment + " "
+			if a.Compressed {
+				icon = icons.Package + " "
+			}
+			entry := icon + displayName
+			if selected {
+				entry += "  ← del: remove"
+			}
+
+			if i == 0 {
+				label := attachLabelSt.Render("Files:")
+				rows = append(rows, label+attachSepSt.Render(attachSepStr)+entrySt.Render(entry))
+			} else {
+				rows = append(rows, blankIndent+entrySt.Render(entry))
 			}
 		}
-
-		// Always render the label on the first visible row, even when scrolled.
-		prefix := indent
-		if idx == 0 {
-			prefix = bodyLabel + bodySep
-		}
-		rows = append(rows, prefix+lineStyle.Render(display))
 	}
 
 	// ── Footer ───────────────────────────────────────────────────────────────
 	rows = append(rows, divider)
 
-	// Build hint line matching the main statusbar format: icon desc (key).
-	// Every span carries Background(theme.Surface) so ANSI resets leave no holes.
-	// Spaces are absorbed into adjacent renders — never left bare between spans.
 	hintIconSt := lipgloss.NewStyle().Foreground(theme.Accent).Background(theme.Surface)
 	hintDescSt := lipgloss.NewStyle().Foreground(theme.TextMuted).Background(theme.Surface)
 	hintKeySt := lipgloss.NewStyle().Foreground(theme.TextFaint).Background(theme.Surface)
 	hintSepSt := lipgloss.NewStyle().Foreground(theme.TextFaint).Background(theme.Surface)
 
 	type hintItem struct{ icon, key, desc string }
+	anonDesc := "anonymize"
+	if c.anonymize {
+		anonDesc = "anonymize ON"
+	}
 	composerHints := []hintItem{
 		{icons.Send, "ctrl+enter", "send"},
 		{icons.ChevronRight, "tab", "next field"},
 		{icons.ArrowUpDown, "pgup/pgdn", "scroll"},
+		{icons.Attachment, "@", "attach"},
+		{icons.Label, "ctrl+r", anonDesc},
 		{icons.Close, "esc", "cancel"},
 	}
 
-	// Plain text for rune-count centering (icons render as 1 col each).
 	var plainParts []string
 	for _, h := range composerHints {
 		plainParts = append(plainParts, h.icon+" "+h.desc+" ("+h.key+")")
@@ -571,10 +819,7 @@ func (c *Composer) ensureBodyVisible() {
 	if f.Kind != FieldTextArea {
 		return
 	}
-	bodyH := c.height - composerBodyOverhead
-	if bodyH < 3 {
-		bodyH = 3
-	}
+	bodyH := c.bodyHeight()
 	line := c.cursorLine(f)
 	if line < c.bodyTop {
 		c.bodyTop = line
@@ -599,10 +844,7 @@ func (c *Composer) scrollBody(delta int) {
 	if f.Kind != FieldTextArea {
 		return
 	}
-	bodyH := c.height - composerBodyOverhead
-	if bodyH < 3 {
-		bodyH = 3
-	}
+	bodyH := c.bodyHeight()
 	lines := strings.Split(f.Value, "\n")
 	maxTop := len(lines) - bodyH
 	if maxTop < 0 {

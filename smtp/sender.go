@@ -4,9 +4,14 @@ package smtp
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"mime"
+	"mime/multipart"
 	"net/smtp"
+	"net/textproto"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -15,13 +20,20 @@ import (
 	"github.com/bubblmail/bubblmail/data"
 )
 
+// Attachment is a file to include in the email.
+type Attachment struct {
+	Path     string // filesystem path
+	Filename string // filename in the email
+}
+
 // ComposedMessage is a draft email ready to send.
 type ComposedMessage struct {
-	From    data.Address
-	To      []data.Address
-	CC      []data.Address
-	Subject string
-	Body    string
+	From        data.Address
+	To          []data.Address
+	CC          []data.Address
+	Subject     string
+	Body        string
+	Attachments []Attachment
 }
 
 // SendResultMsg carries the result of a send operation.
@@ -43,7 +55,6 @@ func sendMessage(cfg *config.AccountConfig, draft *ComposedMessage) error {
 		return fmt.Errorf("resolving password: %w", err)
 	}
 
-	// Build RFC 2822 message.
 	var buf bytes.Buffer
 	date := time.Now().Format(time.RFC1123Z)
 	buf.WriteString("Date: " + date + "\r\n")
@@ -54,10 +65,55 @@ func sendMessage(cfg *config.AccountConfig, draft *ComposedMessage) error {
 	}
 	buf.WriteString("Subject: " + mime.QEncoding.Encode("utf-8", draft.Subject) + "\r\n")
 	buf.WriteString("MIME-Version: 1.0\r\n")
-	buf.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
-	buf.WriteString("Content-Transfer-Encoding: quoted-printable\r\n")
-	buf.WriteString("\r\n")
-	buf.WriteString(draft.Body)
+
+	if len(draft.Attachments) == 0 {
+		// Simple text-only message.
+		buf.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
+		buf.WriteString("Content-Transfer-Encoding: quoted-printable\r\n")
+		buf.WriteString("\r\n")
+		buf.WriteString(draft.Body)
+	} else {
+		// Multipart/mixed with text body + file attachments.
+		mw := multipart.NewWriter(&buf)
+		buf.WriteString("Content-Type: multipart/mixed; boundary=\"" + mw.Boundary() + "\"\r\n")
+		buf.WriteString("\r\n")
+
+		// Text part.
+		th := make(textproto.MIMEHeader)
+		th.Set("Content-Type", "text/plain; charset=utf-8")
+		th.Set("Content-Transfer-Encoding", "quoted-printable")
+		pw, err := mw.CreatePart(th)
+		if err != nil {
+			return fmt.Errorf("creating text part: %w", err)
+		}
+		fmt.Fprint(pw, draft.Body)
+
+		// Attachment parts.
+		for _, a := range draft.Attachments {
+			fileData, err := os.ReadFile(a.Path)
+			if err != nil {
+				return fmt.Errorf("reading attachment %s: %w", a.Filename, err)
+			}
+
+			ct := mimeTypeForFile(a.Filename)
+			ah := make(textproto.MIMEHeader)
+			ah.Set("Content-Type", ct)
+			ah.Set("Content-Transfer-Encoding", "base64")
+			ah.Set("Content-Disposition",
+				fmt.Sprintf("attachment; filename=%q", a.Filename))
+
+			aw, err := mw.CreatePart(ah)
+			if err != nil {
+				return fmt.Errorf("creating attachment part: %w", err)
+			}
+
+			enc := base64.NewEncoder(base64.StdEncoding, aw)
+			enc.Write(fileData)
+			enc.Close()
+		}
+
+		mw.Close()
+	}
 
 	addr := fmt.Sprintf("%s:%d", cfg.SMTPHost, cfg.SMTPPort)
 	tlsCfg := &tls.Config{ServerName: cfg.SMTPHost}
@@ -105,6 +161,29 @@ func sendMessage(cfg *config.AccountConfig, draft *ComposedMessage) error {
 	}
 
 	return client.Quit()
+}
+
+// mimeTypeForFile returns a MIME type based on the file extension.
+func mimeTypeForFile(name string) string {
+	ext := strings.ToLower(filepath.Ext(name))
+	switch ext {
+	case ".zip":
+		return "application/zip"
+	case ".pdf":
+		return "application/pdf"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".txt":
+		return "text/plain"
+	case ".html", ".htm":
+		return "text/html"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 func formatAddress(a data.Address) string {
