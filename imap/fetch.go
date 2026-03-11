@@ -3,6 +3,7 @@ package imap
 import (
 	"fmt"
 	"io"
+	"mime"
 	"strings"
 	"unicode/utf8"
 
@@ -40,13 +41,14 @@ type MoreMessageListMsg struct {
 
 // MessageBodyMsg carries the result of FetchBody.
 type MessageBodyMsg struct {
-	Account string
-	Folder  string
-	UID     uint32
-	MsgID   int64
-	Text    string
-	HTML    string
-	Err     error
+	Account     string
+	Folder      string
+	UID         uint32
+	MsgID       int64
+	Text        string
+	HTML        string
+	Attachments []data.Attachment
+	Err         error
 }
 
 // SetFlagResultMsg carries the result of SetFlag.
@@ -121,11 +123,11 @@ func (c *Client) FetchBody(folder string, uid uint32, msgID int64) tea.Cmd {
 	return func() tea.Msg {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		text, html, err := c.fetchBody(folder, uid)
+		text, html, attachments, err := c.fetchBody(folder, uid)
 		return MessageBodyMsg{
 			Account: c.cfg.Name, Folder: folder,
 			UID: uid, MsgID: msgID,
-			Text: text, HTML: html, Err: err,
+			Text: text, HTML: html, Attachments: attachments, Err: err,
 		}
 	}
 }
@@ -255,9 +257,9 @@ func (c *Client) fetchMessages(folder string, skip, limit int) ([]*data.Message,
 	return result, nil
 }
 
-func (c *Client) fetchBody(folder string, uid uint32) (string, string, error) {
+func (c *Client) fetchBody(folder string, uid uint32) (string, string, []data.Attachment, error) {
 	if _, err := c.conn.Select(folder, nil).Wait(); err != nil {
-		return "", "", fmt.Errorf("selecting folder: %w", err)
+		return "", "", nil, fmt.Errorf("selecting folder: %w", err)
 	}
 
 	uidSet := imaplib.UIDSetNum(imaplib.UID(uid))
@@ -269,10 +271,10 @@ func (c *Client) fetchBody(folder string, uid uint32) (string, string, error) {
 
 	buffers, err := c.conn.Fetch(uidSet, fetchOptions).Collect()
 	if err != nil {
-		return "", "", fmt.Errorf("fetching body: %w", err)
+		return "", "", nil, fmt.Errorf("fetching body: %w", err)
 	}
 	if len(buffers) == 0 {
-		return "", "", fmt.Errorf("message not found")
+		return "", "", nil, fmt.Errorf("message not found")
 	}
 
 	buf := buffers[0]
@@ -280,12 +282,12 @@ func (c *Client) fetchBody(folder string, uid uint32) (string, string, error) {
 		if len(bs.Bytes) == 0 {
 			continue
 		}
-		text, html, err := parseBody(strings.NewReader(string(bs.Bytes)))
+		text, html, attachments, err := parseBody(strings.NewReader(string(bs.Bytes)))
 		if err == nil {
-			return text, html, nil
+			return text, html, attachments, nil
 		}
 	}
-	return "", "", nil
+	return "", "", nil, nil
 }
 
 func (c *Client) setFlag(folder string, uid uint32, flag data.Flag, set bool) error {
@@ -365,14 +367,15 @@ func convertAddress(addr imaplib.Address) data.Address {
 	return data.Address{Name: name, Address: email}
 }
 
-// parseBody extracts plain text and HTML from a raw RFC 2822 message.
-func parseBody(r io.Reader) (string, string, error) {
+// parseBody extracts plain text, HTML, and attachments from a raw RFC 2822 message.
+func parseBody(r io.Reader) (string, string, []data.Attachment, error) {
 	mr, err := gomail.CreateReader(r)
 	if err != nil {
-		return "", "", err
+		return "", "", nil, err
 	}
 
 	var plainText, htmlText string
+	var attachments []data.Attachment
 	for {
 		part, err := mr.NextPart()
 		if err == io.EOF {
@@ -381,23 +384,39 @@ func parseBody(r io.Reader) (string, string, error) {
 		if err != nil {
 			break
 		}
-		// Get content type via the generic Get method (PartHeader interface)
 		ct := part.Header.Get("Content-Type")
+		cd := part.Header.Get("Content-Disposition")
 		body, err := io.ReadAll(part.Body)
 		if err != nil {
 			continue
 		}
-		if !utf8.Valid(body) {
-			continue
-		}
 		switch {
 		case strings.HasPrefix(ct, "text/plain"):
-			if plainText == "" {
+			if utf8.Valid(body) && plainText == "" {
 				plainText = string(body)
 			}
 		case strings.HasPrefix(ct, "text/html"):
-			if htmlText == "" {
+			if utf8.Valid(body) && htmlText == "" {
 				htmlText = string(body)
+			}
+		default:
+			name := extractAttachmentFilename(ct, cd)
+			// Fallback for Content-Disposition: attachment with no filename.
+			if name == "" && cd != "" {
+				if dispType, _, err := mime.ParseMediaType(cd); err == nil && dispType == "attachment" {
+					name = fallbackFilename(ct)
+				}
+			}
+			// Known non-body content types that may lack explicit disposition.
+			if name == "" {
+				name = knownAttachmentFilename(ct)
+			}
+			if name != "" {
+				attachments = append(attachments, data.Attachment{
+					Filename:    name,
+					ContentType: ct,
+					Data:        body,
+				})
 			}
 		}
 	}
@@ -407,7 +426,55 @@ func parseBody(r io.Reader) (string, string, error) {
 		plainText = stripHTMLTags(htmlText)
 	}
 
-	return plainText, htmlText, nil
+	return plainText, htmlText, attachments, nil
+}
+
+// extractAttachmentFilename returns the filename from Content-Disposition or Content-Type, or "".
+func extractAttachmentFilename(ct, cd string) string {
+	if cd != "" {
+		if _, params, err := mime.ParseMediaType(cd); err == nil {
+			if name := params["filename"]; name != "" {
+				return name
+			}
+		}
+	}
+	if ct != "" {
+		if _, params, err := mime.ParseMediaType(ct); err == nil {
+			if name := params["name"]; name != "" {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+// knownAttachmentFilename returns a default filename for content types that are
+// always attachments even when no explicit filename is provided (e.g. text/calendar).
+func knownAttachmentFilename(ct string) string {
+	mediaType := ct
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		mediaType = strings.TrimSpace(ct[:i])
+	}
+	mediaType = strings.ToLower(mediaType)
+	switch mediaType {
+	case "text/calendar":
+		return "invite.ics"
+	}
+	return ""
+}
+
+// fallbackFilename returns a generic filename for a content type using the MIME
+// extension registry, used when Content-Disposition: attachment has no filename.
+func fallbackFilename(ct string) string {
+	mediaType := ct
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		mediaType = strings.TrimSpace(ct[:i])
+	}
+	exts, err := mime.ExtensionsByType(mediaType)
+	if err == nil && len(exts) > 0 {
+		return "attachment" + exts[0]
+	}
+	return "attachment"
 }
 
 // stripHTMLTags removes HTML tags for plain-text fallback.

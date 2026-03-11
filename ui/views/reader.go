@@ -1,6 +1,7 @@
 package views
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -17,13 +18,18 @@ import (
 // Thread mode: thread != nil — all messages rendered oldest→newest, scrolled to latest.
 // Single mode: message != nil — classic static-header + scrollable-body layout.
 type ReaderView struct {
-	theme   *config.Theme
-	width   int
-	height  int
-	thread  *data.Thread  // thread mode
-	message *data.Message // single-message mode
-	scrollY int
-	lines   []string // all rendered lines
+	theme      *config.Theme
+	width      int
+	height     int
+	thread     *data.Thread  // thread mode
+	message    *data.Message // single-message mode
+	event      *data.SuggestedEvent
+	eventFocus int
+	// attachment focus state (single-message mode only)
+	attachFocus       int // -1 = none, 0+ = focused attachment index
+	attachActionFocus int // 0=Open, 1=Download, 2=Editor
+	scrollY           int
+	lines             []string // all rendered lines
 	// msgLineOffsets[i] is the first line index of thread.Messages[i].
 	msgLineOffsets []int
 }
@@ -46,6 +52,10 @@ func (v *ReaderView) SetSize(w, h int) {
 func (v *ReaderView) SetMessage(msg *data.Message) {
 	v.thread = nil
 	v.message = msg
+	v.event = nil
+	v.eventFocus = 0
+	v.attachFocus = -1
+	v.attachActionFocus = 0
 	v.scrollY = 0
 	v.buildLines()
 }
@@ -54,6 +64,10 @@ func (v *ReaderView) SetMessage(msg *data.Message) {
 func (v *ReaderView) SetThread(t *data.Thread) {
 	v.message = nil
 	v.thread = t
+	v.event = nil
+	v.eventFocus = 0
+	v.attachFocus = -1
+	v.attachActionFocus = 0
 	v.scrollY = 0
 	v.buildLines()
 	// Default scroll position: start of the latest message.
@@ -70,14 +84,50 @@ func (v *ReaderView) SetThread(t *data.Thread) {
 	}
 }
 
+// SetSuggestedEvent attaches a cached/generated suggested event to the current single-message view.
+func (v *ReaderView) SetSuggestedEvent(ev *data.SuggestedEvent) {
+	v.event = ev
+	v.rebuildLines()
+}
+
+// FocusNextEventAction advances the copy action focus.
+func (v *ReaderView) FocusNextEventAction(delta int) {
+	if v.event == nil || !v.event.HasEvent {
+		return
+	}
+	v.eventFocus += delta
+	if v.eventFocus < 0 {
+		v.eventFocus = 1
+	}
+	if v.eventFocus > 1 {
+		v.eventFocus = 0
+	}
+	v.rebuildLines()
+}
+
+// FocusedEventAction returns the current copy action identifier.
+func (v *ReaderView) FocusedEventAction() string {
+	if v.event == nil || !v.event.HasEvent {
+		return ""
+	}
+	if v.eventFocus == 1 {
+		return "json"
+	}
+	return "plain"
+}
+
+// SuggestedEvent returns the current event suggestion.
+func (v *ReaderView) SuggestedEvent() *data.SuggestedEvent { return v.event }
+
 // UpdateMessageBody updates the body of the message with the given UID in the
 // current thread (or single message) and rebuilds lines without resetting scroll.
-func (v *ReaderView) UpdateMessageBody(uid uint32, text, html string) {
+func (v *ReaderView) UpdateMessageBody(uid uint32, text, html string, attachments []data.Attachment) {
 	if v.thread != nil {
 		for _, m := range v.thread.Messages {
 			if m.UID == uid {
 				m.Body = text
 				m.HTMLBody = html
+				m.Attachments = attachments
 				v.rebuildLines()
 				return
 			}
@@ -86,8 +136,97 @@ func (v *ReaderView) UpdateMessageBody(uid uint32, text, html string) {
 	if v.message != nil && v.message.UID == uid {
 		v.message.Body = text
 		v.message.HTMLBody = html
+		v.message.Attachments = attachments
 		v.rebuildLines()
 	}
+}
+
+// HasAttachments reports whether the current message has any attachments.
+func (v *ReaderView) HasAttachments() bool {
+	return len(v.messageAttachments()) > 0
+}
+
+// AttachFocusActive reports whether an attachment is currently focused.
+func (v *ReaderView) AttachFocusActive() bool {
+	return v.attachFocus >= 0 && v.attachFocus < len(v.messageAttachments())
+}
+
+// FocusNextAttachment cycles attachment focus by delta (+1 or -1).
+// -1 means no attachment focused. Cycles: -1 → 0 → … → n-1 → -1.
+func (v *ReaderView) FocusNextAttachment(delta int) {
+	atts := v.messageAttachments()
+	if len(atts) == 0 {
+		return
+	}
+	n := len(atts)
+	wasUnfocused := v.attachFocus < 0
+	if delta > 0 {
+		if v.attachFocus >= n-1 {
+			v.attachFocus = -1
+		} else {
+			v.attachFocus++
+		}
+	} else {
+		if v.attachFocus < 0 {
+			v.attachFocus = n - 1
+		} else if v.attachFocus == 0 {
+			v.attachFocus = -1
+		} else {
+			v.attachFocus--
+		}
+	}
+	// Auto-scroll to bottom when entering the attachment section.
+	if wasUnfocused && v.attachFocus >= 0 {
+		v.GoToBottom()
+	}
+	v.rebuildLines()
+}
+
+// FocusNextAttachmentAction cycles the action (Open/Download/Editor) for the focused attachment.
+func (v *ReaderView) FocusNextAttachmentAction(delta int) {
+	if !v.AttachFocusActive() {
+		return
+	}
+	v.attachActionFocus = (v.attachActionFocus + delta + 3) % 3
+	v.rebuildLines()
+}
+
+// FocusedAttachmentIndex returns the index of the focused attachment, or -1.
+func (v *ReaderView) FocusedAttachmentIndex() int { return v.attachFocus }
+
+// FocusedAttachmentAction returns "open", "download", or "editor" for the focused action button.
+func (v *ReaderView) FocusedAttachmentAction() string {
+	switch v.attachActionFocus {
+	case 1:
+		return "download"
+	case 2:
+		return "editor"
+	default:
+		return "open"
+	}
+}
+
+// messageAttachments returns attachments for the current single message or the
+// latest message in a thread (which gets the interactive attachment panel).
+func (v *ReaderView) messageAttachments() []data.Attachment {
+	if v.message != nil {
+		return v.message.Attachments
+	}
+	if v.thread != nil && len(v.thread.Messages) > 0 {
+		return v.thread.Messages[len(v.thread.Messages)-1].Attachments
+	}
+	return nil
+}
+
+// AttachmentSource returns the message whose attachments the focus state applies to.
+func (v *ReaderView) AttachmentSource() *data.Message {
+	if v.message != nil {
+		return v.message
+	}
+	if v.thread != nil && len(v.thread.Messages) > 0 {
+		return v.thread.Messages[len(v.thread.Messages)-1]
+	}
+	return nil
 }
 
 // CurrentThread returns the thread being displayed, or nil.
@@ -166,7 +305,7 @@ func (v *ReaderView) headerHeight() int {
 	if v.thread != nil {
 		return 0
 	}
-	return 5 // From + To + Date + Subject + divider
+	return len(v.singleHeaderLines())
 }
 
 // bodyHeight returns the number of rows available for scrollable content.
@@ -194,7 +333,9 @@ func (v *ReaderView) buildSingleLines() {
 		v.lines = nil
 		return
 	}
-	if v.message.Body == "" && v.message.HTMLBody == "" {
+	bodyLoaded := v.message.Body != "" || v.message.HTMLBody != ""
+	hasAttachments := len(v.message.Attachments) > 0
+	if !bodyLoaded && !hasAttachments {
 		v.lines = []string{fmt.Sprintf("(%s No body loaded — press Enter to fetch)", icons.Download)}
 		return
 	}
@@ -202,7 +343,12 @@ func (v *ReaderView) buildSingleLines() {
 	if textWidth < 20 {
 		textWidth = 20
 	}
-	v.lines = render.RenderBody(v.message.Body, v.message.HTMLBody, textWidth, v.theme)
+	if bodyLoaded {
+		v.lines = render.RenderBody(v.message.Body, v.message.HTMLBody, textWidth, v.theme)
+	} else {
+		v.lines = nil
+	}
+	v.lines = append(v.lines, v.renderAttachmentLines()...)
 }
 
 // buildThreadLines renders all messages in the thread as a single scrollable
@@ -235,8 +381,112 @@ func (v *ReaderView) buildThreadLines() {
 		} else {
 			all = append(all, render.RenderBody(msg.Body, msg.HTMLBody, textWidth, v.theme)...)
 		}
+		// The latest message's attachments are handled by the interactive
+		// section appended below; render all others non-interactively.
+		if i < len(msgs)-1 {
+			all = append(all, v.renderAttachmentLinesSimple(msg.Attachments)...)
+		}
 	}
+	// Interactive attachment panel for the latest message (supports tab focus).
+	all = append(all, v.renderAttachmentLines()...)
 	v.lines = all
+}
+
+// renderAttachmentLines renders the interactive attachment section for the current
+// single-message. Returns nil if there are no attachments.
+func (v *ReaderView) renderAttachmentLines() []string {
+	atts := v.messageAttachments()
+	if len(atts) == 0 {
+		return nil
+	}
+	theme := v.theme
+	divider := lipgloss.NewStyle().Foreground(theme.Border).Render(strings.Repeat("─", v.width))
+	labelStyle := lipgloss.NewStyle().Foreground(theme.TextMuted).Width(10).Align(lipgloss.Right)
+	normalStyle := lipgloss.NewStyle().Foreground(theme.Text)
+	focusedStyle := lipgloss.NewStyle().Foreground(theme.Accent).Bold(true)
+
+	maxNameW := v.width - 28
+	if maxNameW < 10 {
+		maxNameW = 10
+	}
+
+	lines := []string{divider}
+	for i, att := range atts {
+		label := "        "
+		if i == 0 {
+			label = labelStyle.Render("Attach")
+		}
+		focused := v.attachFocus == i
+		name := util.TruncateText(util.SingleLine(att.Filename), maxNameW)
+		size := formatAttachmentSize(len(att.Data))
+
+		rowStyle := normalStyle
+		if focused {
+			rowStyle = focusedStyle
+		}
+		row := label + "  " + rowStyle.Render(icons.Attachment+" "+name+"  "+size)
+		lines = append(lines, row)
+		if focused {
+			lines = append(lines, "            "+v.renderAttachmentButtons())
+		}
+	}
+	return lines
+}
+
+// renderAttachmentLinesSimple renders attachment names for thread mode (no interactivity).
+func (v *ReaderView) renderAttachmentLinesSimple(atts []data.Attachment) []string {
+	if len(atts) == 0 {
+		return nil
+	}
+	theme := v.theme
+	divider := lipgloss.NewStyle().Foreground(theme.Border).Render(strings.Repeat("─", v.width))
+	labelStyle := lipgloss.NewStyle().Foreground(theme.TextMuted).Width(10).Align(lipgloss.Right)
+	valueStyle := lipgloss.NewStyle().Foreground(theme.Text)
+
+	maxNameW := v.width - 28
+	if maxNameW < 10 {
+		maxNameW = 10
+	}
+
+	lines := []string{divider}
+	for i, att := range atts {
+		label := "        "
+		if i == 0 {
+			label = labelStyle.Render("Attach")
+		}
+		name := util.TruncateText(util.SingleLine(att.Filename), maxNameW)
+		size := formatAttachmentSize(len(att.Data))
+		lines = append(lines, label+"  "+valueStyle.Render(icons.Attachment+" "+name+"  "+size))
+	}
+	return lines
+}
+
+func (v *ReaderView) renderAttachmentButtons() string {
+	normal := lipgloss.NewStyle().Foreground(v.theme.Text).Background(v.theme.Surface).Padding(0, 1)
+	active := lipgloss.NewStyle().Foreground(v.theme.Background).Background(v.theme.Accent).Bold(true).Padding(0, 1)
+	open := normal
+	download := normal
+	editor := normal
+	switch v.attachActionFocus {
+	case 0:
+		open = active
+	case 1:
+		download = active
+	case 2:
+		editor = active
+	}
+	return open.Render("Open") + " " + download.Render("Download") + " " + editor.Render("Editor")
+}
+
+func formatAttachmentSize(n int) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(n)/float64(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KB", float64(n)/float64(1<<10))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
 }
 
 // fullMsgHeader returns the 5-line header: From / To / Date / Subject / divider.
@@ -363,38 +613,7 @@ func (v *ReaderView) viewThread() string {
 // viewSingle renders the classic static-header + scrollable-body layout.
 func (v *ReaderView) viewSingle() string {
 	theme := v.theme
-
-	divider := lipgloss.NewStyle().Foreground(theme.Border).Render(strings.Repeat("─", v.width))
-	labelStyle := lipgloss.NewStyle().Foreground(theme.TextMuted).Width(10).Align(lipgloss.Right)
-	valueStyle := lipgloss.NewStyle().Foreground(theme.Text)
-	boldStyle := lipgloss.NewStyle().Foreground(theme.Text).Bold(true)
-
-	maxValW := v.width - 12
-	if maxValW < 10 {
-		maxValW = 10
-	}
-	maxSubjectW := maxValW - 2
-	if maxSubjectW < 5 {
-		maxSubjectW = 5
-	}
-
-	fromStr := util.TruncateText(util.SingleLine(addressListStr(v.message.From)), maxValW)
-	toStr := util.TruncateText(util.SingleLine(addressListStr(v.message.To)), maxValW)
-	dateStr := util.TruncateText(util.FormatDateLong(v.message.Date)+"  "+v.message.Date.Format("15:04"), maxValW)
-	subjectStr := util.TruncateText(util.SingleLine(v.message.Subject), maxSubjectW)
-
-	stars := ""
-	if v.message.IsStarred() {
-		stars = lipgloss.NewStyle().Foreground(theme.Starred).Render(" " + icons.Star)
-	}
-
-	headerStr := strings.Join([]string{
-		labelStyle.Render("From") + "  " + valueStyle.Render(fromStr),
-		labelStyle.Render("To") + "  " + valueStyle.Render(toStr),
-		labelStyle.Render("Date") + "  " + valueStyle.Render(dateStr),
-		labelStyle.Render("Subject") + "  " + boldStyle.Render(subjectStr) + stars,
-		divider,
-	}, "\n")
+	headerStr := strings.Join(v.singleHeaderLines(), "\n")
 
 	bh := v.bodyHeight()
 	start := v.scrollY
@@ -431,6 +650,171 @@ func (v *ReaderView) viewSingle() string {
 		lipgloss.NewStyle().Width(v.width).Render(headerStr),
 		bodyStr,
 	)
+}
+
+func (v *ReaderView) singleHeaderLines() []string {
+	theme := v.theme
+	divider := lipgloss.NewStyle().Foreground(theme.Border).Render(strings.Repeat("─", v.width))
+	labelStyle := lipgloss.NewStyle().Foreground(theme.TextMuted).Width(10).Align(lipgloss.Right)
+	valueStyle := lipgloss.NewStyle().Foreground(theme.Text)
+	boldStyle := lipgloss.NewStyle().Foreground(theme.Text).Bold(true)
+
+	maxValW := v.width - 12
+	if maxValW < 10 {
+		maxValW = 10
+	}
+	maxSubjectW := maxValW - 2
+	if maxSubjectW < 5 {
+		maxSubjectW = 5
+	}
+
+	fromStr := util.TruncateText(util.SingleLine(addressListStr(v.message.From)), maxValW)
+	toStr := util.TruncateText(util.SingleLine(addressListStr(v.message.To)), maxValW)
+	dateStr := util.TruncateText(util.FormatDateLong(v.message.Date)+"  "+v.message.Date.Format("15:04"), maxValW)
+	subjectStr := util.TruncateText(util.SingleLine(v.message.Subject), maxSubjectW)
+
+	stars := ""
+	if v.message.IsStarred() {
+		stars = lipgloss.NewStyle().Foreground(theme.Starred).Render(" " + icons.Star)
+	}
+
+	lines := []string{
+		labelStyle.Render("From") + "  " + valueStyle.Render(fromStr),
+		labelStyle.Render("To") + "  " + valueStyle.Render(toStr),
+		labelStyle.Render("Date") + "  " + valueStyle.Render(dateStr),
+		labelStyle.Render("Subject") + "  " + boldStyle.Render(subjectStr) + stars,
+	}
+	lines = append(lines, divider)
+	if extra := v.renderSuggestedEventSection(); len(extra) > 0 {
+		lines = append(lines, extra...)
+		lines = append(lines, divider)
+	}
+	return lines
+}
+
+func (v *ReaderView) renderSuggestedEventSection() []string {
+	if v.event == nil {
+		return []string{
+			lipgloss.NewStyle().Foreground(v.theme.Accent).Bold(true).Render("Suggested Event"),
+			lipgloss.NewStyle().Foreground(v.theme.TextMuted).Render("Loading suggestion..."),
+		}
+	}
+	if !v.event.GenerationOK {
+		msg := "No suggested event available"
+		if v.event.ParseError != "" {
+			msg = util.TruncateText(util.SingleLine(v.event.ParseError), max(20, v.width-2))
+		}
+		return []string{
+			lipgloss.NewStyle().Foreground(v.theme.Accent).Bold(true).Render("Suggested Event"),
+			lipgloss.NewStyle().Foreground(v.theme.TextMuted).Render(msg),
+		}
+	}
+	if !v.event.HasEvent {
+		return []string{
+			lipgloss.NewStyle().Foreground(v.theme.Accent).Bold(true).Render("Suggested Event"),
+			lipgloss.NewStyle().Foreground(v.theme.TextMuted).Render("No event found in this message"),
+		}
+	}
+	header := lipgloss.NewStyle().Foreground(v.theme.Accent).Bold(true).Render("Suggested Event")
+	buttons := v.renderEventButtons()
+	plain := v.event.PlainText
+	if plain == "" {
+		plain = formatSuggestedEventPlain(v.event)
+	}
+	plainLines := strings.Split(plain, "\n")
+	textWidth := v.width - 4
+	if textWidth < 20 {
+		textWidth = 20
+	}
+	var out []string
+	out = append(out, header)
+	out = append(out, buttons)
+	cardStyle := lipgloss.NewStyle().Foreground(v.theme.Text).Background(v.theme.Surface).Padding(0, 1).Width(textWidth)
+	for _, line := range plainLines {
+		wrapped := util.WrapText(util.SingleLine(line), textWidth-2)
+		if len(wrapped) == 0 {
+			out = append(out, cardStyle.Render(""))
+			continue
+		}
+		for _, w := range wrapped {
+			out = append(out, cardStyle.Render(w))
+		}
+	}
+	return out
+}
+
+func (v *ReaderView) renderEventButtons() string {
+	base := lipgloss.NewStyle().Foreground(v.theme.TextMuted).Border(lipgloss.RoundedBorder()).BorderForeground(v.theme.Border).Padding(0, 1)
+	focused := base.Foreground(v.theme.Text).BorderForeground(v.theme.Accent).Bold(true)
+	plain := base
+	jsonBtn := base
+	if v.eventFocus == 0 {
+		plain = focused
+	} else {
+		jsonBtn = focused
+	}
+	return plain.Render("Copy Plain") + "  " + jsonBtn.Render("Copy JSON")
+}
+
+func formatSuggestedEventPlain(ev *data.SuggestedEvent) string {
+	if ev == nil {
+		return ""
+	}
+	if !ev.HasEvent {
+		return "No suggested event found"
+	}
+	lines := []string{ev.Summary}
+	if ev.Date != "" {
+		lines = append(lines, "Date: "+ev.Date)
+	}
+	if ev.AllDay {
+		lines = append(lines, "Time: All Day")
+	} else if ev.Start != "" || ev.End != "" {
+		lines = append(lines, "Time: "+strings.TrimSpace(ev.Start+" - "+ev.End))
+	}
+	if ev.Location != "" {
+		lines = append(lines, "Location: "+ev.Location)
+	}
+	if ev.Calendar != "" {
+		lines = append(lines, "Calendar: "+ev.Calendar)
+	}
+	if ev.Status != "" {
+		lines = append(lines, "Status: "+ev.Status)
+	}
+	if ev.Description != "" {
+		lines = append(lines, "", ev.Description)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (v *ReaderView) SuggestedEventJSON() string {
+	if v.event == nil {
+		return ""
+	}
+	if v.event.JSONText != "" {
+		return v.event.JSONText
+	}
+	b, _ := json.Marshal(map[string]any{
+		"hasEvent":    v.event.HasEvent,
+		"summary":     v.event.Summary,
+		"date":        v.event.Date,
+		"start":       v.event.Start,
+		"end":         v.event.End,
+		"location":    v.event.Location,
+		"calendar":    v.event.Calendar,
+		"status":      v.event.Status,
+		"allDay":      v.event.AllDay,
+		"recurring":   v.event.Recurring,
+		"description": v.event.Description,
+	})
+	return string(b)
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func addressListStr(addrs []data.Address) string {

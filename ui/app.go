@@ -3,6 +3,9 @@ package ui
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -14,10 +17,12 @@ import (
 	"github.com/bubblmail/bubblmail/embeddings"
 	imaplib "github.com/bubblmail/bubblmail/imap"
 	outsmtp "github.com/bubblmail/bubblmail/smtp"
+	"github.com/bubblmail/bubblmail/suggest"
 	"github.com/bubblmail/bubblmail/thread"
 	"github.com/bubblmail/bubblmail/ui/composer"
 	"github.com/bubblmail/bubblmail/ui/icons"
 	"github.com/bubblmail/bubblmail/ui/views"
+	"github.com/bubblmail/bubblmail/util"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -47,6 +52,7 @@ type embeddingStartedMsg struct {
 }
 
 type prefetchTickMsg struct{}
+type suggestPollMsg struct{}
 
 type quickMoveResultMsg struct {
 	msgID   int64
@@ -89,6 +95,9 @@ type App struct {
 	classifyClient  *classifylib.Client
 	classifyQueue   *classifylib.Queue
 	classifyResults chan classifylib.ResultMsg
+	suggestClient   *suggest.Client
+	suggestQueue    *suggest.Queue
+	suggestResults  chan suggest.ResultMsg
 	smartFolder     string // active smart folder name (when viewID == ViewSmartFolder)
 	smartCounts     map[string]int
 
@@ -189,6 +198,12 @@ func NewApp(cfg *config.Config, store *cache.Store) *App {
 	if classifyClient != nil {
 		classifyQueue = classifylib.NewQueue(classifyClient, store, classifyResults)
 	}
+	suggestClient, _ := suggest.NewClient(cfg.Classification, cfg.Embeddings)
+	suggestResults := make(chan suggest.ResultMsg, 128)
+	var suggestQueue *suggest.Queue
+	if suggestClient != nil {
+		suggestQueue = suggest.NewQueue(suggestClient, store, suggestResults)
+	}
 
 	app := &App{
 		cfg:             cfg,
@@ -200,6 +215,9 @@ func NewApp(cfg *config.Config, store *cache.Store) *App {
 		classifyClient:  classifyClient,
 		classifyQueue:   classifyQueue,
 		classifyResults: classifyResults,
+		suggestClient:   suggestClient,
+		suggestQueue:    suggestQueue,
+		suggestResults:  suggestResults,
 		smartCounts:     make(map[string]int),
 		imapClients:     make(map[string]*imaplib.Client),
 		header:          NewHeader(styles),
@@ -263,6 +281,9 @@ func (a *App) Init() tea.Cmd {
 	}
 	if a.classifyQueue != nil {
 		cmds = append(cmds, classifyResultsTick())
+	}
+	if a.suggestQueue != nil {
+		cmds = append(cmds, suggestResultsTick())
 	}
 	// Load any previously cached classification counts immediately so the
 	// sidebar is populated on first render without waiting for new messages.
@@ -370,6 +391,12 @@ func embeddingTick() tea.Cmd {
 func classifyResultsTick() tea.Cmd {
 	return tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg {
 		return classifyPollMsg{}
+	})
+}
+
+func suggestResultsTick() tea.Cmd {
+	return tea.Tick(300*time.Millisecond, func(t time.Time) tea.Msg {
+		return suggestPollMsg{}
 	})
 }
 
@@ -490,6 +517,15 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.flash("Cache error: "+err.Error(), "err")
 			}
 		}
+		// Store attachments and update the reader — must happen before any early return.
+		if msg.MsgID > 0 {
+			if m := a.findMessageByID(msg.MsgID); m != nil {
+				m.Attachments = msg.Attachments
+			}
+		}
+		if a.viewID == ViewReader {
+			a.readerView.UpdateMessageBody(msg.UID, msg.Text, msg.HTML, msg.Attachments)
+		}
 		if msg.MsgID > 0 && a.embQueue != nil && msg.Text != "" {
 			m := a.findMessageByID(msg.MsgID)
 			if m != nil {
@@ -503,9 +539,30 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return a, cmd
 			}
 		}
-		// Update reader view — works for both thread and single-message mode.
-		if a.viewID == ViewReader {
-			a.readerView.UpdateMessageBody(msg.UID, msg.Text, msg.HTML)
+		if msg.MsgID > 0 {
+			m := a.findMessageByID(msg.MsgID)
+			if m != nil && a.viewID == ViewReader && a.readerView.CurrentMessage() != nil && a.readerView.CurrentMessage().ID == msg.MsgID {
+				return a, a.loadSuggestedEvent(m)
+			}
+		}
+		return a, nil
+
+	case attachActionResultMsg:
+		switch msg.action {
+		case "open":
+			if msg.err != nil {
+				a.flash("Open failed: "+msg.err.Error(), "err")
+			}
+		case "download":
+			if msg.err != nil {
+				a.flash("Download failed: "+msg.err.Error(), "err")
+			} else {
+				a.flash("Saved to "+msg.path, "ok")
+			}
+		case "editor":
+			if msg.err != nil {
+				a.flash("Editor error: "+msg.err.Error(), "err")
+			}
 		}
 		return a, nil
 
@@ -666,6 +723,28 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return a, classifyResultsTick()
+
+	case suggestPollMsg:
+		if a.suggestQueue == nil {
+			return a, nil
+		}
+		for {
+			select {
+			case r := <-a.suggestResults:
+				if r.Err != nil && r.Event == nil {
+					a.flash("Suggested event error: "+r.Err.Error(), "err")
+					continue
+				}
+				if cur := a.readerView.CurrentMessage(); cur != nil && cur.ID == r.MessageID {
+					a.readerView.SetSuggestedEvent(r.Event)
+				}
+				if r.Event != nil && !r.Event.GenerationOK && r.Err != nil {
+					a.flash("Suggested event parse error: "+r.Err.Error(), "err")
+				}
+			default:
+				return a, suggestResultsTick()
+			}
+		}
 
 	case prefetchTickMsg:
 		if !a.cfg.Embeddings.PrefetchBodies {
@@ -919,9 +998,17 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, tea.Batch(a.fetchMessages(), spinnerTick())
 
 	case "tab":
+		if a.viewID == ViewReader && a.readerView.HasAttachments() {
+			a.readerView.FocusNextAttachment(1)
+			return a, nil
+		}
 		a.cycleAccount(1)
 
 	case "shift+tab":
+		if a.viewID == ViewReader && a.readerView.HasAttachments() {
+			a.readerView.FocusNextAttachment(-1)
+			return a, nil
+		}
 		a.cycleAccount(-1)
 
 	case "/":
@@ -971,6 +1058,14 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, a.maybeLoadMore()
 
 	case "enter":
+		if a.viewID == ViewReader && a.readerView.AttachFocusActive() {
+			return a, a.executeAttachmentAction()
+		}
+		if a.viewID == ViewReader && a.readerView.CurrentMessage() != nil {
+			if cmd := a.copySuggestedEvent(); cmd != nil {
+				return a, cmd
+			}
+		}
 		if a.viewID == ViewInbox && a.quickMenu != nil && a.quickMenu.side != quickMenuNone {
 			cmd := a.handleQuickMenuEnter()
 			return a, cmd
@@ -978,6 +1073,14 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, a.handleEnter()
 
 	case "left":
+		if a.viewID == ViewReader && a.readerView.AttachFocusActive() {
+			a.readerView.FocusNextAttachmentAction(-1)
+			return a, nil
+		}
+		if a.viewID == ViewReader && a.readerView.CurrentMessage() != nil {
+			a.readerView.FocusNextEventAction(-1)
+			return a, nil
+		}
 		if a.viewID == ViewInbox {
 			if a.quickMenu != nil && a.quickMenu.side == quickMenuLeft {
 				// Same direction again — close
@@ -1001,6 +1104,14 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.closeQuickMenu()
 
 	case "right":
+		if a.viewID == ViewReader && a.readerView.AttachFocusActive() {
+			a.readerView.FocusNextAttachmentAction(1)
+			return a, nil
+		}
+		if a.viewID == ViewReader && a.readerView.CurrentMessage() != nil {
+			a.readerView.FocusNextEventAction(1)
+			return a, nil
+		}
 		if a.viewID == ViewInbox {
 			if a.quickMenu != nil && a.quickMenu.side == quickMenuRight {
 				// Same direction again — close
@@ -1213,7 +1324,8 @@ func (a *App) openMessage(msg *data.Message) tea.Cmd {
 		}
 	}
 
-	return tea.Batch(markCmd, fetchCmd)
+	suggestCmd := a.loadSuggestedEvent(msg)
+	return tea.Batch(markCmd, fetchCmd, suggestCmd)
 }
 
 // openThread opens a full thread in the reader, fetching bodies for any
@@ -1247,6 +1359,27 @@ func (a *App) openThread(t *data.Thread) tea.Cmd {
 	}
 
 	return tea.Batch(cmds...)
+}
+
+func (a *App) loadSuggestedEvent(msg *data.Message) tea.Cmd {
+	if msg == nil {
+		return nil
+	}
+	if cached, err := a.store.GetSuggestedEvent(msg.ID); err == nil && cached != nil {
+		if a.readerView != nil {
+			a.readerView.SetSuggestedEvent(cached)
+		}
+		if cached.GenerationOK || cached.ParseError != "" {
+			return nil
+		}
+	}
+	if a.suggestQueue != nil {
+		if a.readerView != nil {
+			a.readerView.SetSuggestedEvent(nil)
+		}
+		a.suggestQueue.Submit(msg)
+	}
+	return nil
 }
 
 func (a *App) fetchMessages() tea.Cmd {
@@ -1918,6 +2051,105 @@ func (a *App) currentMessage() *data.Message {
 		return a.readerView.CurrentMessage()
 	}
 	return nil
+}
+
+func (a *App) copySuggestedEvent() tea.Cmd {
+	ev := a.readerView.SuggestedEvent()
+	if ev == nil || !ev.HasEvent {
+		return nil
+	}
+	content := ev.PlainText
+	label := "Copied suggested event"
+	if a.readerView.FocusedEventAction() == "json" {
+		content = a.readerView.SuggestedEventJSON()
+		label = "Copied suggested event JSON"
+	}
+	if strings.TrimSpace(content) == "" {
+		return nil
+	}
+	if err := util.CopyToClipboard(content); err != nil {
+		return a.flash("Copy failed: "+err.Error(), "err")
+	}
+	return a.flash(label, "ok")
+}
+
+func (a *App) executeAttachmentAction() tea.Cmd {
+	msg := a.readerView.AttachmentSource()
+	if msg == nil {
+		return nil
+	}
+	idx := a.readerView.FocusedAttachmentIndex()
+	if idx < 0 || idx >= len(msg.Attachments) {
+		return nil
+	}
+	att := msg.Attachments[idx]
+	switch a.readerView.FocusedAttachmentAction() {
+	case "open":
+		return openAttachmentDefaultCmd(att)
+	case "download":
+		return downloadAttachmentCmd(att)
+	case "editor":
+		return openAttachmentEditorCmd(att)
+	}
+	return nil
+}
+
+// attachActionResultMsg is returned when an attachment action completes.
+type attachActionResultMsg struct {
+	action string
+	path   string
+	err    error
+}
+
+func openAttachmentDefaultCmd(att data.Attachment) tea.Cmd {
+	return func() tea.Msg {
+		path, err := writeAttachmentTemp(att)
+		if err != nil {
+			return attachActionResultMsg{action: "open", err: err}
+		}
+		if err := exec.Command("xdg-open", path).Start(); err != nil {
+			return attachActionResultMsg{action: "open", err: err}
+		}
+		return attachActionResultMsg{action: "open", path: path}
+	}
+}
+
+func downloadAttachmentCmd(att data.Attachment) tea.Cmd {
+	return func() tea.Msg {
+		home, _ := os.UserHomeDir()
+		dest := filepath.Join(home, "Downloads", att.Filename)
+		if err := os.WriteFile(dest, att.Data, 0644); err != nil {
+			return attachActionResultMsg{action: "download", err: err}
+		}
+		return attachActionResultMsg{action: "download", path: dest}
+	}
+}
+
+func openAttachmentEditorCmd(att data.Attachment) tea.Cmd {
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "vi"
+	}
+	path, err := writeAttachmentTemp(att)
+	if err != nil {
+		return func() tea.Msg { return attachActionResultMsg{action: "editor", err: err} }
+	}
+	return tea.ExecProcess(exec.Command(editor, path), func(err error) tea.Msg {
+		return attachActionResultMsg{action: "editor", path: path, err: err}
+	})
+}
+
+func writeAttachmentTemp(att data.Attachment) (string, error) {
+	ext := filepath.Ext(att.Filename)
+	f, err := os.CreateTemp("", "bubblmail-*"+ext)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if _, err := f.Write(att.Data); err != nil {
+		return "", err
+	}
+	return f.Name(), nil
 }
 
 func (a *App) cycleAccount(dir int) {

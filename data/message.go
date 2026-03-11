@@ -27,6 +27,13 @@ func (a Address) String() string {
 	return a.Address
 }
 
+// Attachment represents a file attached to an email.
+type Attachment struct {
+	Filename    string
+	ContentType string
+	Data        []byte
+}
+
 // Message represents a single email message.
 type Message struct {
 	ID          int64
@@ -42,9 +49,10 @@ type Message struct {
 	Date        time.Time
 	Flags       []Flag
 	Size        uint32
-	Snippet     string // first ~200 chars plain text
-	Body        string // lazy: populated on FetchBody
-	HTMLBody    string // lazy: populated on FetchBody
+	Snippet     string       // first ~200 chars plain text
+	Body        string       // lazy: populated on FetchBody
+	HTMLBody    string       // lazy: populated on FetchBody
+	Attachments []Attachment // lazy: populated on FetchBody
 	FolderName  string
 	AccountName string
 	Tags        []string // local only (SQLite)
