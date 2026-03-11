@@ -6,6 +6,7 @@ import (
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/data"
 	outsmtp "github.com/bubblmail/bubblmail/smtp"
+	"github.com/bubblmail/bubblmail/ui/icons"
 	"github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -247,6 +248,12 @@ func (c *Composer) submit() {
 	c.active = false
 }
 
+// composerBodyOverhead is the total number of rows consumed outside the body
+// area: title(1) + from(1) + divider(1) + To(1) + CC(1) + Subject(1) +
+// sectionDiv(1) + divider(1) + hints(1) = 9 content rows, plus box border(2)
+// + box padding top/bottom(2) = 13 total.
+const composerBodyOverhead = 13
+
 // View renders the composer overlay.
 func (c *Composer) View() string {
 	if !c.active {
@@ -258,91 +265,175 @@ func (c *Composer) View() string {
 	if boxWidth < 60 {
 		boxWidth = 60
 	}
+	// innerW is the usable content width inside the box's Padding(1,2).
+	innerW := boxWidth - 4
 
-	titleStyle := lipgloss.NewStyle().
-		Foreground(theme.Accent).
-		Background(theme.Surface).
-		Bold(true).
-		Align(lipgloss.Center).
-		Width(boxWidth - 4)
-
+	// ── Title ────────────────────────────────────────────────────────────────
 	mode := c.mode
 	if mode == "" {
 		mode = "New Message"
 	}
-	title := titleStyle.Render(mode)
+	title := lipgloss.NewStyle().
+		Foreground(theme.Accent).
+		Background(theme.Surface).
+		Bold(true).
+		Align(lipgloss.Center).
+		Width(innerW).
+		Render(mode)
 
-	divider := lipgloss.NewStyle().
-		Foreground(theme.Border).
-		Render(strings.Repeat("─", boxWidth-4))
-
-	var rows []string
-	rows = append(rows, title, divider)
-
-	for i, f := range c.fields {
-		ef := NewEditorField(theme, f)
-		ef.SetActive(i == c.focused)
-		ef.SetWidth(boxWidth - 4)
-
-		if f.Kind == FieldTextArea {
-			// Render multi-line body (no single-line field row)
-			labelStyle := lipgloss.NewStyle().
-				Foreground(theme.TextMuted).
-				Width(composerLabelWidth).
-				Align(lipgloss.Right)
-			sepStyle := lipgloss.NewStyle().
-				Foreground(theme.Border)
-			label := labelStyle.Render(f.Label + ":")
-			sep := sepStyle.Render(composerFieldSep)
-			prefixWidth := lipgloss.Width(label + sep)
-			indent := strings.Repeat(" ", prefixWidth)
-			textW := boxWidth - 4 - prefixWidth
-			if textW < 1 {
-				textW = 1
-			}
-			bodyLines := strings.Split(f.Value, "\n")
-			bodyH := c.height - len(rows) - 6
-			if bodyH < 3 {
-				bodyH = 3
-			}
-			start, end := c.bodyWindow(f, bodyH)
-			visible := bodyLines[start:end]
-			for idx, line := range visible {
-				lineStyle := lipgloss.NewStyle().
-					Foreground(theme.Text).
-					Background(theme.SurfaceAlt).
-					Width(textW)
-				display := line
-				if i == c.focused {
-					cursorLine := c.cursorLine(f)
-					if cursorLine == start+idx {
-						col := c.cursorColumn(f)
-						lineRunes := []rune(line)
-						if col > len(lineRunes) {
-							col = len(lineRunes)
-						}
-						display = string(lineRunes[:col]) + "▌" + string(lineRunes[col:])
-					}
-				}
-				prefix := indent
-				if start == 0 && idx == 0 {
-					prefix = label + sep
-				}
-				rows = append(rows, prefix+lineStyle.Render(display))
-			}
-		} else {
-			rows = append(rows, ef.View())
-		}
+	// ── From line ────────────────────────────────────────────────────────────
+	fromStr := c.from.Address
+	if c.from.Name != "" {
+		fromStr = c.from.Name + " <" + c.from.Address + ">"
 	}
-
-	rows = append(rows, "")
-
-	hintStyle := lipgloss.NewStyle().
-		Foreground(theme.TextFaint).
+	fromLine := lipgloss.NewStyle().
+		Foreground(theme.TextMuted).
 		Background(theme.Surface).
 		Align(lipgloss.Center).
-		Width(boxWidth - 4)
-	rows = append(rows, hintStyle.Render("ctrl+enter send  ·  tab next field  ·  ↑/↓ move line  ·  pgup/pgdn scroll  ·  esc cancel"))
+		Width(innerW).
+		Render(fromStr)
+
+	// ── Dividers ─────────────────────────────────────────────────────────────
+	divider := lipgloss.NewStyle().
+		Foreground(theme.Border).
+		Background(theme.Surface).
+		Render(strings.Repeat("─", innerW))
+
+	sectionDiv := lipgloss.NewStyle().
+		Foreground(theme.Overlay).
+		Background(theme.Surface).
+		Render(strings.Repeat("╌", innerW))
+
+	// ── Header fields (To / CC / Subject) ────────────────────────────────────
+	var rows []string
+	rows = append(rows, title, fromLine, divider)
+
+	for i, f := range c.fields[:3] {
+		ef := NewEditorField(theme, f)
+		ef.SetActive(i == c.focused)
+		ef.SetWidth(innerW)
+		rows = append(rows, ef.View())
+	}
+
+	rows = append(rows, sectionDiv)
+
+	// ── Body field ───────────────────────────────────────────────────────────
+	bodyF := c.fields[3]
+	bodyFocused := c.focused == 3
+
+	// Label / separator colours follow focus state.
+	var bodyLabelFg, bodySepFg lipgloss.Color
+	var bodySepStr string
+	if bodyFocused {
+		bodyLabelFg = theme.Accent
+		bodySepFg = theme.Accent
+		bodySepStr = " ▸ "
+	} else {
+		bodyLabelFg = theme.TextMuted
+		bodySepFg = theme.Border
+		bodySepStr = " │ "
+	}
+
+	bodyLabel := lipgloss.NewStyle().
+		Foreground(bodyLabelFg).
+		Background(theme.Surface).
+		Width(composerLabelWidth).
+		Align(lipgloss.Right).
+		Render("Body:")
+
+	bodySep := lipgloss.NewStyle().Foreground(bodySepFg).Background(theme.Surface).Render(bodySepStr)
+
+	// Use plain char counts — never measure pre-rendered ANSI strings.
+	// composerLabelWidth(10) + sepStr(3) = 13 chars of prefix.
+	const bodyPrefixWidth = composerLabelWidth + 3
+	indent := lipgloss.NewStyle().Background(theme.Surface).Render(strings.Repeat(" ", bodyPrefixWidth))
+	textW := innerW - bodyPrefixWidth
+	if textW < 1 {
+		textW = 1
+	}
+
+	bodyLines := strings.Split(bodyF.Value, "\n")
+	bodyH := c.height - len(rows) - 6 // matches composerBodyOverhead
+	if bodyH < 3 {
+		bodyH = 3
+	}
+	start, end := c.bodyWindow(bodyF, bodyH)
+	visible := bodyLines[start:end]
+
+	for idx, line := range visible {
+		lineStyle := lipgloss.NewStyle().
+			Foreground(theme.Text).
+			Background(theme.SurfaceAlt).
+			Width(textW)
+
+		display := line
+		if bodyFocused {
+			cursorLine := c.cursorLine(bodyF)
+			if cursorLine == start+idx {
+				col := c.cursorColumn(bodyF)
+				lineRunes := []rune(line)
+				if col > len(lineRunes) {
+					col = len(lineRunes)
+				}
+				display = string(lineRunes[:col]) + "▌" + string(lineRunes[col:])
+			}
+		}
+
+		// Always render the label on the first visible row, even when scrolled.
+		prefix := indent
+		if idx == 0 {
+			prefix = bodyLabel + bodySep
+		}
+		rows = append(rows, prefix+lineStyle.Render(display))
+	}
+
+	// ── Footer ───────────────────────────────────────────────────────────────
+	rows = append(rows, divider)
+
+	// Build hint line matching the main statusbar format: icon desc (key).
+	// Every span carries Background(theme.Surface) so ANSI resets leave no holes.
+	// Spaces are absorbed into adjacent renders — never left bare between spans.
+	hintIconSt := lipgloss.NewStyle().Foreground(theme.Accent).Background(theme.Surface)
+	hintDescSt := lipgloss.NewStyle().Foreground(theme.TextMuted).Background(theme.Surface)
+	hintKeySt := lipgloss.NewStyle().Foreground(theme.TextFaint).Background(theme.Surface)
+	hintSepSt := lipgloss.NewStyle().Foreground(theme.TextFaint).Background(theme.Surface)
+
+	type hintItem struct{ icon, key, desc string }
+	composerHints := []hintItem{
+		{icons.Send, "ctrl+enter", "send"},
+		{icons.ChevronRight, "tab", "next field"},
+		{icons.ArrowUpDown, "pgup/pgdn", "scroll"},
+		{icons.Close, "esc", "cancel"},
+	}
+
+	// Plain text for rune-count centering (icons render as 1 col each).
+	var plainParts []string
+	for _, h := range composerHints {
+		plainParts = append(plainParts, h.icon+" "+h.desc+" ("+h.key+")")
+	}
+	plainHint := strings.Join(plainParts, "  ")
+	plainW := len([]rune(plainHint))
+	padLeft := (innerW - plainW) / 2
+	if padLeft < 0 {
+		padLeft = 0
+	}
+	padRight := innerW - plainW - padLeft
+	if padRight < 0 {
+		padRight = 0
+	}
+
+	var hintParts []string
+	for _, h := range composerHints {
+		hintParts = append(hintParts,
+			hintIconSt.Render(h.icon+" ")+
+				hintDescSt.Render(h.desc+" ")+
+				hintKeySt.Render("("+h.key+")"),
+		)
+	}
+	styledHint := hintSepSt.Render(strings.Repeat(" ", padLeft)) +
+		strings.Join(hintParts, hintSepSt.Render("  ")) +
+		hintSepSt.Render(strings.Repeat(" ", padRight))
+	rows = append(rows, styledHint)
 
 	content := strings.Join(rows, "\n")
 
@@ -480,7 +571,7 @@ func (c *Composer) ensureBodyVisible() {
 	if f.Kind != FieldTextArea {
 		return
 	}
-	bodyH := c.height - 6 - len(c.fields)
+	bodyH := c.height - composerBodyOverhead
 	if bodyH < 3 {
 		bodyH = 3
 	}
@@ -508,7 +599,7 @@ func (c *Composer) scrollBody(delta int) {
 	if f.Kind != FieldTextArea {
 		return
 	}
-	bodyH := c.height - 6 - len(c.fields)
+	bodyH := c.height - composerBodyOverhead
 	if bodyH < 3 {
 		bodyH = 3
 	}

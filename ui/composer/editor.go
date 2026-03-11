@@ -188,36 +188,38 @@ func (ef *EditorField) SetWidth(w int) {
 // View renders a single form field row.
 func (ef *EditorField) View() string {
 	theme := ef.theme
-	labelW := labelWidth
+
+	// Label and separator change colour when the field is focused.
+	var labelFg lipgloss.Color
+	var sepStr string
+	var sepFg lipgloss.Color
+	if ef.active {
+		labelFg = theme.Accent
+		sepStr = " ▸ "
+		sepFg = theme.Accent
+	} else {
+		labelFg = theme.TextMuted
+		sepStr = " │ "
+		sepFg = theme.Border
+	}
 
 	labelStyle := lipgloss.NewStyle().
-		Foreground(theme.TextMuted).
-		Width(labelW).
+		Foreground(labelFg).
+		Background(theme.Surface).
+		Width(labelWidth).
 		Align(lipgloss.Right)
 
-	var valueStyle lipgloss.Style
-	valueW := ef.width - labelW - len(fieldSep)
+	sep := lipgloss.NewStyle().Foreground(sepFg).Background(theme.Surface).Render(sepStr)
+
+	// Use plain char counts — never measure ANSI strings for layout.
+	// sepStr is always exactly 3 chars (" ▸ " or " │ ").
+	valueW := ef.width - labelWidth - 3
 	if valueW < 1 {
 		valueW = 1
 	}
-	if ef.active {
-		valueStyle = lipgloss.NewStyle().
-			Foreground(theme.Text).
-			Background(theme.SurfaceAlt).
-			Width(valueW)
-	} else {
-		valueStyle = lipgloss.NewStyle().
-			Foreground(theme.Text).
-			Background(theme.Surface).
-			Width(valueW)
-	}
 
 	label := labelStyle.Render(ef.field.Label + ":")
-	sep := lipgloss.NewStyle().
-		Foreground(theme.Border).
-		Render(fieldSep)
 
-	var display string
 	value := ef.field.Value
 	if ef.field.Kind == FieldTextArea {
 		parts := strings.Split(value, "\n")
@@ -227,32 +229,49 @@ func (ef *EditorField) View() string {
 			value = ""
 		}
 	}
+
+	var display string
 	if ef.active {
-		// Insert cursor marker (textarea cursor is rendered in the body view)
 		runes := []rune(value)
-		if ef.field.Kind == FieldTextArea {
-			display = valueStyle.Render(value)
-		} else {
-			cursor := ef.field.cursor
-			if cursor > len(runes) {
-				cursor = len(runes)
-			}
-			if cursor < 0 {
-				cursor = 0
-			}
-			display = valueStyle.Render(string(runes[:cursor]) + "▌" + string(runes[cursor:]))
+		cursor := ef.field.cursor
+		if cursor > len(runes) {
+			cursor = len(runes)
 		}
+		if cursor < 0 {
+			cursor = 0
+		}
+		display = lipgloss.NewStyle().
+			Foreground(theme.Text).
+			Background(theme.SurfaceAlt).
+			Width(valueW).
+			Render(string(runes[:cursor]) + "▌" + string(runes[cursor:]))
+	} else if value == "" {
+		display = lipgloss.NewStyle().
+			Foreground(theme.TextFaint).
+			Background(theme.Surface).
+			Width(valueW).
+			Render(fieldPlaceholder(ef.field.Label))
 	} else {
-		if value == "" {
-			display = lipgloss.NewStyle().
-				Foreground(theme.TextFaint).
-				Background(theme.Surface).
-				Width(valueW).
-				Render("(empty)")
-		} else {
-			display = valueStyle.Render(value)
-		}
+		display = lipgloss.NewStyle().
+			Foreground(theme.Text).
+			Background(theme.Surface).
+			Width(valueW).
+			Render(value)
 	}
 
 	return label + sep + display
+}
+
+// fieldPlaceholder returns a subtle hint shown in empty unfocused fields.
+func fieldPlaceholder(label string) string {
+	switch label {
+	case "To":
+		return "recipient address..."
+	case "CC":
+		return "optional..."
+	case "Subject":
+		return "subject line..."
+	default:
+		return ""
+	}
 }
