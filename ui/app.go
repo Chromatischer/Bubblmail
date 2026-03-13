@@ -935,12 +935,14 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		qChanged, closed, selected := a.searchOverlay.HandleKey(key)
 		if closed {
 			a.searchState = nil
+			var selectedMsg *data.Message
 			if selected {
-				if msg := a.searchOverlay.SelectedMessage(); msg != nil {
-					return a, a.openMessage(msg)
-				}
+				selectedMsg = a.searchOverlay.SelectedMessage()
 			}
 			a.searchOverlay.Close()
+			if selectedMsg != nil {
+				return a, a.openMessage(selectedMsg)
+			}
 		} else if qChanged {
 			id := a.searchOverlay.BumpDebounce()
 			if !a.searchOverlay.CanSearch() {

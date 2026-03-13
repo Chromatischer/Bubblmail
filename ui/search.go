@@ -44,7 +44,7 @@ var searchSpinnerFrames = []string{
 
 // NewSearchOverlay creates a new search overlay.
 func NewSearchOverlay(styles *Styles) *SearchOverlay {
-	return &SearchOverlay{styles: styles, minChars: 2}
+	return &SearchOverlay{styles: styles, minChars: 3}
 }
 
 // SetSize sets the overlay dimensions.
