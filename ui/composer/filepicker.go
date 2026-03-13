@@ -78,6 +78,25 @@ func (fp *filePicker) handleKey(key string) (path string, isDir bool, accepted b
 		}
 		fp.active = false
 		return fullPath, false, true, false
+	case "tab":
+		// Tab-complete the current selection into the query.
+		//   • Directory → append its path + "/" so the user drills in.
+		//   • File      → accept immediately (same as enter).
+		if len(fp.matches) == 0 {
+			return "", false, false, false
+		}
+		sel := fp.matches[fp.cursor]
+		fullPath := filepath.Join(fp.cwd, sel)
+		info, err := os.Stat(fullPath)
+		if err == nil && info.IsDir() {
+			// Complete the query to "sel/" and stay in the picker.
+			fp.query = sel + "/"
+			fp.cursor = 0
+			fp.refresh()
+			return "", false, false, false
+		}
+		fp.active = false
+		return fullPath, false, true, false
 	case "up":
 		if fp.cursor > 0 {
 			fp.cursor--
@@ -247,7 +266,7 @@ func (fp *filePicker) view(bodyW, height int) string {
 	filterSt := lipgloss.NewStyle().Foreground(theme.Text).Background(theme.SurfaceAlt)
 	cursorSt := lipgloss.NewStyle().Foreground(theme.Accent).Background(theme.SurfaceAlt).Bold(true)
 
-	queryRendered := iconSt.Render(" " + icons.Search + " ") +
+	queryRendered := iconSt.Render(" "+icons.Search+" ") +
 		dirSt.Render(queryDir) +
 		filterSt.Render(queryFilter) +
 		cursorSt.Render("▌")

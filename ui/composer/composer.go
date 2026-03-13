@@ -520,89 +520,162 @@ func (c *Composer) View() string {
 		start, end := c.bodyWindow(bodyF, bodyH)
 		visible := bodyLines[start:end]
 
-		// Determine code-block state at the top of the visible window.
-		inCodeBlock := false
-		for i := 0; i < start; i++ {
-			if isCodeFence(util.SingleLine(bodyLines[i])) {
-				inCodeBlock = !inCodeBlock
-			}
-		}
-
 		cursorLine := -1
+		cursorCol := 0
 		if bodyFocused {
 			cursorLine = c.cursorLine(bodyF)
+			cursorCol = c.cursorColumn(bodyF)
 		}
 
-		for idx, line := range visible {
-			// Strip ZWJ and lone CRs before any display operation (CLAUDE.md).
-			safeLine := util.SingleLine(line)
-			isFence := isCodeFence(safeLine)
-			onCursorLine := bodyFocused && start+idx == cursorLine
+		// Purple palette for quoted reply text. Two shades — one for the │ gutter
+		// (brighter) and one for the body text (softer) — on both dark and light themes.
+		var quotePurple, quoteTextPurple lipgloss.Color
+		if theme.IsDark {
+			quotePurple = lipgloss.Color("#B094F0")     // bright lavender gutter bar
+			quoteTextPurple = lipgloss.Color("#9B82D4") // muted purple body text
+		} else {
+			quotePurple = lipgloss.Color("#7C5CBF")     // deep violet gutter bar
+			quoteTextPurple = lipgloss.Color("#8B6DC8") // medium violet body text
+		}
 
-			// Code fences and code block content use Overlay background.
-			var bg lipgloss.Color
-			if isFence || inCodeBlock {
-				bg = theme.Overlay
+		plainLineStyle := lipgloss.NewStyle().
+			Foreground(theme.Text).
+			Background(theme.SurfaceAlt).
+			Width(textW)
+
+		visualRows := 0 // number of visual rows emitted so far
+		isFirst := true // whether the very first visual row has been emitted
+
+		for logIdx, line := range visible {
+			logicalLineIdx := start + logIdx
+
+			// Detect quoted lines ("> …") and strip depth markers.
+			quoteDepth, quoteText := bodyQuoteDepth(line)
+			isQuoted := quoteDepth > 0
+
+			// The gutter occupies 2 cols per depth level ("│ ").
+			// Non-quoted lines use the full textW.
+			gutterW := quoteDepth * 2
+			wrapW := textW - gutterW
+			if wrapW < 1 {
+				wrapW = 1
+			}
+
+			// Soft-wrap the logical line into visual sub-lines.
+			var subLines []string
+			if isQuoted {
+				subLines = util.WrapANSI(quoteText, wrapW)
 			} else {
-				bg = theme.SurfaceAlt
+				subLines = util.WrapANSI(line, textW)
+			}
+			if len(subLines) == 0 {
+				subLines = []string{""}
 			}
 
-			// Width-padding style — no Foreground so inner span colours prevail.
-			lineStyle := lipgloss.NewStyle().
-				Background(bg).
-				Width(textW)
-
-			// Clip to textW on the plain string before any styling (CLAUDE.md).
-			display := util.TruncateText(safeLine, textW)
-			if onCursorLine {
-				col := c.cursorColumn(bodyF)
-				lineRunes := []rune(safeLine)
-				if col > len(lineRunes) {
-					col = len(lineRunes)
+			// Determine where the cursor sits within this logical line's sub-lines.
+			// Cursor tracking works on the raw logical line (with > markers intact),
+			// so we map cursorCol into sub-lines using the raw line's rune positions.
+			cursorSubLine := -1
+			cursorSubCol := 0
+			if bodyFocused && logicalLineIdx == cursorLine {
+				// For quoted lines the cursor column is measured against the raw
+				// "> …" content, but we display only the stripped text. Shift the
+				// cursor left by the number of stripped prefix runes so it lands in
+				// the right sub-line position.
+				effectiveCol := cursorCol
+				if isQuoted {
+					prefixRunes := len([]rune(line)) - len([]rune(quoteText))
+					effectiveCol = cursorCol - prefixRunes
+					if effectiveCol < 0 {
+						effectiveCol = 0
+					}
 				}
-				display = util.TruncateText(string(lineRunes[:col])+"▌"+string(lineRunes[col:]), textW)
+				runesConsumed := 0
+				for si, sl := range subLines {
+					slRunes := []rune(sl)
+					slLen := len(slRunes)
+					isLastSub := si == len(subLines)-1
+					if effectiveCol <= runesConsumed+slLen || isLastSub {
+						cursorSubLine = si
+						cursorSubCol = effectiveCol - runesConsumed
+						if cursorSubCol < 0 {
+							cursorSubCol = 0
+						}
+						if cursorSubCol > slLen {
+							cursorSubCol = slLen
+						}
+						break
+					}
+					runesConsumed += slLen + 1
+				}
 			}
 
-			var styledDisplay string
-			switch {
-			case isFence:
-				styledDisplay = lipgloss.NewStyle().
-					Foreground(theme.TextFaint).
-					Background(bg).
-					Render(display)
-			case inCodeBlock:
-				styledDisplay = lipgloss.NewStyle().
-					Foreground(theme.TextMuted).
-					Background(bg).
-					Render(display)
-			case onCursorLine:
-				// Reveal raw markdown syntax while editing this line.
-				styledDisplay = lipgloss.NewStyle().
-					Foreground(theme.Text).
-					Background(bg).
-					Render(display)
-			default:
-				styledDisplay = renderMarkdownLine(display, theme, bg)
-			}
+			for si, sl := range subLines {
+				if visualRows >= bodyH {
+					break
+				}
 
-			if isFence {
-				inCodeBlock = !inCodeBlock
-			}
+				var renderedLine string
+				if isQuoted {
+					// Build the purple gutter: one "│ " per depth level.
+					gutterStr := strings.Repeat("│ ", quoteDepth)
+					gutter := lipgloss.NewStyle().
+						Foreground(quotePurple).
+						Background(theme.SurfaceAlt).
+						Render(gutterStr)
 
-			prefix := indent
-			if idx == 0 {
-				prefix = bodyLabel + bodySep
+					// Insert cursor into stripped text if needed.
+					display := sl
+					if bodyFocused && logicalLineIdx == cursorLine && si == cursorSubLine {
+						slRunes := []rune(sl)
+						col := cursorSubCol
+						if col > len(slRunes) {
+							col = len(slRunes)
+						}
+						display = string(slRunes[:col]) + "▌" + string(slRunes[col:])
+					}
+
+					// Text cell: remaining width after gutter.
+					textCell := lipgloss.NewStyle().
+						Foreground(quoteTextPurple).
+						Background(theme.SurfaceAlt).
+						Width(wrapW).
+						Render(display)
+
+					renderedLine = gutter + textCell
+				} else {
+					display := sl
+					if bodyFocused && logicalLineIdx == cursorLine && si == cursorSubLine {
+						slRunes := []rune(sl)
+						col := cursorSubCol
+						if col > len(slRunes) {
+							col = len(slRunes)
+						}
+						display = string(slRunes[:col]) + "▌" + string(slRunes[col:])
+					}
+					renderedLine = plainLineStyle.Render(display)
+				}
+
+				prefix := indent
+				if isFirst {
+					prefix = bodyLabel + bodySep
+					isFirst = false
+				}
+				rows = append(rows, prefix+renderedLine)
+				visualRows++
 			}
-			rows = append(rows, prefix+lineStyle.Render(styledDisplay))
 		}
-		// Pad empty lines to keep height stable.
-		for i := len(visible); i < bodyH; i++ {
+
+		// Pad remaining visual rows to keep the body area height stable.
+		for visualRows < bodyH {
 			prefix := indent
-			if i == 0 {
+			if isFirst {
 				prefix = bodyLabel + bodySep
+				isFirst = false
 			}
 			rows = append(rows, prefix+lipgloss.NewStyle().
 				Background(theme.SurfaceAlt).Width(textW).Render(""))
+			visualRows++
 		}
 	}
 
@@ -905,4 +978,22 @@ func (c *Composer) scrollBody(delta int) {
 	if c.bodyTop > maxTop {
 		c.bodyTop = maxTop
 	}
+}
+
+// bodyQuoteDepth counts leading '>' characters in a body line and returns the
+// quote depth and the stripped text content (without the '>' markers or their
+// trailing spaces). Returns depth=0 and the original line if not a quote.
+func bodyQuoteDepth(line string) (depth int, text string) {
+	s := line
+	for len(s) > 0 && s[0] == '>' {
+		depth++
+		s = s[1:]
+		if len(s) > 0 && s[0] == ' ' {
+			s = s[1:]
+		}
+	}
+	if depth == 0 {
+		return 0, line
+	}
+	return depth, strings.TrimSpace(s)
 }
