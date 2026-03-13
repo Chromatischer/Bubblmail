@@ -75,8 +75,17 @@ func (s *Store) applySchema() error {
 	if _, err := s.db.Exec(`DROP TRIGGER IF EXISTS messages_fts_update`); err != nil {
 		return fmt.Errorf("dropping stale fts_update trigger: %w", err)
 	}
-	_, err := s.db.Exec(schemaSQL)
-	return err
+	if _, err := s.db.Exec(schemaSQL); err != nil {
+		return err
+	}
+	// Migration: add rejected column to suggested_events if it doesn't exist yet.
+	if _, err := s.db.Exec(`ALTER TABLE suggested_events ADD COLUMN rejected INTEGER NOT NULL DEFAULT 0`); err != nil {
+		// Ignore "duplicate column" errors — column already exists.
+		if !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("migrating suggested_events.rejected: %w", err)
+		}
+	}
+	return nil
 }
 
 // UpsertMessages inserts or updates messages in the cache.
@@ -1020,9 +1029,9 @@ func (s *Store) UpsertSuggestedEvent(ev *data.SuggestedEvent) error {
 			message_id, has_event, summary, date, start_time, end_time,
 			location, calendar, status, all_day, recurring, description,
 			model, generated_at, source_hash, plain_text, json_text,
-			parse_error, generation_ok
+			parse_error, generation_ok, rejected
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(message_id) DO UPDATE SET
 			has_event = excluded.has_event,
 			summary = excluded.summary,
@@ -1041,7 +1050,8 @@ func (s *Store) UpsertSuggestedEvent(ev *data.SuggestedEvent) error {
 			plain_text = excluded.plain_text,
 			json_text = excluded.json_text,
 			parse_error = excluded.parse_error,
-			generation_ok = excluded.generation_ok
+			generation_ok = excluded.generation_ok,
+			rejected = excluded.rejected
 	`,
 		ev.MessageID,
 		boolToInt(ev.HasEvent),
@@ -1062,6 +1072,7 @@ func (s *Store) UpsertSuggestedEvent(ev *data.SuggestedEvent) error {
 		ev.JSONText,
 		ev.ParseError,
 		boolToInt(ev.GenerationOK),
+		boolToInt(ev.Rejected),
 	)
 	return err
 }
@@ -1069,12 +1080,13 @@ func (s *Store) UpsertSuggestedEvent(ev *data.SuggestedEvent) error {
 // GetSuggestedEvent returns the cached suggested event for a message.
 func (s *Store) GetSuggestedEvent(messageID int64) (*data.SuggestedEvent, error) {
 	ev := &data.SuggestedEvent{}
-	var hasEvent, allDay, recurring, generationOK int
+	var hasEvent, allDay, recurring, generationOK, rejected int
 	err := s.db.QueryRow(`
 		SELECT message_id, has_event, summary, date, start_time, end_time,
 		       location, calendar, status, all_day, recurring, description,
 		       model, generated_at, source_hash, plain_text, json_text,
-		       parse_error, generation_ok
+		       parse_error, generation_ok,
+		       COALESCE(rejected, 0)
 		FROM suggested_events
 		WHERE message_id = ?
 	`, messageID).Scan(
@@ -1097,6 +1109,7 @@ func (s *Store) GetSuggestedEvent(messageID int64) (*data.SuggestedEvent, error)
 		&ev.JSONText,
 		&ev.ParseError,
 		&generationOK,
+		&rejected,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -1108,7 +1121,18 @@ func (s *Store) GetSuggestedEvent(messageID int64) (*data.SuggestedEvent, error)
 	ev.AllDay = allDay != 0
 	ev.Recurring = recurring != 0
 	ev.GenerationOK = generationOK != 0
+	ev.Rejected = rejected != 0
 	return ev, nil
+}
+
+// RejectSuggestedEvent marks a suggestion as rejected so it is never shown again.
+func (s *Store) RejectSuggestedEvent(messageID int64) error {
+	_, err := s.db.Exec(`
+		INSERT INTO suggested_events (message_id, rejected)
+		VALUES (?, 1)
+		ON CONFLICT(message_id) DO UPDATE SET rejected = 1
+	`, messageID)
+	return err
 }
 
 // GetUnclassifiedInboxMessages returns messages from INBOX for an account that

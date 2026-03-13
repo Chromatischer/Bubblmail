@@ -130,6 +130,7 @@ CREATE TABLE IF NOT EXISTS suggested_events (
     json_text      TEXT    NOT NULL DEFAULT '',
     parse_error    TEXT    NOT NULL DEFAULT '',
     generation_ok  INTEGER NOT NULL DEFAULT 0,
+    rejected       INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_suggested_events_model ON suggested_events(model);

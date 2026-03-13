@@ -1393,7 +1393,11 @@ func (a *App) loadSuggestedEvent(msg *data.Message) tea.Cmd {
 	}
 	a.debugLog("loadSuggestedEvent: msg.ID=%d", msg.ID)
 	if cached, err := a.store.GetSuggestedEvent(msg.ID); err == nil && cached != nil {
-		a.debugLog("loadSuggestedEvent: found cached GenerationOK=%v HasEvent=%v", cached.GenerationOK, cached.HasEvent)
+		a.debugLog("loadSuggestedEvent: found cached GenerationOK=%v HasEvent=%v Rejected=%v", cached.GenerationOK, cached.HasEvent, cached.Rejected)
+		// If the user previously rejected this suggestion, don't show it again.
+		if cached.Rejected {
+			return nil
+		}
 		if a.readerView != nil {
 			a.readerView.SetSuggestedEvent(cached)
 		}
@@ -2095,9 +2099,13 @@ func (a *App) copySuggestedEvent() tea.Cmd {
 	if ev == nil || !ev.HasEvent {
 		return nil
 	}
+	action := a.readerView.FocusedEventAction()
+	if action == "reject" {
+		return a.rejectSuggestedEvent()
+	}
 	content := ev.PlainText
 	label := "Copied suggested event"
-	if a.readerView.FocusedEventAction() == "json" {
+	if action == "json" {
 		content = a.readerView.SuggestedEventJSON()
 		label = "Copied suggested event JSON"
 	}
@@ -2108,6 +2116,22 @@ func (a *App) copySuggestedEvent() tea.Cmd {
 		return a.flash("Copy failed: "+err.Error(), "err")
 	}
 	return a.flash(label, "ok")
+}
+
+func (a *App) rejectSuggestedEvent() tea.Cmd {
+	ev := a.readerView.SuggestedEvent()
+	if ev == nil {
+		return nil
+	}
+	if err := a.store.RejectSuggestedEvent(ev.MessageID); err != nil {
+		return a.flash("Reject failed: "+err.Error(), "err")
+	}
+	// Hide the suggestion in the current view.
+	rejected := *ev
+	rejected.Rejected = true
+	rejected.HasEvent = false
+	a.readerView.SetSuggestedEvent(&rejected)
+	return a.flash("Event suggestion rejected", "ok")
 }
 
 func (a *App) executeAttachmentAction() tea.Cmd {

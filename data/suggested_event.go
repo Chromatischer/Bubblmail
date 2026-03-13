@@ -21,4 +21,5 @@ type SuggestedEvent struct {
 	JSONText     string
 	ParseError   string
 	GenerationOK bool
+	Rejected     bool
 }

@@ -95,30 +95,34 @@ func (v *ReaderView) HasFocusableEvent() bool {
 	return v.event != nil && v.event.HasEvent
 }
 
-// FocusNextEventAction advances the copy action focus.
+// FocusNextEventAction advances the action button focus (0=Copy Plain, 1=Copy JSON, 2=Reject).
 func (v *ReaderView) FocusNextEventAction(delta int) {
 	if v.event == nil || !v.event.HasEvent {
 		return
 	}
 	v.eventFocus += delta
 	if v.eventFocus < 0 {
-		v.eventFocus = 1
+		v.eventFocus = 2
 	}
-	if v.eventFocus > 1 {
+	if v.eventFocus > 2 {
 		v.eventFocus = 0
 	}
 	v.rebuildLines()
 }
 
-// FocusedEventAction returns the current copy action identifier.
+// FocusedEventAction returns the current action identifier: "plain", "json", or "reject".
 func (v *ReaderView) FocusedEventAction() string {
 	if v.event == nil || !v.event.HasEvent {
 		return ""
 	}
-	if v.eventFocus == 1 {
+	switch v.eventFocus {
+	case 1:
 		return "json"
+	case 2:
+		return "reject"
+	default:
+		return "plain"
 	}
-	return "plain"
 }
 
 // SuggestedEvent returns the current event suggestion.
@@ -712,67 +716,121 @@ func (v *ReaderView) singleHeaderLines() []string {
 }
 
 func (v *ReaderView) renderSuggestedEventSection() []string {
+	labelStyle := lipgloss.NewStyle().Foreground(v.theme.TextMuted).Width(10).Align(lipgloss.Right)
+	header := labelStyle.Render("Event") + "  " + lipgloss.NewStyle().Foreground(v.theme.Accent).Bold(true).Render(icons.Calendar+" Suggested Event")
+
 	if v.event == nil {
 		return []string{
-			lipgloss.NewStyle().Foreground(v.theme.Accent).Bold(true).Render("Suggested Event"),
-			lipgloss.NewStyle().Foreground(v.theme.TextMuted).Render("Loading suggestion..."),
+			header,
+			"            " + lipgloss.NewStyle().Foreground(v.theme.TextMuted).Render("Loading suggestion..."),
 		}
 	}
 	if !v.event.GenerationOK {
 		msg := "No suggested event available"
 		if v.event.ParseError != "" {
-			msg = util.TruncateText(util.SingleLine(v.event.ParseError), max(20, v.width-2))
+			msg = util.TruncateText(util.SingleLine(v.event.ParseError), max(20, v.width-14))
 		}
 		return []string{
-			lipgloss.NewStyle().Foreground(v.theme.Accent).Bold(true).Render("Suggested Event"),
-			lipgloss.NewStyle().Foreground(v.theme.TextMuted).Render(msg),
+			header,
+			"            " + lipgloss.NewStyle().Foreground(v.theme.TextMuted).Render(msg),
 		}
 	}
 	if !v.event.HasEvent {
 		return []string{
-			lipgloss.NewStyle().Foreground(v.theme.Accent).Bold(true).Render("Suggested Event"),
-			lipgloss.NewStyle().Foreground(v.theme.TextMuted).Render("No event found in this message"),
+			header,
+			"            " + lipgloss.NewStyle().Foreground(v.theme.TextMuted).Render("No event found in this message"),
 		}
 	}
-	header := lipgloss.NewStyle().Foreground(v.theme.Accent).Bold(true).Render("Suggested Event")
-	buttons := v.renderEventButtons()
-	plain := v.event.PlainText
-	if plain == "" {
-		plain = formatSuggestedEventPlain(v.event)
-	}
-	plainLines := strings.Split(plain, "\n")
-	textWidth := v.width - 4
-	if textWidth < 20 {
-		textWidth = 20
-	}
+
+	// Render the event fields as highlighted rows.
+	fieldLabel := lipgloss.NewStyle().Foreground(v.theme.TextMuted)
+	fieldValue := lipgloss.NewStyle().Foreground(v.theme.Text)
+	titleStyle := lipgloss.NewStyle().Foreground(v.theme.Text).Bold(true)
+	indent := "            "
+
 	var out []string
 	out = append(out, header)
-	out = append(out, buttons)
-	cardStyle := lipgloss.NewStyle().Foreground(v.theme.Text).Background(v.theme.Surface).Padding(0, 1).Width(textWidth)
-	for _, line := range plainLines {
-		wrapped := util.WrapText(util.SingleLine(line), textWidth-2)
-		if len(wrapped) == 0 {
-			out = append(out, cardStyle.Render(""))
-			continue
+
+	// Title row
+	summary := util.SingleLine(v.event.Summary)
+	if summary != "" {
+		out = append(out, indent+titleStyle.Render(summary))
+	}
+
+	// Date / time row
+	if v.event.AllDay && v.event.Date != "" {
+		out = append(out, indent+fieldLabel.Render("Date    ")+fieldValue.Render(util.SingleLine(v.event.Date))+" "+fieldLabel.Render("(all day)"))
+	} else if v.event.Date != "" || v.event.Start != "" || v.event.End != "" {
+		datePart := util.SingleLine(v.event.Date)
+		timePart := strings.TrimSpace(util.SingleLine(v.event.Start) + " – " + util.SingleLine(v.event.End))
+		timePart = strings.TrimPrefix(timePart, " – ")
+		timePart = strings.TrimSuffix(timePart, " – ")
+		row := indent + fieldLabel.Render("Date    ")
+		if datePart != "" {
+			row += fieldValue.Render(datePart)
 		}
-		for _, w := range wrapped {
-			out = append(out, cardStyle.Render(w))
+		if timePart != "" {
+			if datePart != "" {
+				row += "  " + fieldLabel.Render("Time    ") + fieldValue.Render(timePart)
+			} else {
+				row += fieldValue.Render(timePart)
+			}
+		}
+		out = append(out, row)
+	}
+
+	// Location row
+	if v.event.Location != "" {
+		out = append(out, indent+fieldLabel.Render("Location")+fieldValue.Render("  "+util.SingleLine(v.event.Location)))
+	}
+
+	// Recurring
+	if v.event.Recurring {
+		out = append(out, indent+fieldLabel.Render("Repeats ")+fieldValue.Render("  Yes"))
+	}
+
+	// Description (wrapped, preserving paragraph breaks)
+	if v.event.Description != "" {
+		textWidth := v.width - 14
+		if textWidth < 20 {
+			textWidth = 20
+		}
+		out = append(out, "")
+		for _, line := range strings.Split(v.event.Description, "\n") {
+			sanitised := util.SingleLine(line)
+			if strings.TrimSpace(sanitised) == "" {
+				out = append(out, "")
+				continue
+			}
+			wrapped := util.WrapText(sanitised, textWidth)
+			for _, w := range wrapped {
+				out = append(out, indent+fieldValue.Render(w))
+			}
 		}
 	}
+
+	// Buttons below the event
+	out = append(out, "")
+	out = append(out, indent+v.renderEventButtons())
 	return out
 }
 
 func (v *ReaderView) renderEventButtons() string {
-	base := lipgloss.NewStyle().Foreground(v.theme.TextMuted).Border(lipgloss.RoundedBorder()).BorderForeground(v.theme.Border).Padding(0, 1)
-	focused := base.Foreground(v.theme.Text).BorderForeground(v.theme.Accent).Bold(true)
-	plain := base
-	jsonBtn := base
-	if v.eventFocus == 0 {
-		plain = focused
-	} else {
-		jsonBtn = focused
+	normal := lipgloss.NewStyle().Foreground(v.theme.Text).Background(v.theme.Surface).Padding(0, 1)
+	active := lipgloss.NewStyle().Foreground(v.theme.Background).Background(v.theme.Accent).Bold(true).Padding(0, 1)
+	danger := lipgloss.NewStyle().Foreground(v.theme.Background).Background(v.theme.Error).Bold(true).Padding(0, 1)
+	copyPlain := normal
+	copyJSON := normal
+	reject := normal
+	switch v.eventFocus {
+	case 0:
+		copyPlain = active
+	case 1:
+		copyJSON = active
+	case 2:
+		reject = danger
 	}
-	return plain.Render("Copy Plain") + "  " + jsonBtn.Render("Copy JSON")
+	return copyPlain.Render("Copy Plain") + " " + copyJSON.Render("Copy JSON") + " " + reject.Render("Reject")
 }
 
 func formatSuggestedEventPlain(ev *data.SuggestedEvent) string {
@@ -789,16 +847,13 @@ func formatSuggestedEventPlain(ev *data.SuggestedEvent) string {
 	if ev.AllDay {
 		lines = append(lines, "Time: All Day")
 	} else if ev.Start != "" || ev.End != "" {
-		lines = append(lines, "Time: "+strings.TrimSpace(ev.Start+" - "+ev.End))
+		lines = append(lines, "Time: "+strings.TrimSpace(ev.Start+" – "+ev.End))
 	}
 	if ev.Location != "" {
 		lines = append(lines, "Location: "+ev.Location)
 	}
-	if ev.Calendar != "" {
-		lines = append(lines, "Calendar: "+ev.Calendar)
-	}
-	if ev.Status != "" {
-		lines = append(lines, "Status: "+ev.Status)
+	if ev.Recurring {
+		lines = append(lines, "Repeating: Yes")
 	}
 	if ev.Description != "" {
 		lines = append(lines, "", ev.Description)
