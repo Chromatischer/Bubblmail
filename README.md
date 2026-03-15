@@ -98,6 +98,8 @@ The wizard will prompt for:
 
 Config is written to `~/.config/bubblmail/config.toml`.
 
+The local cache is stored in `~/.cache/bubblmail` by default.
+
 **Example config:**
 
 ```toml
@@ -144,11 +146,17 @@ bubblmail auth list               List configured accounts
 bubblmail auth status             Test IMAP connections
 bubblmail auth remove <name>      Remove an account
 
+bubblmail embeddings status       Show embedding coverage per account
+bubblmail embeddings embedd       Backfill embeddings for cached bodies
+bubblmail embeddings embedd force Re-embed all cached bodies
+
 bubblmail list unread             List unread messages
 bubblmail list mailbox <name>     List messages in a mailbox
 bubblmail list account <name>     List messages for an account
 bubblmail list search <query>     Full-text search cached messages
 bubblmail list counts             Show unread/total counts per folder
+
+bubblmail search diag <query>     Show search diagnostics for a query
 ```
 
 **List flags:**
@@ -239,3 +247,10 @@ Pressing the opposite direction, or any navigation key (`j`/`k` etc.), closes th
 ## License
 
 MIT
+
+---
+
+## Notes For Contributors
+
+- Read `docs/architecture.md` for the package/runtime overview.
+- Read `docs/configuration.md` for the full config surface.

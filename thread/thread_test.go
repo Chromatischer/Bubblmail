@@ -71,9 +71,9 @@ func TestBuildThreads_ReferencesChain(t *testing.T) {
 	now := time.Now()
 	msgs := []*data.Message{
 		{
-			MessageID:  "<a@example.com>",
-			Subject:    "Start",
-			Date:       now.Add(-2 * time.Hour),
+			MessageID: "<a@example.com>",
+			Subject:   "Start",
+			Date:      now.Add(-2 * time.Hour),
 		},
 		{
 			MessageID:  "<b@example.com>",
@@ -166,5 +166,56 @@ func TestBuildThreads_AllRead(t *testing.T) {
 	threads := BuildThreads(msgs)
 	if threads[0].HasUnread {
 		t.Error("expected HasUnread=false for message with \\Seen flag")
+	}
+}
+
+func TestBuildThreads_StarredAggregation(t *testing.T) {
+	now := time.Now()
+	msgs := []*data.Message{
+		{MessageID: "<a@example.com>", Subject: "Topic", Date: now.Add(-time.Hour)},
+		{MessageID: "<b@example.com>", InReplyTo: "<a@example.com>", Subject: "Re: Topic", Date: now, Flags: []data.Flag{data.FlagFlagged}},
+	}
+	threads := BuildThreads(msgs)
+	if len(threads) != 1 {
+		t.Fatalf("expected 1 thread, got %d", len(threads))
+	}
+	if !threads[0].Starred {
+		t.Fatal("expected thread to be starred when any message is flagged")
+	}
+}
+
+func TestBuildThreads_MissingMessageIDFallsBackToSubject(t *testing.T) {
+	now := time.Now()
+	msgs := []*data.Message{
+		{Subject: "Hello", Date: now.Add(-time.Hour)},
+		{Subject: "Hello", Date: now},
+	}
+	threads := BuildThreads(msgs)
+	if len(threads) != 1 {
+		t.Fatalf("expected 1 thread, got %d", len(threads))
+	}
+	if threads[0].ID != "Hello" {
+		t.Fatalf("expected fallback thread ID 'Hello', got %q", threads[0].ID)
+	}
+	if len(threads[0].Messages) != 2 {
+		t.Fatalf("expected 2 messages in fallback thread, got %d", len(threads[0].Messages))
+	}
+}
+
+func TestBuildThreads_DuplicateMessageIDDoesNotSplitThread(t *testing.T) {
+	now := time.Now()
+	msgs := []*data.Message{
+		{MessageID: "<dup@example.com>", Subject: "First", Date: now.Add(-time.Hour)},
+		{MessageID: "<dup@example.com>", Subject: "Second", Date: now},
+	}
+	threads := BuildThreads(msgs)
+	if len(threads) != 1 {
+		t.Fatalf("expected 1 thread for duplicate message IDs, got %d", len(threads))
+	}
+	if len(threads[0].Messages) != 2 {
+		t.Fatalf("expected both duplicate-id messages in one thread, got %d", len(threads[0].Messages))
+	}
+	if threads[0].Messages[0].Subject != "First" || threads[0].Messages[1].Subject != "Second" {
+		t.Fatalf("expected chronological ordering for duplicate-id messages, got %+v", threads[0].Messages)
 	}
 }
