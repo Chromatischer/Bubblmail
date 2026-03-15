@@ -9,6 +9,7 @@ import (
 	"github.com/bubblmail/bubblmail/data"
 	outsmtp "github.com/bubblmail/bubblmail/smtp"
 	"github.com/bubblmail/bubblmail/ui/icons"
+	"github.com/bubblmail/bubblmail/util"
 	"github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -246,12 +247,10 @@ func (c *Composer) HandleKey(key string) {
 	case "up":
 		if f.Kind == FieldTextArea {
 			f.cursorMoveLines(-1)
-			return
 		}
 	case "down":
 		if f.Kind == FieldTextArea {
 			f.cursorMoveLines(1)
-			return
 		}
 	case "pgup":
 		c.scrollBody(-1)
@@ -265,22 +264,16 @@ func (c *Composer) HandleKey(key string) {
 		} else {
 			c.focused = (c.focused + 1) % len(c.fields)
 		}
-		return
 	case "backspace", "ctrl+h":
 		f.backspace()
-		return
 	case "left":
 		f.cursorLeft()
-		return
 	case "right":
 		f.cursorRight()
-		return
 	case "home", "ctrl+a":
 		f.cursorHome()
-		return
 	case "end", "ctrl+e":
 		f.cursorEnd()
-		return
 	default:
 		if len(key) == 1 && key[0] >= 32 {
 			// Trigger file picker when @ is typed in the body field.
@@ -414,7 +407,10 @@ func (c *Composer) View() string {
 	}
 	theme := c.theme
 
-	boxWidth := c.width - 4
+	boxWidth := c.width - 16
+	if boxWidth > 110 {
+		boxWidth = 110
+	}
 	if boxWidth < 60 {
 		boxWidth = 60
 	}
@@ -524,30 +520,80 @@ func (c *Composer) View() string {
 		start, end := c.bodyWindow(bodyF, bodyH)
 		visible := bodyLines[start:end]
 
+		// Determine code-block state at the top of the visible window.
+		inCodeBlock := false
+		for i := 0; i < start; i++ {
+			if isCodeFence(util.SingleLine(bodyLines[i])) {
+				inCodeBlock = !inCodeBlock
+			}
+		}
+
+		cursorLine := -1
+		if bodyFocused {
+			cursorLine = c.cursorLine(bodyF)
+		}
+
 		for idx, line := range visible {
+			// Strip ZWJ and lone CRs before any display operation (CLAUDE.md).
+			safeLine := util.SingleLine(line)
+			isFence := isCodeFence(safeLine)
+			onCursorLine := bodyFocused && start+idx == cursorLine
+
+			// Code fences and code block content use Overlay background.
+			var bg lipgloss.Color
+			if isFence || inCodeBlock {
+				bg = theme.Overlay
+			} else {
+				bg = theme.SurfaceAlt
+			}
+
+			// Width-padding style — no Foreground so inner span colours prevail.
 			lineStyle := lipgloss.NewStyle().
-				Foreground(theme.Text).
-				Background(theme.SurfaceAlt).
+				Background(bg).
 				Width(textW)
 
-			display := line
-			if bodyFocused {
-				cursorLine := c.cursorLine(bodyF)
-				if cursorLine == start+idx {
-					col := c.cursorColumn(bodyF)
-					lineRunes := []rune(line)
-					if col > len(lineRunes) {
-						col = len(lineRunes)
-					}
-					display = string(lineRunes[:col]) + "▌" + string(lineRunes[col:])
+			// Clip to textW on the plain string before any styling (CLAUDE.md).
+			display := util.TruncateText(safeLine, textW)
+			if onCursorLine {
+				col := c.cursorColumn(bodyF)
+				lineRunes := []rune(safeLine)
+				if col > len(lineRunes) {
+					col = len(lineRunes)
 				}
+				display = util.TruncateText(string(lineRunes[:col])+"▌"+string(lineRunes[col:]), textW)
+			}
+
+			var styledDisplay string
+			switch {
+			case isFence:
+				styledDisplay = lipgloss.NewStyle().
+					Foreground(theme.TextFaint).
+					Background(bg).
+					Render(display)
+			case inCodeBlock:
+				styledDisplay = lipgloss.NewStyle().
+					Foreground(theme.TextMuted).
+					Background(bg).
+					Render(display)
+			case onCursorLine:
+				// Reveal raw markdown syntax while editing this line.
+				styledDisplay = lipgloss.NewStyle().
+					Foreground(theme.Text).
+					Background(bg).
+					Render(display)
+			default:
+				styledDisplay = renderMarkdownLine(display, theme, bg)
+			}
+
+			if isFence {
+				inCodeBlock = !inCodeBlock
 			}
 
 			prefix := indent
 			if idx == 0 {
 				prefix = bodyLabel + bodySep
 			}
-			rows = append(rows, prefix+lineStyle.Render(display))
+			rows = append(rows, prefix+lineStyle.Render(styledDisplay))
 		}
 		// Pad empty lines to keep height stable.
 		for i := len(visible); i < bodyH; i++ {
@@ -642,18 +688,20 @@ func (c *Composer) View() string {
 	hintSepSt := lipgloss.NewStyle().Foreground(theme.TextFaint).Background(theme.Surface)
 
 	type hintItem struct{ icon, key, desc string }
-	anonDesc := "anonymize"
-	if c.anonymize {
-		anonDesc = "anonymize ON"
-	}
 	composerHints := []hintItem{
 		{icons.Send, "ctrl+s", "send"},
 		{icons.ChevronRight, "tab", "next field"},
 		{icons.ArrowUpDown, "pgup/pgdn", "scroll"},
 		{icons.Attachment, "@", "attach"},
-		{icons.Label, "ctrl+r", anonDesc},
-		{icons.Close, "esc", "cancel"},
 	}
+	if len(c.attachments) > 0 {
+		anonDesc := "anonymize"
+		if c.anonymize {
+			anonDesc = "anonymize ON"
+		}
+		composerHints = append(composerHints, hintItem{icons.Label, "ctrl+r", anonDesc})
+	}
+	composerHints = append(composerHints, hintItem{icons.Close, "esc", "cancel"})
 
 	var plainParts []string
 	for _, h := range composerHints {
@@ -694,7 +742,7 @@ func (c *Composer) View() string {
 		Width(boxWidth).
 		Render(content)
 
-	return lipgloss.Place(c.width, c.height, lipgloss.Center, lipgloss.Center, box)
+	return lipgloss.Place(c.width, c.height, lipgloss.Center, lipgloss.Top, box)
 }
 
 // --- helpers ---

@@ -824,6 +824,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case clearStatusMsg:
 		a.statusbar.ClearMessage()
+		a.updateLayout() // message gone; reclaim the extra line
 		return a, nil
 
 	case quitTimeoutMsg:
@@ -1547,21 +1548,21 @@ func (a *App) prefetchBodies(limit int) []tea.Cmd {
 func (a *App) openCompose() tea.Cmd {
 	from := a.senderAddress()
 	a.comp.OpenNew(from)
-	a.comp.SetSize(a.width, a.height)
+	a.comp.SetSize(a.width, a.height-a.headerHeight()-a.statusHeight())
 	return nil
 }
 
 func (a *App) openReply(msg *data.Message, replyAll bool) tea.Cmd {
 	from := a.senderAddress()
 	a.comp.OpenReply(from, msg, replyAll)
-	a.comp.SetSize(a.width, a.height)
+	a.comp.SetSize(a.width, a.height-a.headerHeight()-a.statusHeight())
 	return nil
 }
 
 func (a *App) openForward(msg *data.Message) tea.Cmd {
 	from := a.senderAddress()
 	a.comp.OpenForward(from, msg)
-	a.comp.SetSize(a.width, a.height)
+	a.comp.SetSize(a.width, a.height-a.headerHeight()-a.statusHeight())
 	return nil
 }
 
@@ -2464,8 +2465,39 @@ func (a *App) headerHeight() int {
 	return 3 // row1 + row2 + divider
 }
 
+func (a *App) currentSbContext() string {
+	ctx := "inbox"
+	switch a.viewID {
+	case ViewReader:
+		ctx = "reader"
+	case ViewFolder:
+		ctx = "folder"
+	case ViewSmartFolder:
+		ctx = "inbox"
+	}
+	if a.comp.IsActive() {
+		ctx = "composer"
+	}
+	if a.searchOverlay.IsActive() {
+		ctx = "search"
+	}
+	if a.folderPicker.IsActive() {
+		ctx = "move"
+	}
+	if a.newFolder.IsActive() {
+		ctx = "new-folder"
+	}
+	if a.sidebarFocused {
+		ctx = "sidebar"
+	}
+	if (a.viewID == ViewInbox || a.viewID == ViewSmartFolder) && a.quickMenu != nil && a.quickMenu.side != quickMenuNone {
+		ctx = "quick"
+	}
+	return ctx
+}
+
 func (a *App) statusHeight() int {
-	return 2 // divider + row
+	return a.statusbar.Height(a.currentSbContext())
 }
 
 func (a *App) updateLayout() {
@@ -2482,21 +2514,24 @@ func (a *App) updateLayout() {
 	}
 
 	contentW := a.width - sidebarW
+
+	// Set widths before computing heights so statusHeight() renders correctly.
+	a.header.SetWidth(a.width)
+	a.statusbar.SetWidth(a.width)
+
 	contentH := a.height - a.headerHeight() - a.statusHeight()
 	if contentH < 1 {
 		contentH = 1
 	}
 
-	a.header.SetWidth(a.width)
 	a.header.SetAccount(a.activeAccount)
 	a.header.SetFolder(a.activeFolder)
-	a.statusbar.SetWidth(a.width)
 	a.sidebar.SetSize(sidebarWidth, contentH)
 
 	a.inboxView.SetSize(contentW, contentH)
 	a.readerView.SetSize(contentW, contentH)
 	a.folderView.SetSize(contentW, contentH)
-	a.comp.SetSize(a.width, a.height)
+	a.comp.SetSize(a.width, contentH)
 	a.searchOverlay.SetSize(a.width, contentH)
 	a.newFolder.SetSize(a.width, contentH)
 }
@@ -2569,33 +2604,7 @@ func (a *App) View() string {
 		mainContent = a.helpOverlay.View(a.width, contentH)
 	}
 
-	// Status bar context
-	sbContext := "inbox"
-	switch a.viewID {
-	case ViewReader:
-		sbContext = "reader"
-	case ViewFolder:
-		sbContext = "folder"
-	case ViewSmartFolder:
-		sbContext = "inbox" // same hints as inbox
-	}
-	if a.searchOverlay.IsActive() {
-		sbContext = "search"
-	}
-	if a.folderPicker.IsActive() {
-		sbContext = "move"
-	}
-	if a.newFolder.IsActive() {
-		sbContext = "new-folder"
-	}
-	if a.sidebarFocused {
-		sbContext = "sidebar"
-	}
-	if (a.viewID == ViewInbox || a.viewID == ViewSmartFolder) && a.quickMenu != nil && a.quickMenu.side != quickMenuNone {
-		sbContext = "quick"
-	}
-
-	statusbar := a.statusbar.View(sbContext)
+	statusbar := a.statusbar.View(a.currentSbContext())
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, mainContent, statusbar)
 }
@@ -2625,6 +2634,7 @@ func (a *App) maybeLoadMore() tea.Cmd {
 
 func (a *App) flash(msg, kind string) tea.Cmd {
 	a.statusbar.SetMessage(msg, kind)
+	a.updateLayout() // flash message adds a line; recalculate content height
 	return tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
 		return clearStatusMsg{}
 	})

@@ -76,6 +76,13 @@ func (sb *StatusBar) AdvanceSpinner() {
 	sb.spinner = (sb.spinner + 1) % len(spinnerFrames)
 }
 
+// Height returns the number of terminal lines the status bar will occupy for
+// the given context. Call this before layout so contentH is correct.
+func (sb *StatusBar) Height(context string) int {
+	rendered := sb.View(context)
+	return strings.Count(rendered, "\n") + 1
+}
+
 // View renders the status bar for the given context.
 // context is "inbox", "reader", "composer", "search", "folder".
 func (sb *StatusBar) View(context string) string {
@@ -170,10 +177,9 @@ func (sb *StatusBar) View(context string) string {
 		hints = []hint{
 			{icons.ArrowUpDown, "j/k", "navigate"},
 			{icons.MailOpen, "enter", "open"},
+			{icons.ArrowLeftRight, "l/r", "quick actions"},
 			{icons.Compose, "c", "compose"},
 			{icons.Reply, "r", "reply"},
-			{icons.Star, "s", "star"},
-			{icons.Read, "m", "mark read"},
 			{icons.Search, "/", "search"},
 			{icons.FolderTree, "b", "sidebar"},
 			{icons.Help, "?", "help"},
@@ -199,8 +205,41 @@ func (sb *StatusBar) View(context string) string {
 
 	hintsStr := strings.Join(parts, sepStyle.Render("  "))
 
-	// Right side: flash message + status
-	var statusParts []string
+	// Inline right side: loading + embedding stats (short, predictable width).
+	var inlineParts []string
+	if sb.loading {
+		inlineParts = append(inlineParts, lipgloss.NewStyle().
+			Foreground(theme.TextMuted).
+			Render(fmt.Sprintf("%s Loading…", icons.Syncing)))
+	}
+	if sb.embedding.Queued > 0 || sb.embedding.InFlight > 0 {
+		label := fmt.Sprintf("Embeddings %d in flight · %d queued", sb.embedding.InFlight, sb.embedding.Queued)
+		inlineParts = append(inlineParts, lipgloss.NewStyle().
+			Foreground(theme.TextMuted).
+			Render(label))
+	}
+	var inlineRight string
+	if len(inlineParts) > 0 {
+		inlineRight = strings.Join(inlineParts, sepStyle.Render("  •  "))
+	}
+
+	hintsW := lipgloss.Width(hintsStr)
+	inlineW := lipgloss.Width(inlineRight)
+	contentW := sb.width - 2 // account for Padding(0,1)
+	gap := contentW - hintsW - inlineW
+	if gap < 1 {
+		gap = 1
+	}
+	hintsRow := lipgloss.NewStyle().
+		Width(sb.width).
+		Padding(0, 1).
+		Render(hintsStr + strings.Repeat(" ", gap) + inlineRight)
+
+	divider := lipgloss.NewStyle().
+		Foreground(theme.Border).
+		Render(strings.Repeat("─", sb.width))
+
+	// Flash message on its own line so it is always fully readable.
 	if sb.message != "" {
 		var color lipgloss.Color
 		switch sb.msgKind {
@@ -211,42 +250,13 @@ func (sb *StatusBar) View(context string) string {
 		default:
 			color = theme.TextMuted
 		}
-		statusParts = append(statusParts, lipgloss.NewStyle().
+		msgRow := lipgloss.NewStyle().
+			Width(sb.width).
+			Padding(0, 1).
 			Foreground(color).
-			Render(sb.message))
-	}
-	if sb.loading {
-		statusParts = append(statusParts, lipgloss.NewStyle().
-			Foreground(theme.TextMuted).
-			Render(fmt.Sprintf("%s Loading…", icons.Syncing)))
-	}
-	if sb.embedding.Queued > 0 || sb.embedding.InFlight > 0 {
-		label := fmt.Sprintf("Embeddings %d in flight · %d queued", sb.embedding.InFlight, sb.embedding.Queued)
-		statusParts = append(statusParts, lipgloss.NewStyle().
-			Foreground(theme.TextMuted).
-			Render(label))
-	}
-	var rightStr string
-	if len(statusParts) > 0 {
-		rightStr = strings.Join(statusParts, sepStyle.Render("  •  "))
+			Render(sb.message)
+		return lipgloss.JoinVertical(lipgloss.Left, divider, hintsRow, msgRow)
 	}
 
-	rightW := lipgloss.Width(rightStr)
-	hintsW := lipgloss.Width(hintsStr)
-	gap := sb.width - hintsW - rightW - 2
-	if gap < 1 {
-		gap = 1
-	}
-	barContent := hintsStr + strings.Repeat(" ", gap) + rightStr
-
-	divider := lipgloss.NewStyle().
-		Foreground(theme.Border).
-		Render(strings.Repeat("─", sb.width))
-
-	row := lipgloss.NewStyle().
-		Width(sb.width).
-		Padding(0, 1).
-		Render(barContent)
-
-	return lipgloss.JoinVertical(lipgloss.Left, divider, row)
+	return lipgloss.JoinVertical(lipgloss.Left, divider, hintsRow)
 }
