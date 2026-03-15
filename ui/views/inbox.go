@@ -19,33 +19,37 @@ import (
 //	● From Name                    tag1  tag2     Jun 12
 //	  Re: Subject truncated…                   (3 msgs)
 type InboxView struct {
-	theme   *config.Theme
-	width   int
-	height  int
-	threads []*data.Thread
-	cursor  int // focused thread index
-	offset  int // first visible thread
-	quick   *QuickMenuRender
+	theme           *config.Theme
+	width           int
+	height          int
+	threads         []*data.Thread
+	cursor          int // focused thread index
+	offset          int // first visible thread
+	quick           *QuickMenuRender
+	selectionAnchor int // -1 = no multi-selection; ≥0 = anchor index
 }
 
 // QuickMenuRender controls the inline quick action hint rendering.
 type QuickMenuRender struct {
-	Side string
-	Step int
+	Side     string
+	Step     int
+	MoveHint string // "" = computing, "?" = picker, else = AI-chosen folder
 }
 
 // NewInboxView creates a new inbox view.
 func NewInboxView(theme *config.Theme) *InboxView {
-	return &InboxView{theme: theme}
+	return &InboxView{theme: theme, selectionAnchor: -1}
 }
 
 // SetQuickMenu updates the inline quick action state.
-func (v *InboxView) SetQuickMenu(side string, step int) {
+// moveHint is only relevant for left/step-1 (the move action):
+// "" = still computing, "?" = will open folder picker, else = AI-chosen folder.
+func (v *InboxView) SetQuickMenu(side string, step int, moveHint string) {
 	if side == "" {
 		v.quick = nil
 		return
 	}
-	v.quick = &QuickMenuRender{Side: side, Step: step}
+	v.quick = &QuickMenuRender{Side: side, Step: step, MoveHint: moveHint}
 }
 
 // SetSize sets the view dimensions.
@@ -59,11 +63,13 @@ func (v *InboxView) SetThreads(threads []*data.Thread) {
 	v.threads = threads
 	v.cursor = 0
 	v.offset = 0
+	v.selectionAnchor = -1
 }
 
 // AppendThreads replaces the thread list while preserving cursor position.
 func (v *InboxView) AppendThreads(threads []*data.Thread) {
 	v.threads = threads
+	v.selectionAnchor = -1
 	if v.cursor >= len(v.threads) {
 		v.cursor = len(v.threads) - 1
 	}
@@ -77,6 +83,17 @@ func (v *InboxView) Len() int { return len(v.threads) }
 
 // CursorPos returns the current cursor index.
 func (v *InboxView) CursorPos() int { return v.cursor }
+
+// SetCursor moves the cursor to the given index, clamped to valid bounds.
+func (v *InboxView) SetCursor(i int) {
+	if i >= len(v.threads) {
+		i = len(v.threads) - 1
+	}
+	if i < 0 {
+		i = 0
+	}
+	v.cursor = i
+}
 
 // SelectedThread returns the currently focused thread, or nil.
 func (v *InboxView) SelectedThread() *data.Thread {
@@ -165,6 +182,55 @@ func (v *InboxView) GoToBottom() {
 	}
 }
 
+// selRange returns the inclusive [lo, hi] index range of the current selection.
+func (v *InboxView) selRange() (lo, hi int) {
+	if v.selectionAnchor < 0 {
+		return v.cursor, v.cursor
+	}
+	if v.cursor < v.selectionAnchor {
+		return v.cursor, v.selectionAnchor
+	}
+	return v.selectionAnchor, v.cursor
+}
+
+// HasMultiSelection returns true when more than one thread is selected.
+func (v *InboxView) HasMultiSelection() bool {
+	return v.selectionAnchor >= 0 && v.selectionAnchor != v.cursor
+}
+
+// SelectedThreads returns all threads in the current selection range.
+func (v *InboxView) SelectedThreads() []*data.Thread {
+	lo, hi := v.selRange()
+	out := make([]*data.Thread, 0, hi-lo+1)
+	for i := lo; i <= hi; i++ {
+		if i >= 0 && i < len(v.threads) {
+			out = append(out, v.threads[i])
+		}
+	}
+	return out
+}
+
+// ClearSelection collapses multi-selection back to just the cursor.
+func (v *InboxView) ClearSelection() {
+	v.selectionAnchor = -1
+}
+
+// ShiftMoveUp extends or starts a shift-selection one step upward.
+func (v *InboxView) ShiftMoveUp() {
+	if v.selectionAnchor < 0 {
+		v.selectionAnchor = v.cursor
+	}
+	v.MoveUp()
+}
+
+// ShiftMoveDown extends or starts a shift-selection one step downward.
+func (v *InboxView) ShiftMoveDown() {
+	if v.selectionAnchor < 0 {
+		v.selectionAnchor = v.cursor
+	}
+	v.MoveDown()
+}
+
 // View renders the inbox thread list.
 func (v *InboxView) View() string {
 	if len(v.threads) == 0 {
@@ -182,11 +248,16 @@ func (v *InboxView) View() string {
 		end = len(v.threads)
 	}
 
+	lo, hi := v.selRange()
+	center := (lo + hi) / 2
+
 	var rows []string
 	for i := v.offset; i < end; i++ {
 		t := v.threads[i]
 		isSelected := i == v.cursor
-		rows = append(rows, v.renderThread(t, isSelected, i)...)
+		inMultiSel := v.selectionAnchor >= 0 && i >= lo && i <= hi && !isSelected
+		showQuickIcon := i == center
+		rows = append(rows, v.renderThread(t, isSelected, i, inMultiSel, showQuickIcon)...)
 	}
 
 	// Pad to full height
@@ -197,10 +268,12 @@ func (v *InboxView) View() string {
 	return strings.Join(rows[:v.height], "\n")
 }
 
-func (v *InboxView) renderThread(t *data.Thread, selected bool, index int) []string {
+func (v *InboxView) renderThread(t *data.Thread, selected bool, index int, inMultiSel bool, showQuickIcon bool) []string {
 	fullW := v.width
 	theme := v.theme
-	quickActive := selected && v.quick != nil
+	// Quick menu renders for the cursor row normally; for other selected rows it
+	// renders a colour strip (icon only shown on the centre of the selection).
+	quickActive := (selected || inMultiSel) && v.quick != nil
 
 	// We always render mail content at fullW.
 	// When a quick menu is active we build a wider virtual card:
@@ -219,13 +292,16 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool, index int) []str
 	contentW := fullW
 
 	rowBg := lipgloss.Color("")
-	if !selected && index%2 == 1 {
+	if !selected && !inMultiSel && index%2 == 1 {
 		rowBg = theme.Surface
 	}
 
 	sel := func(s lipgloss.Style) lipgloss.Style {
 		if selected {
 			return s.Background(theme.Selected)
+		}
+		if inMultiSel {
+			return s.Background(theme.SurfaceAlt)
 		}
 		if rowBg != "" {
 			return s.Background(rowBg)
@@ -412,11 +488,37 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool, index int) []str
 
 	// Build each side panel as a single-row string (we split badges by "\n"
 	// and handle row0/row1 separately).
+	// When showQuickIcon is false (non-centre multi-select rows) we render a
+	// plain colour strip instead of the icon/label tiles.
 	buildPanel := func(side string, totalW int) (row0, row1 string) {
 		isActiveSide := side == activeSide
 		step := 0
 		if isActiveSide {
 			step = v.quick.Step
+		}
+
+		// For non-centre selection rows render a solid colour strip.
+		if !showQuickIcon {
+			var bg lipgloss.Color
+			if !isActiveSide {
+				bg = v.theme.Surface
+			} else if side == "left" {
+				if step == 0 {
+					bg = v.theme.Unread
+				} else if v.quick != nil && v.quick.MoveHint == "?" {
+					bg = v.theme.Border
+				} else {
+					bg = v.theme.Accent
+				}
+			} else {
+				if step == 0 {
+					bg = v.theme.Starred
+				} else {
+					bg = v.theme.Error
+				}
+			}
+			strip := lipgloss.NewStyle().Width(totalW).Background(bg).Render("")
+			return strip, strip
 		}
 
 		type actionSpec struct {
@@ -433,7 +535,21 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool, index int) []str
 					}
 					return actionSpec{icons.Unread, "UNRD", v.theme.Unread}
 				}()
-				a1 := actionSpec{icons.FolderOpen, "MOVE", v.theme.Accent}
+				a1 := func() actionSpec {
+					hint := ""
+					if v.quick != nil {
+						hint = v.quick.MoveHint
+					}
+					switch hint {
+					case "?":
+						return actionSpec{icons.FolderTree, "PICK", v.theme.Border}
+					case "":
+						return actionSpec{icons.FolderOpen, "MOVE", v.theme.Accent}
+					default:
+						label := folderShortName(hint, moveW-1)
+						return actionSpec{icons.FolderOpen, label, v.theme.Accent}
+					}
+				}()
 				return []actionSpec{a0, a1}
 			}
 			return []actionSpec{
@@ -504,6 +620,19 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool, index int) []str
 	row2 := ansi.Cut(card2, cropStart, cropEnd)
 
 	return []string{row1, row2}
+}
+
+// folderShortName returns the last path segment of a folder name, truncated to
+// maxCols terminal columns.
+func folderShortName(name string, maxCols int) string {
+	seg := name
+	if i := strings.LastIndexAny(name, "/."); i >= 0 {
+		seg = name[i+1:]
+	}
+	if seg == "" {
+		seg = name
+	}
+	return util.TruncateText(seg, maxCols)
 }
 
 func (v *InboxView) emptyState() string {

@@ -17,6 +17,7 @@ type StatusBar struct {
 	spinner   int
 	loading   bool
 	embedding embeddingStats
+	moveHint  string // suggested destination folder for quick-move
 }
 
 var spinnerFrames = []string{
@@ -59,6 +60,16 @@ func (sb *StatusBar) SetLoading(loading bool) {
 func (sb *StatusBar) SetEmbeddingStats(stats embeddingStats) {
 	sb.embedding = stats
 }
+
+// SetMoveHint sets the suggested destination folder for the quick-move hint.
+// Pass "" to clear, "?" to indicate the folder picker will open, or a folder
+// name to indicate the AI-chosen destination.
+func (sb *StatusBar) SetMoveHint(hint string) {
+	sb.moveHint = hint
+}
+
+// MoveHint returns the current move hint value.
+func (sb *StatusBar) MoveHint() string { return sb.moveHint }
 
 // AdvanceSpinner advances the spinner frame.
 func (sb *StatusBar) AdvanceSpinner() {
@@ -123,9 +134,21 @@ func (sb *StatusBar) View(context string) string {
 			{icons.Close, "esc", "cancel"},
 		}
 	case "quick":
+		applyDesc := "apply"
+		applyIcon := icons.Check
+		switch sb.moveHint {
+		case "?":
+			applyDesc = "pick folder"
+			applyIcon = icons.FolderOpen
+		case "":
+			// still computing or non-move step — generic
+		default:
+			applyDesc = "→ " + sb.moveHint
+			applyIcon = icons.FolderOpen
+		}
 		hints = []hint{
 			{icons.ArrowLeftRight, "←/→", "quick actions"},
-			{icons.Check, "enter", "apply"},
+			{applyIcon, "enter", applyDesc},
 			{icons.ArrowUpDown, "j/k", "navigate"},
 			{icons.Close, "esc", "close"},
 		}

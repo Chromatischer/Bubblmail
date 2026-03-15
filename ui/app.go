@@ -64,6 +64,9 @@ type quickMoveResultMsg struct {
 	err     error
 }
 
+// moveHintMsg carries a precomputed folder suggestion for the quick-move hint.
+type moveHintMsg struct{ dest string }
+
 // clearStatusMsg clears the flash message.
 type clearStatusMsg struct{}
 
@@ -101,6 +104,7 @@ type App struct {
 	suggestResults  chan suggest.ResultMsg
 	smartFolder     string // active smart folder name (when viewID == ViewSmartFolder)
 	smartCounts     map[string]int
+	prevViewID      ViewID // view to return to when closing reader
 
 	// IMAP clients, one per account
 	imapClients map[string]*imaplib.Client
@@ -589,10 +593,15 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		a.flash("Moved to Trash", "ok")
 		// Remove the message from local state and refresh the inbox view.
+		// Preserve cursor: keep it at the same index so the next thread is selected.
+		cursor := a.inboxView.CursorPos()
 		a.loadedMessages = removeByUID(a.loadedMessages, msg.UID)
 		a.fetchedCount = len(a.loadedMessages)
 		threads := thread.BuildThreads(a.loadedMessages)
-		a.inboxView.SetThreads(threads)
+		a.inboxView.AppendThreads(threads)
+		if cursor < len(threads) {
+			a.inboxView.SetCursor(cursor)
+		}
 		if a.viewID == ViewReader {
 			a.viewID = ViewInbox
 		}
@@ -616,10 +625,14 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, nil
 		}
 		a.flash("Moved to "+msg.Dest, "ok")
+		cursor := a.inboxView.CursorPos()
 		a.loadedMessages = removeByUID(a.loadedMessages, msg.UID)
 		a.fetchedCount = len(a.loadedMessages)
 		threads := thread.BuildThreads(a.loadedMessages)
-		a.inboxView.SetThreads(threads)
+		a.inboxView.AppendThreads(threads)
+		if cursor < len(threads) {
+			a.inboxView.SetCursor(cursor)
+		}
 		if a.viewID == ViewReader {
 			a.viewID = ViewInbox
 		}
@@ -800,6 +813,15 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return a, nil
 
+	case moveHintMsg:
+		if msg.dest == "" {
+			a.statusbar.SetMoveHint("?") // no AI match — will open folder picker
+		} else {
+			a.statusbar.SetMoveHint(msg.dest)
+		}
+		a.applyQuickMenuState()
+		return a, nil
+
 	case clearStatusMsg:
 		a.statusbar.ClearMessage()
 		return a, nil
@@ -953,6 +975,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					a.smartFolder = folder
 					a.viewID = ViewSmartFolder
 					a.header.SetFolder(folder)
+					a.sidebar.SetActive("", folder)
 					return a, a.fetchSmartFolder(folder)
 				}
 				a.activeAccount = acct
@@ -1000,7 +1023,11 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if a.showSidebar {
 			a.sidebarFocused = true
 			a.sidebar.SetFocused(true)
-			a.sidebar.FocusAt(a.activeAccount, a.activeFolder)
+			if a.viewID == ViewSmartFolder {
+				a.sidebar.FocusAt("", a.smartFolder)
+			} else {
+				a.sidebar.FocusAt(a.activeAccount, a.activeFolder)
+			}
 		}
 
 	case "i":
@@ -1048,30 +1075,61 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	// View-specific navigation
+	case "shift+down":
+		if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
+			a.closeQuickMenu()
+			a.inboxView.ShiftMoveDown()
+			return a, a.maybeLoadMore()
+		}
+
+	case "shift+up":
+		if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
+			a.closeQuickMenu()
+			a.inboxView.ShiftMoveUp()
+		}
+
 	case "j", "down":
 		a.closeQuickMenu()
+		if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
+			a.inboxView.ClearSelection()
+		}
 		a.moveDown()
 		return a, a.maybeLoadMore()
 
 	case "k", "up":
 		a.closeQuickMenu()
+		if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
+			a.inboxView.ClearSelection()
+		}
 		a.moveUp()
 
 	case "ctrl+d":
 		a.closeQuickMenu()
+		if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
+			a.inboxView.ClearSelection()
+		}
 		a.pageDown()
 		return a, a.maybeLoadMore()
 
 	case "ctrl+u":
 		a.closeQuickMenu()
+		if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
+			a.inboxView.ClearSelection()
+		}
 		a.pageUp()
 
 	case "g":
 		a.closeQuickMenu()
+		if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
+			a.inboxView.ClearSelection()
+		}
 		a.goToTop()
 
 	case "G":
 		a.closeQuickMenu()
+		if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
+			a.inboxView.ClearSelection()
+		}
 		a.goToBottom()
 		return a, a.maybeLoadMore()
 
@@ -1084,7 +1142,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return a, cmd
 			}
 		}
-		if a.viewID == ViewInbox && a.quickMenu != nil && a.quickMenu.side != quickMenuNone {
+		if (a.viewID == ViewInbox || a.viewID == ViewSmartFolder) && a.quickMenu != nil && a.quickMenu.side != quickMenuNone {
 			cmd := a.handleQuickMenuEnter()
 			return a, cmd
 		}
@@ -1099,7 +1157,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.readerView.FocusNextEventAction(-1)
 			return a, nil
 		}
-		if a.viewID == ViewInbox {
+		if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
 			if a.quickMenu != nil && a.quickMenu.side == quickMenuLeft {
 				// Same direction again — close
 				a.closeQuickMenu()
@@ -1116,7 +1174,9 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		fallthrough
 	case "esc", "h":
-		if a.viewID == ViewReader || a.viewID == ViewFolder {
+		if a.viewID == ViewReader {
+			a.viewID = a.prevViewID
+		} else if a.viewID == ViewFolder {
 			a.viewID = ViewInbox
 		}
 		a.closeQuickMenu()
@@ -1130,7 +1190,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.readerView.FocusNextEventAction(1)
 			return a, nil
 		}
-		if a.viewID == ViewInbox {
+		if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
 			if a.quickMenu != nil && a.quickMenu.side == quickMenuRight {
 				// Same direction again — close
 				a.closeQuickMenu()
@@ -1194,6 +1254,7 @@ func (a *App) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 					// Smart folder clicked
 					a.smartFolder = folder
 					a.viewID = ViewSmartFolder
+					a.sidebar.SetActive("", folder)
 					a.header.SetFolder(folder)
 					return a, a.fetchSmartFolder(folder)
 				}
@@ -1214,7 +1275,7 @@ func (a *App) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 
 func (a *App) moveUp() {
 	switch a.viewID {
-	case ViewInbox:
+	case ViewInbox, ViewSmartFolder:
 		a.inboxView.MoveUp()
 	case ViewReader:
 		a.readerView.MoveUp()
@@ -1225,7 +1286,7 @@ func (a *App) moveUp() {
 
 func (a *App) moveDown() {
 	switch a.viewID {
-	case ViewInbox:
+	case ViewInbox, ViewSmartFolder:
 		a.inboxView.MoveDown()
 	case ViewReader:
 		a.readerView.MoveDown()
@@ -1236,7 +1297,7 @@ func (a *App) moveDown() {
 
 func (a *App) pageUp() {
 	switch a.viewID {
-	case ViewInbox:
+	case ViewInbox, ViewSmartFolder:
 		a.inboxView.PageUp()
 	case ViewReader:
 		a.readerView.PageUp()
@@ -1247,7 +1308,7 @@ func (a *App) pageUp() {
 
 func (a *App) pageDown() {
 	switch a.viewID {
-	case ViewInbox:
+	case ViewInbox, ViewSmartFolder:
 		a.inboxView.PageDown()
 	case ViewReader:
 		a.readerView.PageDown()
@@ -1258,7 +1319,7 @@ func (a *App) pageDown() {
 
 func (a *App) goToTop() {
 	switch a.viewID {
-	case ViewInbox:
+	case ViewInbox, ViewSmartFolder:
 		a.inboxView.GoToTop()
 	case ViewReader:
 		a.readerView.GoToTop()
@@ -1269,7 +1330,7 @@ func (a *App) goToTop() {
 
 func (a *App) goToBottom() {
 	switch a.viewID {
-	case ViewInbox:
+	case ViewInbox, ViewSmartFolder:
 		a.inboxView.GoToBottom()
 	case ViewReader:
 		a.readerView.GoToBottom()
@@ -1282,8 +1343,8 @@ func (a *App) applyQuickMenuState() {
 	if a.inboxView == nil || a.quickMenu == nil {
 		return
 	}
-	if a.quickMenu.side == quickMenuNone || a.viewID != ViewInbox {
-		a.inboxView.SetQuickMenu("", 0)
+	if a.quickMenu.side == quickMenuNone || (a.viewID != ViewInbox && a.viewID != ViewSmartFolder) {
+		a.inboxView.SetQuickMenu("", 0, "")
 		return
 	}
 	side := ""
@@ -1292,12 +1353,12 @@ func (a *App) applyQuickMenuState() {
 	} else if a.quickMenu.side == quickMenuRight {
 		side = "right"
 	}
-	a.inboxView.SetQuickMenu(side, a.quickMenu.step)
+	a.inboxView.SetQuickMenu(side, a.quickMenu.step, a.statusbar.MoveHint())
 }
 
 func (a *App) handleEnter() tea.Cmd {
 	switch a.viewID {
-	case ViewInbox:
+	case ViewInbox, ViewSmartFolder:
 		t := a.inboxView.SelectedThread()
 		if t != nil {
 			return a.openThread(t)
@@ -1318,6 +1379,7 @@ func (a *App) handleEnter() tea.Cmd {
 // --- message/folder actions ---
 
 func (a *App) openMessage(msg *data.Message) tea.Cmd {
+	a.prevViewID = a.viewID
 	a.readerView.SetMessage(msg)
 	a.viewID = ViewReader
 
@@ -1349,6 +1411,7 @@ func (a *App) openMessage(msg *data.Message) tea.Cmd {
 // openThread opens a full thread in the reader, fetching bodies for any
 // messages that haven't been loaded yet.
 func (a *App) openThread(t *data.Thread) tea.Cmd {
+	a.prevViewID = a.viewID
 	a.readerView.SetThread(t)
 	a.viewID = ViewReader
 
@@ -1512,73 +1575,98 @@ func (a *App) senderAddress() data.Address {
 }
 
 func (a *App) toggleStar() tea.Cmd {
-	t := a.inboxView.SelectedThread()
-	if t == nil {
+	threads := a.inboxView.SelectedThreads()
+	if len(threads) == 0 {
 		return nil
 	}
-	msg := t.Latest()
-	if msg == nil {
-		return nil
-	}
-	starred := msg.IsStarred()
-	newFlags := toggleFlag(msg.Flags, data.FlagFlagged, !starred)
-	_ = a.store.SetFlags(a.activeAccount, a.activeFolder, msg.UID, newFlags)
-	msg.Flags = newFlags
-	// Recompute thread aggregate so the inbox re-renders immediately.
-	t.Starred = false
-	for _, m := range t.Messages {
-		if m.IsStarred() {
-			t.Starred = true
-			break
+	var cmds []tea.Cmd
+	for _, t := range threads {
+		msg := t.Latest()
+		if msg == nil {
+			continue
+		}
+		starred := msg.IsStarred()
+		newFlags := toggleFlag(msg.Flags, data.FlagFlagged, !starred)
+		_ = a.store.SetFlags(msg.AccountName, msg.FolderName, msg.UID, newFlags)
+		msg.Flags = newFlags
+		// Recompute thread aggregate so the inbox re-renders immediately.
+		t.Starred = false
+		for _, m := range t.Messages {
+			if m.IsStarred() {
+				t.Starred = true
+				break
+			}
+		}
+		client, ok := a.imapClients[msg.AccountName]
+		if ok {
+			cmds = append(cmds, client.SetFlag(msg.FolderName, msg.UID, data.FlagFlagged, !starred))
 		}
 	}
-	client, ok := a.imapClients[a.activeAccount]
-	if ok {
-		return client.SetFlag(a.activeFolder, msg.UID, data.FlagFlagged, !starred)
-	}
-	return nil
+	a.inboxView.ClearSelection()
+	return tea.Batch(cmds...)
 }
 
 func (a *App) toggleRead() tea.Cmd {
-	t := a.inboxView.SelectedThread()
-	if t == nil {
+	threads := a.inboxView.SelectedThreads()
+	if len(threads) == 0 {
 		return nil
 	}
-	msg := t.Latest()
-	if msg == nil {
-		return nil
-	}
-	read := msg.IsRead()
-	newFlags := toggleFlag(msg.Flags, data.FlagSeen, !read)
-	_ = a.store.SetFlags(a.activeAccount, a.activeFolder, msg.UID, newFlags)
-	msg.Flags = newFlags
-	// Recompute thread aggregate so the inbox re-renders immediately.
-	t.HasUnread = false
-	for _, m := range t.Messages {
-		if !m.IsRead() {
-			t.HasUnread = true
-			break
+	var cmds []tea.Cmd
+	for _, t := range threads {
+		msg := t.Latest()
+		if msg == nil {
+			continue
+		}
+		read := msg.IsRead()
+		newFlags := toggleFlag(msg.Flags, data.FlagSeen, !read)
+		_ = a.store.SetFlags(msg.AccountName, msg.FolderName, msg.UID, newFlags)
+		msg.Flags = newFlags
+		// Recompute thread aggregate so the inbox re-renders immediately.
+		t.HasUnread = false
+		for _, m := range t.Messages {
+			if !m.IsRead() {
+				t.HasUnread = true
+				break
+			}
+		}
+		client, ok := a.imapClients[msg.AccountName]
+		if ok {
+			cmds = append(cmds, client.SetFlag(msg.FolderName, msg.UID, data.FlagSeen, !read))
 		}
 	}
-	client, ok := a.imapClients[a.activeAccount]
-	if ok {
-		return client.SetFlag(a.activeFolder, msg.UID, data.FlagSeen, !read)
-	}
-	return nil
+	a.inboxView.ClearSelection()
+	return tea.Batch(cmds...)
 }
 
 func (a *App) quickMoveMessage() tea.Cmd {
-	if a.viewID != ViewInbox {
+	if a.viewID != ViewInbox && a.viewID != ViewSmartFolder {
 		return nil
 	}
-	msg := a.currentMessage()
-	if msg == nil {
+	threads := a.inboxView.SelectedThreads()
+	if len(threads) == 0 {
 		return nil
 	}
 	if a.embClient == nil {
+		// No embeddings — open folder picker; selection stays active so
+		// moveMessageToFolder will act on all selected threads when confirmed.
 		a.openFolderPicker()
 		return nil
 	}
+	var cmds []tea.Cmd
+	for _, t := range threads {
+		msg := t.Latest()
+		if msg == nil {
+			continue
+		}
+		if cmd := a.quickMoveSingleMessage(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	a.inboxView.ClearSelection()
+	return tea.Batch(cmds...)
+}
+
+func (a *App) quickMoveSingleMessage(msg *data.Message) tea.Cmd {
 	account := a.activeAccount
 	folder := a.activeFolder
 	uid := msg.UID
@@ -1659,6 +1747,76 @@ func (a *App) quickMoveMessage() tea.Cmd {
 	}
 }
 
+// prefetchMoveHint computes the AI folder suggestion for the currently selected
+// thread and returns a moveHintMsg so the status bar can show the destination
+// before the user confirms the move.
+func (a *App) prefetchMoveHint() tea.Cmd {
+	if a.embClient == nil {
+		return nil
+	}
+	threads := a.inboxView.SelectedThreads()
+	if len(threads) == 0 {
+		t := a.inboxView.SelectedThread()
+		if t == nil {
+			return nil
+		}
+		threads = []*data.Thread{t}
+	}
+	msg := threads[0].Latest()
+	if msg == nil {
+		return nil
+	}
+	account := a.activeAccount
+	folder := a.activeFolder
+	msgID := msg.ID
+	uid := msg.UID
+
+	return func() tea.Msg {
+		model := a.cfg.Embeddings.Model
+		if model == "" {
+			model = "openai/text-embedding-3-small"
+		}
+		vec, norm, err := a.store.GetEmbedding(msgID, model)
+		if err != nil || vec == nil || norm == 0 {
+			return moveHintMsg{}
+		}
+		_ = uid
+		folders, vectors, norms, _, err := a.store.ListFolderEmbeddings(account, model)
+		if err != nil {
+			return moveHintMsg{}
+		}
+		bestScore := float32(0)
+		bestFolder := ""
+		for i, f := range folders {
+			if f == nil {
+				continue
+			}
+			if !f.IsSelectable() {
+				continue
+			}
+			if f.Name == folder {
+				continue
+			}
+			if isSystemFolder(f.DisplayName, f.Name) {
+				continue
+			}
+			score := embeddings.CosineSimilarity(vec, norm, vectors[i], norms[i])
+			if score > bestScore {
+				bestScore = score
+				bestFolder = f.Name
+			}
+		}
+		threshold := float32(a.cfg.Embeddings.AutoMoveThreshold)
+		if threshold <= 0 {
+			threshold = 0.27
+		}
+		if bestFolder == "" || bestScore < threshold {
+			return moveHintMsg{}
+		}
+		return moveHintMsg{dest: bestFolder}
+	}
+}
+
 func isSystemFolder(displayName, name string) bool {
 	label := strings.ToLower(strings.TrimSpace(displayName))
 	full := strings.ToLower(strings.TrimSpace(name))
@@ -1680,6 +1838,7 @@ func (a *App) closeQuickMenu() {
 	}
 	a.quickMenu.side = quickMenuNone
 	a.quickMenu.step = 0
+	a.statusbar.SetMoveHint("")
 	a.applyQuickMenuState()
 }
 
@@ -1701,6 +1860,10 @@ func (a *App) openQuickMenu(side quickMenuSide) tea.Cmd {
 	}
 	a.quickMenu.step++
 	a.applyQuickMenuState()
+	// Prefetch the move suggestion when landing on the move step (left side, step 1).
+	if a.quickMenu.side == quickMenuLeft && a.quickMenu.step == 1 {
+		return a.prefetchMoveHint()
+	}
 	return nil
 }
 
@@ -1731,8 +1894,26 @@ func (a *App) handleQuickMenuEnter() tea.Cmd {
 }
 
 func (a *App) deleteMessage() tea.Cmd {
-	msg := a.currentMessage()
-	if msg == nil {
+	if a.viewID != ViewInbox && a.viewID != ViewSmartFolder {
+		// Outside inbox — single-message mode (e.g. reader).
+		msg := a.currentMessage()
+		if msg == nil {
+			return nil
+		}
+		client, ok := a.imapClients[a.activeAccount]
+		if !ok {
+			return nil
+		}
+		trash := a.findTrashFolder(a.activeAccount)
+		if trash == "" {
+			a.flash("No Trash folder found", "err")
+			return nil
+		}
+		a.flash(fmt.Sprintf("%s Moving to Trash…", icons.Trash), "info")
+		return client.MoveToTrash(a.activeFolder, msg.UID, trash)
+	}
+	threads := a.inboxView.SelectedThreads()
+	if len(threads) == 0 {
 		return nil
 	}
 	client, ok := a.imapClients[a.activeAccount]
@@ -1744,8 +1925,21 @@ func (a *App) deleteMessage() tea.Cmd {
 		a.flash("No Trash folder found", "err")
 		return nil
 	}
-	a.flash(fmt.Sprintf("%s Moving to Trash…", icons.Trash), "info")
-	return client.MoveToTrash(a.activeFolder, msg.UID, trash)
+	var cmds []tea.Cmd
+	for _, t := range threads {
+		msg := t.Latest()
+		if msg == nil {
+			continue
+		}
+		cmds = append(cmds, client.MoveToTrash(msg.FolderName, msg.UID, trash))
+	}
+	if len(cmds) == 1 {
+		a.flash(fmt.Sprintf("%s Moving to Trash…", icons.Trash), "info")
+	} else {
+		a.flash(fmt.Sprintf("%s Moving %d to Trash…", icons.Trash, len(cmds)), "info")
+	}
+	a.inboxView.ClearSelection()
+	return tea.Batch(cmds...)
 }
 
 func (a *App) openFolderPicker() {
@@ -1783,16 +1977,41 @@ func (a *App) createFolder(name string) tea.Cmd {
 }
 
 func (a *App) moveMessageToFolder(destFolder string) tea.Cmd {
-	msg := a.currentMessage()
-	if msg == nil {
+	if a.viewID != ViewInbox && a.viewID != ViewSmartFolder {
+		// Outside inbox — single-message mode (e.g. reader).
+		msg := a.currentMessage()
+		if msg == nil {
+			return nil
+		}
+		client, ok := a.imapClients[a.activeAccount]
+		if !ok {
+			return nil
+		}
+		a.flash(fmt.Sprintf("%s Moving…", icons.FolderOpen), "info")
+		return client.MoveMessage(a.activeFolder, msg.UID, destFolder)
+	}
+	threads := a.inboxView.SelectedThreads()
+	if len(threads) == 0 {
 		return nil
 	}
 	client, ok := a.imapClients[a.activeAccount]
 	if !ok {
 		return nil
 	}
+	var cmds []tea.Cmd
+	for _, t := range threads {
+		msg := t.Latest()
+		if msg == nil {
+			continue
+		}
+		cmds = append(cmds, client.MoveMessage(msg.FolderName, msg.UID, destFolder))
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
 	a.flash(fmt.Sprintf("%s Moving…", icons.FolderOpen), "info")
-	return client.MoveMessage(a.activeFolder, msg.UID, destFolder)
+	a.inboxView.ClearSelection()
+	return tea.Batch(cmds...)
 }
 
 // findTrashFolder returns the IMAP name of the Trash folder for the given account.
@@ -2080,7 +2299,7 @@ func (a *App) handleComposerResult(r *composer.Result) tea.Cmd {
 
 func (a *App) currentMessage() *data.Message {
 	switch a.viewID {
-	case ViewInbox:
+	case ViewInbox, ViewSmartFolder:
 		t := a.inboxView.SelectedThread()
 		if t != nil {
 			return t.Latest()
@@ -2372,7 +2591,7 @@ func (a *App) View() string {
 	if a.sidebarFocused {
 		sbContext = "sidebar"
 	}
-	if a.viewID == ViewInbox && a.quickMenu != nil && a.quickMenu.side != quickMenuNone {
+	if (a.viewID == ViewInbox || a.viewID == ViewSmartFolder) && a.quickMenu != nil && a.quickMenu.side != quickMenuNone {
 		sbContext = "quick"
 	}
 

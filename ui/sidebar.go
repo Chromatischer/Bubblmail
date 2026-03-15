@@ -326,8 +326,13 @@ func (sb *Sidebar) View() string {
 
 			count := sb.smartCounts[cat]
 			var line string
-			if count > 0 && !isActive {
-				countStyle := lipgloss.NewStyle().Foreground(theme.Unread)
+			if count > 0 {
+				var countStyle lipgloss.Style
+				if isActive {
+					countStyle = lipgloss.NewStyle().Foreground(theme.Background).Background(theme.Accent)
+				} else {
+					countStyle = lipgloss.NewStyle().Foreground(theme.Unread)
+				}
 				countStr := countStyle.Render(fmt.Sprintf(" %d", count))
 				available := sb.width - lipgloss.Width(indent) - 2 - lipgloss.Width(countStr)
 				if available < 0 {
