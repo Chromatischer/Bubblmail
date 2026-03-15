@@ -43,6 +43,9 @@ type syncMsg struct{ account string }
 // spinnerTickMsg advances the loading spinner.
 type spinnerTickMsg struct{}
 
+// searchDebounceMsg fires after the debounce delay to trigger a search.
+type searchDebounceMsg struct{ id int }
+
 // embeddingTickMsg refreshes embedding status.
 type embeddingTickMsg struct{}
 
@@ -685,10 +688,27 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case spinnerTickMsg:
 		a.statusbar.AdvanceSpinner()
-		if a.statusbar.loading {
+		a.searchOverlay.AdvanceSpinner()
+		if a.statusbar.loading || a.searchOverlay.IsLoading() {
 			return a, spinnerTick()
 		}
 		return a, nil
+
+	case searchDebounceMsg:
+		if !a.searchOverlay.IsActive() || msg.id != a.searchOverlay.DebounceID() {
+			return a, nil
+		}
+		q := a.searchOverlay.Query()
+		if !a.searchOverlay.CanSearch() {
+			return a, nil
+		}
+		a.searchOverlay.SetSearchResults(nil, true)
+		a.searchSeq++
+		cmds := []tea.Cmd{a.doStreamingSearch(q, a.searchSeq)}
+		if !a.statusbar.loading {
+			cmds = append(cmds, spinnerTick())
+		}
+		return a, tea.Batch(cmds...)
 
 	case embeddingStartedMsg:
 		a.statusbar.SetEmbeddingStats(msg.stats)
@@ -898,6 +918,20 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// 2. Search overlay
 	if a.searchOverlay.IsActive() {
+		// ctrl+f triggers an IMAP server search using the current query
+		if key == "ctrl+f" {
+			if client, ok := a.imapClients[a.activeAccount]; ok {
+				q := a.searchOverlay.Query()
+				a.searchOverlay.SetSearchResults(nil, true)
+				a.flash(fmt.Sprintf("%s Searching server…", icons.Search), "info")
+				cmds := []tea.Cmd{client.SearchIMAP(a.activeFolder, q)}
+				if !a.statusbar.loading {
+					cmds = append(cmds, spinnerTick())
+				}
+				return a, tea.Batch(cmds...)
+			}
+			return a, nil
+		}
 		qChanged, closed, selected := a.searchOverlay.HandleKey(key)
 		if closed {
 			a.searchState = nil
@@ -908,13 +942,13 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			a.searchOverlay.Close()
 		} else if qChanged {
-			q := a.searchOverlay.Query()
-			if a.searchOverlay.CanSearch() {
-				a.searchOverlay.SetSearchResults(nil, true)
-				a.searchSeq++
-				return a, a.doStreamingSearch(q, a.searchSeq)
+			id := a.searchOverlay.BumpDebounce()
+			if !a.searchOverlay.CanSearch() {
+				a.searchOverlay.SetSearchResults(nil, false)
 			}
-			a.searchOverlay.SetSearchResults(nil, false)
+			return a, tea.Tick(200*time.Millisecond, func(t time.Time) tea.Msg {
+				return searchDebounceMsg{id: id}
+			})
 		}
 		return a, nil
 	}

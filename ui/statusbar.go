@@ -130,6 +130,7 @@ func (sb *StatusBar) View(context string) string {
 		}
 	case "move":
 		hints = []hint{
+			{icons.Search, "type", "filter"},
 			{icons.ArrowUpDown, "j/k", "navigate"},
 			{icons.FolderOpen, "enter", "move here"},
 			{icons.Close, "esc", "cancel"},

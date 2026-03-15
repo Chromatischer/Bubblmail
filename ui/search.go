@@ -9,7 +9,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// SearchOverlay is a floating search box with FTS5 results list.
+// SearchOverlay is a floating search box with FTS + semantic results.
 type SearchOverlay struct {
 	styles   *Styles
 	width    int
@@ -22,12 +22,14 @@ type SearchOverlay struct {
 	loading  bool
 	minChars int
 
-	// debounce state
-	pendingQuery string
-	debounceID   int
+	// debounce: bumped on each keystroke; app fires search only when ID matches
+	debounceID int
+
+	// spinner frame for loading indicator
+	spinnerFrame int
 }
 
-// SearchResult holds a search match and labels.
+// SearchResult holds a search match and its source labels.
 type SearchResult struct {
 	Message  *data.Message
 	Score    float32
@@ -35,18 +37,20 @@ type SearchResult struct {
 	Similar  bool
 }
 
+var searchSpinnerFrames = []string{
+	icons.Spinner1, icons.Spinner2, icons.Spinner3,
+	icons.Spinner4, icons.Spinner5, icons.Spinner6,
+}
+
 // NewSearchOverlay creates a new search overlay.
 func NewSearchOverlay(styles *Styles) *SearchOverlay {
-	return &SearchOverlay{styles: styles, minChars: 5}
+	return &SearchOverlay{styles: styles, minChars: 2}
 }
 
 // SetSize sets the overlay dimensions.
-func (s *SearchOverlay) SetSize(w, h int) {
-	s.width = w
-	s.height = h
-}
+func (s *SearchOverlay) SetSize(w, h int) { s.width = w; s.height = h }
 
-// Open opens the search overlay.
+// Open opens the overlay and resets all state.
 func (s *SearchOverlay) Open() {
 	s.active = true
 	s.query = ""
@@ -54,9 +58,10 @@ func (s *SearchOverlay) Open() {
 	s.cursor = 0
 	s.offset = 0
 	s.loading = false
+	s.debounceID = 0
 }
 
-// Close closes the overlay.
+// Close closes the overlay and clears state.
 func (s *SearchOverlay) Close() {
 	s.active = false
 	s.query = ""
@@ -65,21 +70,36 @@ func (s *SearchOverlay) Close() {
 }
 
 // IsActive returns true if the overlay is open.
-func (s *SearchOverlay) IsActive() bool {
-	return s.active
-}
+func (s *SearchOverlay) IsActive() bool { return s.active }
+
+// IsLoading returns true if a search is in progress.
+func (s *SearchOverlay) IsLoading() bool { return s.loading }
 
 // Query returns the current search query.
-func (s *SearchOverlay) Query() string {
-	return s.query
-}
+func (s *SearchOverlay) Query() string { return s.query }
 
-// CanSearch reports whether the current query is long enough to trigger search.
+// CanSearch reports whether the query is long enough to trigger a search.
 func (s *SearchOverlay) CanSearch() bool {
 	return len([]rune(strings.TrimSpace(s.query))) >= s.minChars
 }
 
-// SetResults updates the search results.
+// BumpDebounce increments and returns the debounce counter.
+// The caller stores the returned ID and fires search only if the ID still
+// matches after the debounce delay.
+func (s *SearchOverlay) BumpDebounce() int {
+	s.debounceID++
+	return s.debounceID
+}
+
+// DebounceID returns the current debounce counter.
+func (s *SearchOverlay) DebounceID() int { return s.debounceID }
+
+// AdvanceSpinner steps the loading indicator by one frame.
+func (s *SearchOverlay) AdvanceSpinner() {
+	s.spinnerFrame = (s.spinnerFrame + 1) % len(searchSpinnerFrames)
+}
+
+// SetResults updates results from a completed IMAP search.
 func (s *SearchOverlay) SetResults(msgs []*data.Message) {
 	results := make([]*SearchResult, 0, len(msgs))
 	for _, msg := range msgs {
@@ -91,7 +111,7 @@ func (s *SearchOverlay) SetResults(msgs []*data.Message) {
 	s.offset = 0
 }
 
-// SetSearchResults updates streaming search results.
+// SetSearchResults updates results from a streaming semantic search.
 func (s *SearchOverlay) SetSearchResults(results []*SearchResult, loading bool) {
 	if results == nil {
 		results = []*SearchResult{}
@@ -110,7 +130,7 @@ func (s *SearchOverlay) SetSearchResults(results []*SearchResult, loading bool) 
 	}
 }
 
-// SelectedMessage returns the currently selected message, or nil.
+// SelectedMessage returns the currently focused result, or nil.
 func (s *SearchOverlay) SelectedMessage() *data.Message {
 	if s.cursor < 0 || s.cursor >= len(s.results) {
 		return nil
@@ -139,11 +159,7 @@ func (s *SearchOverlay) HandleKey(key string) (queryChanged bool, closed bool, s
 	case "down", "j":
 		if s.cursor < len(s.results)-1 {
 			s.cursor++
-			visibleRows := s.height - 6
-			if visibleRows < 1 {
-				visibleRows = 1
-			}
-			if s.cursor >= s.offset+visibleRows {
+			if s.cursor >= s.offset+s.visibleRowCount() {
 				s.offset++
 			}
 		}
@@ -156,7 +172,6 @@ func (s *SearchOverlay) HandleKey(key string) (queryChanged bool, closed bool, s
 			return true, false, false
 		}
 	default:
-		// Printable characters
 		if len(key) == 1 && key[0] >= 32 {
 			s.query += key
 			s.cursor = 0
@@ -167,177 +182,276 @@ func (s *SearchOverlay) HandleKey(key string) (queryChanged bool, closed bool, s
 	return false, false, false
 }
 
-// View renders the search overlay.
+// visibleRowCount returns how many result rows fit inside the overlay.
+func (s *SearchOverlay) visibleRowCount() int {
+	boxH := s.height - 4
+	if boxH < 10 {
+		boxH = 10
+	}
+	// Padding(1,2) consumes 2 rows; input + divider + footer consume 3 more.
+	vr := boxH - 5
+	if vr < 1 {
+		vr = 1
+	}
+	return vr
+}
+
+// View renders the search overlay centered over the terminal.
 func (s *SearchOverlay) View() string {
 	theme := s.styles.Theme
 
-	boxWidth := s.width - 4
-	if boxWidth < 40 {
-		boxWidth = 40
+	boxW := s.width - 4
+	if boxW < 44 {
+		boxW = 44
 	}
-	boxHeight := s.height - 4
-	if boxHeight < 10 {
-		boxHeight = 10
+	boxH := s.height - 4
+	if boxH < 10 {
+		boxH = 10
 	}
 
-	// Input line
-	inputStyle := lipgloss.NewStyle().
-		Foreground(theme.Text).
-		Background(theme.SurfaceAlt).
-		Width(boxWidth-4).
-		Padding(0, 1)
+	// innerW: content area inside Padding(1, 2) = boxW − 4
+	innerW := boxW - 4
+	if innerW < 10 {
+		innerW = 10
+	}
 
-	queryDisplay := s.query
-	if strings.TrimSpace(queryDisplay) == "" {
-		queryDisplay = lipgloss.NewStyle().
+	vr := s.visibleRowCount()
+
+	surf := theme.Surface
+
+	// bg-colored single-space helper used between cells so resets don't expose
+	// the terminal default background between styled blocks.
+	sp := func(bg lipgloss.Color) string {
+		return lipgloss.NewStyle().Background(bg).Render(" ")
+	}
+
+	// ── Input row ────────────────────────────────────────────────────────────
+	// Two adjacent Width(N) cells, each with explicit Background(Surface).
+	// iconCellW=2: icon(1) + 1 padding from Width(2).
+	const iconCellW = 2
+	iconCell := lipgloss.NewStyle().
+		Width(iconCellW).
+		Background(surf).
+		Foreground(theme.Accent).
+		Render(icons.Search)
+
+	inputAreaW := innerW - iconCellW
+	if inputAreaW < 1 {
+		inputAreaW = 1
+	}
+	var inputCell string
+	if s.query == "" {
+		inputCell = lipgloss.NewStyle().
+			Width(inputAreaW).
+			Background(surf).
 			Foreground(theme.TextFaint).
-			Background(theme.SurfaceAlt).
-			Render("Type at least 5 characters…")
+			Render("Search mail…")
 	} else {
-		queryDisplay = inputStyle.Render(s.query + "▌")
+		// leave 1 col for the cursor glyph; truncate then append it
+		displayQ := util.TruncateText(util.SingleLine(s.query), inputAreaW-1) + "▌"
+		inputCell = lipgloss.NewStyle().
+			Width(inputAreaW).
+			Background(surf).
+			Foreground(theme.Text).
+			Bold(true).
+			Render(displayQ)
 	}
+	inputRow := iconCell + inputCell
 
-	inputLine := "  " + queryDisplay
+	// ── Divider ──────────────────────────────────────────────────────────────
+	divider := lipgloss.NewStyle().
+		Background(surf).
+		Foreground(theme.Border).
+		Render(strings.Repeat("─", innerW))
 
-	// Results
-	visibleRows := boxHeight - 4
-	if visibleRows < 1 {
-		visibleRows = 1
-	}
-
+	// ── Result rows ──────────────────────────────────────────────────────────
+	blankLine := lipgloss.NewStyle().Background(surf).Width(innerW).Render("")
 	var resultLines []string
-	if len(s.results) == 0 && strings.TrimSpace(s.query) != "" {
-		emptyMsg := lipgloss.NewStyle().
-			Foreground(theme.TextFaint).
-			Background(theme.Surface).
-			Render(func() string {
-				if !s.CanSearch() {
-					return "  Keep typing…"
-				}
-				if s.loading {
-					return "  Searching…"
-				}
-				return "  No results"
-			}())
-		resultLines = append(resultLines, emptyMsg)
+
+	if len(s.results) == 0 {
+		var stateMsg string
+		var stateColor lipgloss.Color
+		switch {
+		case s.query == "":
+			stateMsg = "Type to search"
+			stateColor = theme.TextFaint
+		case !s.CanSearch():
+			stateMsg = "Keep typing…"
+			stateColor = theme.TextFaint
+		case s.loading:
+			stateMsg = searchSpinnerFrames[s.spinnerFrame] + " Searching…"
+			stateColor = theme.TextMuted
+		default:
+			stateMsg = "No results"
+			stateColor = theme.TextMuted
+		}
+		// Center the message vertically within vr rows, all with Surface bg.
+		topPad := (vr - 1) / 2
+		for i := 0; i < topPad; i++ {
+			resultLines = append(resultLines, blankLine)
+		}
+		resultLines = append(resultLines,
+			lipgloss.NewStyle().
+				Width(innerW).
+				Background(surf).
+				Foreground(stateColor).
+				Align(lipgloss.Center).
+				Render(stateMsg),
+		)
+		for len(resultLines) < vr {
+			resultLines = append(resultLines, blankLine)
+		}
+	} else {
+		for i := s.offset; i < len(s.results) && i < s.offset+vr; i++ {
+			resultLines = append(resultLines, s.renderRow(s.results[i], i == s.cursor, innerW, sp))
+		}
+		for len(resultLines) < vr {
+			resultLines = append(resultLines, blankLine)
+		}
 	}
 
-	for i := s.offset; i < len(s.results) && i < s.offset+visibleRows; i++ {
-		res := s.results[i]
-		msg := res.Message
-		isSelected := i == s.cursor
-
-		from := util.TruncateText(util.SingleLine(msg.FromString()), 20)
-		subject := ""
-		date := util.FormatDate(msg.Date)
-
-		var lineStyle, metaStyle lipgloss.Style
-		if isSelected {
-			lineStyle = lipgloss.NewStyle().
-				Background(theme.Selected).
-				Foreground(theme.Background).
-				Bold(true)
-			metaStyle = lineStyle
-		} else {
-			lineStyle = lipgloss.NewStyle().
-				Foreground(theme.Text).
-				Background(theme.Surface)
-			metaStyle = lipgloss.NewStyle().
-				Foreground(theme.TextMuted).
-				Background(theme.Surface)
-		}
-
-		unread := " "
-		if !msg.IsRead() {
-			unread = lipgloss.NewStyle().
-				Foreground(theme.Unread).
-				Background(func() lipgloss.Color {
-					if isSelected {
-						return theme.Selected
-					}
-					return theme.Surface
-				}()).
-				Render(icons.Unread)
-		}
-
-		badge := ""
-		if res.Semantic || res.Similar {
-			var tags []string
-			if res.Semantic {
-				tags = append(tags, "SEM")
-			}
-			if res.Similar {
-				tags = append(tags, "SIM")
-			}
-			badgeStyle := lipgloss.NewStyle().
-				Foreground(theme.Background).
-				Background(theme.Accent).
-				Padding(0, 1)
-			badge = badgeStyle.Render(strings.Join(tags, " "))
-		}
-
-		// Fixed-width layout — all widths computed from plain strings only,
-		// never from pre-rendered ANSI spans. Each segment uses Width() so
-		// lipgloss self-pads it; no gap arithmetic against ANSI strings.
-		const fromW = 20
-		const prefixW = 3 // " " + unread(1) + " "
-
-		dateW := util.VisibleWidth(date)
-		badgeW := 0
-		if badge != "" {
-			badgeW = util.VisibleWidth(badge) + 1 // +1 for leading space
-		}
-		suffixW := 1 + dateW + badgeW // leading space before date (or badge)
-
-		subjectW := boxWidth - prefixW - fromW - 1 - suffixW // -1 for space between from and subject
-		if subjectW < 1 {
-			subjectW = 1
-		}
-
-		subject = util.TruncateText(util.SingleLine(msg.Subject), subjectW)
-
-		// Render each segment with an explicit Width() so it self-pads exactly.
-		fromCell := lineStyle.Width(fromW).Render(from)
-		subjectCell := lineStyle.Width(subjectW).Render(subject)
-
-		suffixParts := ""
-		if badge != "" {
-			suffixParts += " " + badge
-		}
-		suffixParts += " " + metaStyle.Render(date)
-
-		line := " " + unread + " " + fromCell + " " + subjectCell + suffixParts
-		resultLines = append(resultLines, line)
-	}
-
-	// Pad to boxHeight
-	bgLine := lipgloss.NewStyle().Background(theme.Surface).Width(boxWidth).Render("")
-	for len(resultLines) < visibleRows {
-		resultLines = append(resultLines, bgLine)
-	}
-
-	countLine := ""
+	// ── Footer ───────────────────────────────────────────────────────────────
+	var footerStr string
 	if len(s.results) > 0 {
-		countLabel := util.PluralCount(len(s.results), "result", "results")
-		if s.loading {
-			countLabel += " · streaming"
-		}
-		countLine = lipgloss.NewStyle().
+		countTxt := util.PluralCount(len(s.results), "result", "results")
+		countCell := lipgloss.NewStyle().
+			Background(surf).
 			Foreground(theme.TextFaint).
-			Background(theme.Surface).
-			Render("  " + strings.Repeat("─", 10) + " " + countLabel)
+			Render(countTxt)
+		if s.loading {
+			spinTxt := searchSpinnerFrames[s.spinnerFrame] + " streaming…"
+			spinCell := lipgloss.NewStyle().
+				Background(surf).
+				Foreground(theme.TextMuted).
+				Render(spinTxt)
+			gap := innerW - util.VisibleWidth(countTxt) - util.VisibleWidth(spinTxt)
+			if gap < 1 {
+				gap = 1
+			}
+			gapCell := lipgloss.NewStyle().Background(surf).Render(strings.Repeat(" ", gap))
+			footerStr = countCell + gapCell + spinCell
+		} else {
+			footerStr = countCell
+		}
+	} else {
+		footerStr = blankLine
 	}
 
-	content := strings.Join(append([]string{inputLine, countLine}, resultLines...), "\n")
+	// ── Assemble ─────────────────────────────────────────────────────────────
+	lines := make([]string, 0, 3+vr)
+	lines = append(lines, inputRow, divider)
+	lines = append(lines, resultLines...)
+	lines = append(lines, footerStr)
 
 	box := lipgloss.NewStyle().
-		Width(boxWidth).
-		Height(boxHeight).
-		Background(theme.Surface).
+		Width(boxW).
+		Height(boxH).
+		Background(surf).
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(theme.Accent).
-		Padding(1, 0).
-		Render(content)
+		Padding(1, 2).
+		Render(strings.Join(lines, "\n"))
 
 	return lipgloss.Place(s.width, s.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// renderRow renders a single search result at the given width.
+// All widths are computed from plain strings; each cell uses Width(N) to self-pad.
+// sp is a pre-built bg-colored single space injected between cells so that
+// resets from inner styles don't expose the terminal's default background.
+func (s *SearchOverlay) renderRow(res *SearchResult, selected bool, innerW int, sp func(lipgloss.Color) string) string {
+	theme := s.styles.Theme
+	msg := res.Message
+
+	bg := theme.Surface
+	if selected {
+		bg = theme.Selected
+	}
+
+	var rowFg, metaFg lipgloss.Color
+	if selected {
+		rowFg = theme.Background
+		metaFg = theme.Background
+	} else {
+		rowFg = theme.Text
+		metaFg = theme.TextMuted
+	}
+
+	cell := func(w int, fg lipgloss.Color, plain string) string {
+		return lipgloss.NewStyle().
+			Width(w).
+			Background(bg).
+			Foreground(fg).
+			Render(plain)
+	}
+
+	// Unread indicator (1 col)
+	var unreadChar string
+	var unreadFg lipgloss.Color
+	if !msg.IsRead() {
+		unreadChar = icons.Unread
+		unreadFg = theme.Unread
+	} else {
+		unreadChar = " "
+		unreadFg = bg
+	}
+	unreadCell := cell(1, unreadFg, unreadChar)
+
+	// Date — fixed width so the indicator column stays vertically aligned.
+	// FormatDate can return "Yesterday" (9 cols); replace it before truncating.
+	const dateW = 6
+	dateFmt := util.FormatDate(msg.Date)
+	if dateFmt == "Yesterday" {
+		dateFmt = "Yest."
+	}
+	dateRaw := util.TruncateText(util.SingleLine(dateFmt), dateW)
+	dateCell := cell(dateW, metaFg, dateRaw)
+
+	// Match-type indicator: 1-col character right before the date.
+	// Rendered as a Width(2) cell (char + 1 padding space) to keep it tidy.
+	// * = semantic (AI embedding match)  ~ = similar (cosine distance)
+	const indCellW = 2
+	var indChar string
+	var indFg lipgloss.Color
+	switch {
+	case res.Semantic:
+		indChar = "*"
+		indFg = theme.Accent
+	case res.Similar:
+		indChar = "~"
+		indFg = theme.TextMuted
+	default:
+		indChar = " "
+		indFg = bg
+	}
+	indCell := cell(indCellW, indFg, indChar)
+
+	// suffixW: sp(1) + ind(2) + sp(1) + date(6) = 10, constant across all rows
+	suffixW := 1 + indCellW + 1 + dateW
+
+	// From (fixed 18 cols)
+	const fromW = 18
+	fromCell := cell(fromW, rowFg, util.TruncateText(util.SingleLine(msg.FromString()), fromW))
+
+	// Subject fills remaining space
+	// Layout: unread(1) + sp(1) + from(18) + sp(1) + subject + suffixW = innerW
+	subjectW := innerW - 1 - 1 - fromW - 1 - suffixW
+	if subjectW < 1 {
+		subjectW = 1
+	}
+	subjectCell := cell(subjectW, rowFg, util.TruncateText(util.SingleLine(msg.Subject), subjectW))
+
+	// Subject gets a dimmer style when read and not selected
+	if !selected && msg.IsRead() {
+		subjectCell = lipgloss.NewStyle().
+			Width(subjectW).
+			Background(bg).
+			Foreground(theme.TextMuted).
+			Render(util.TruncateText(util.SingleLine(msg.Subject), subjectW))
+	}
+
+	spc := sp(bg)
+	suffix := spc + indCell + spc + dateCell
+
+	return unreadCell + spc + fromCell + spc + subjectCell + suffix
 }
