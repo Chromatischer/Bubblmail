@@ -15,9 +15,9 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/data"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // Attachment is a file to include in the email.
@@ -41,6 +41,62 @@ type SendResultMsg struct {
 	Err error
 }
 
+// BuildRawMessage builds the raw RFC 2822 bytes for a composed message.
+// The returned bytes can be used both for SMTP DATA and for IMAP APPEND.
+func BuildRawMessage(draft *ComposedMessage) ([]byte, error) {
+	var buf bytes.Buffer
+	date := time.Now().Format(time.RFC1123Z)
+	buf.WriteString("Date: " + date + "\r\n")
+	buf.WriteString("From: " + formatAddress(draft.From) + "\r\n")
+	buf.WriteString("To: " + formatAddresses(draft.To) + "\r\n")
+	if len(draft.CC) > 0 {
+		buf.WriteString("Cc: " + formatAddresses(draft.CC) + "\r\n")
+	}
+	buf.WriteString("Subject: " + mime.QEncoding.Encode("utf-8", draft.Subject) + "\r\n")
+	buf.WriteString("MIME-Version: 1.0\r\n")
+
+	if len(draft.Attachments) == 0 {
+		buf.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
+		buf.WriteString("Content-Transfer-Encoding: quoted-printable\r\n")
+		buf.WriteString("\r\n")
+		buf.WriteString(draft.Body)
+	} else {
+		mw := multipart.NewWriter(&buf)
+		buf.WriteString("Content-Type: multipart/mixed; boundary=\"" + mw.Boundary() + "\"\r\n")
+		buf.WriteString("\r\n")
+
+		th := make(textproto.MIMEHeader)
+		th.Set("Content-Type", "text/plain; charset=utf-8")
+		th.Set("Content-Transfer-Encoding", "quoted-printable")
+		pw, err := mw.CreatePart(th)
+		if err != nil {
+			return nil, fmt.Errorf("creating text part: %w", err)
+		}
+		fmt.Fprint(pw, draft.Body)
+
+		for _, a := range draft.Attachments {
+			fileData, err := os.ReadFile(a.Path)
+			if err != nil {
+				return nil, fmt.Errorf("reading attachment %s: %w", a.Filename, err)
+			}
+			ct := mimeTypeForFile(a.Filename)
+			ah := make(textproto.MIMEHeader)
+			ah.Set("Content-Type", ct)
+			ah.Set("Content-Transfer-Encoding", "base64")
+			ah.Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", a.Filename))
+			aw, err := mw.CreatePart(ah)
+			if err != nil {
+				return nil, fmt.Errorf("creating attachment part: %w", err)
+			}
+			enc := base64.NewEncoder(base64.StdEncoding, aw)
+			enc.Write(fileData)
+			enc.Close()
+		}
+		mw.Close()
+	}
+	return buf.Bytes(), nil
+}
+
 // SendMessage returns a tea.Cmd that sends the composed message via SMTP.
 func SendMessage(cfg *config.AccountConfig, draft *ComposedMessage) tea.Cmd {
 	return func() tea.Msg {
@@ -55,64 +111,9 @@ func sendMessage(cfg *config.AccountConfig, draft *ComposedMessage) error {
 		return fmt.Errorf("resolving password: %w", err)
 	}
 
-	var buf bytes.Buffer
-	date := time.Now().Format(time.RFC1123Z)
-	buf.WriteString("Date: " + date + "\r\n")
-	buf.WriteString("From: " + formatAddress(draft.From) + "\r\n")
-	buf.WriteString("To: " + formatAddresses(draft.To) + "\r\n")
-	if len(draft.CC) > 0 {
-		buf.WriteString("Cc: " + formatAddresses(draft.CC) + "\r\n")
-	}
-	buf.WriteString("Subject: " + mime.QEncoding.Encode("utf-8", draft.Subject) + "\r\n")
-	buf.WriteString("MIME-Version: 1.0\r\n")
-
-	if len(draft.Attachments) == 0 {
-		// Simple text-only message.
-		buf.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
-		buf.WriteString("Content-Transfer-Encoding: quoted-printable\r\n")
-		buf.WriteString("\r\n")
-		buf.WriteString(draft.Body)
-	} else {
-		// Multipart/mixed with text body + file attachments.
-		mw := multipart.NewWriter(&buf)
-		buf.WriteString("Content-Type: multipart/mixed; boundary=\"" + mw.Boundary() + "\"\r\n")
-		buf.WriteString("\r\n")
-
-		// Text part.
-		th := make(textproto.MIMEHeader)
-		th.Set("Content-Type", "text/plain; charset=utf-8")
-		th.Set("Content-Transfer-Encoding", "quoted-printable")
-		pw, err := mw.CreatePart(th)
-		if err != nil {
-			return fmt.Errorf("creating text part: %w", err)
-		}
-		fmt.Fprint(pw, draft.Body)
-
-		// Attachment parts.
-		for _, a := range draft.Attachments {
-			fileData, err := os.ReadFile(a.Path)
-			if err != nil {
-				return fmt.Errorf("reading attachment %s: %w", a.Filename, err)
-			}
-
-			ct := mimeTypeForFile(a.Filename)
-			ah := make(textproto.MIMEHeader)
-			ah.Set("Content-Type", ct)
-			ah.Set("Content-Transfer-Encoding", "base64")
-			ah.Set("Content-Disposition",
-				fmt.Sprintf("attachment; filename=%q", a.Filename))
-
-			aw, err := mw.CreatePart(ah)
-			if err != nil {
-				return fmt.Errorf("creating attachment part: %w", err)
-			}
-
-			enc := base64.NewEncoder(base64.StdEncoding, aw)
-			enc.Write(fileData)
-			enc.Close()
-		}
-
-		mw.Close()
+	raw, err := BuildRawMessage(draft)
+	if err != nil {
+		return err
 	}
 
 	addr := fmt.Sprintf("%s:%d", cfg.SMTPHost, cfg.SMTPPort)
@@ -153,7 +154,7 @@ func sendMessage(cfg *config.AccountConfig, draft *ComposedMessage) error {
 	if err != nil {
 		return fmt.Errorf("SMTP DATA command failed: %w", err)
 	}
-	if _, err := w.Write(buf.Bytes()); err != nil {
+	if _, err := w.Write(raw); err != nil {
 		return fmt.Errorf("writing message: %w", err)
 	}
 	if err := w.Close(); err != nil {

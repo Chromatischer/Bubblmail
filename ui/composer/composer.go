@@ -16,8 +16,19 @@ import (
 
 // Result holds the outcome of a composer interaction.
 type Result struct {
-	Action string // "send", "cancel"
+	Action string // "send", "cancel", "save-draft"
 	Draft  *outsmtp.ComposedMessage
+}
+
+// savedDraftState holds the stashed composer state for the continue/discard prompt.
+type savedDraftState struct {
+	fields      []*Field
+	from        data.Address
+	mode        string
+	attachments []Attachment
+	anonymize   bool
+	focused     int
+	bodyTop     int
 }
 
 // Composer is the full-screen email composition overlay.
@@ -39,6 +50,10 @@ type Composer struct {
 	filePicker   *filePicker
 	anonymize    bool
 	attachCursor int // selected index in attachment list when focused==4
+
+	// Draft persistence: stash when closing with content, prompt on reopen.
+	savedDraft *savedDraftState
+	prompting  bool // showing the continue/discard prompt
 }
 
 const (
@@ -54,39 +69,49 @@ func NewComposer(theme *config.Theme) *Composer {
 	}
 }
 
-// OpenNew opens the composer for a new email.
-func (c *Composer) OpenNew(from data.Address) {
+// openWith is the shared opener that sets active, resets state, and then
+// shows the continue/discard prompt when a saved draft exists.
+func (c *Composer) openWith(from data.Address, fields []*Field, mode string, focusedField int) {
 	c.from = from
 	c.active = true
 	c.result = nil
-	c.focused = 0
-	c.mode = "New Message"
 	c.bodyTop = 0
 	c.attachments = nil
 	c.anonymize = false
 	c.attachCursor = 0
-	c.fields = []*Field{
+
+	if c.savedDraft != nil {
+		// Stash the intended fresh fields so "Discard" can load them.
+		// We show the prompt immediately; restoreDraft / discard will swap fields.
+		c.fields = fields
+		c.focused = focusedField
+		c.mode = mode
+		c.prompting = true
+		return
+	}
+
+	c.fields = fields
+	c.focused = focusedField
+	c.mode = mode
+	c.prompting = false
+}
+
+// OpenNew opens the composer for a new email.
+func (c *Composer) OpenNew(from data.Address) {
+	fields := []*Field{
 		{Label: "To", Kind: FieldText},
 		{Label: "CC", Kind: FieldText},
 		{Label: "Subject", Kind: FieldText},
 		{Label: "Body", Kind: FieldTextArea},
 	}
+	c.openWith(from, fields, "New Message", 0)
 }
 
 // OpenReply opens the composer pre-filled for a reply.
 func (c *Composer) OpenReply(from data.Address, orig *data.Message, replyAll bool) {
-	c.from = from
-	c.active = true
-	c.result = nil
-	c.focused = 3 // jump to body
-	c.bodyTop = 0
-	c.attachments = nil
-	c.anonymize = false
-	c.attachCursor = 0
+	mode := "Reply"
 	if replyAll {
-		c.mode = "Reply All"
-	} else {
-		c.mode = "Reply"
+		mode = "Reply All"
 	}
 
 	replyTo := primaryReplyAddress(orig)
@@ -101,38 +126,30 @@ func (c *Composer) OpenReply(from data.Address, orig *data.Message, replyAll boo
 	}
 	body := quoteBody(orig)
 
-	c.fields = []*Field{
+	fields := []*Field{
 		{Label: "To", Kind: FieldText, Value: to, cursor: len([]rune(to))},
 		{Label: "CC", Kind: FieldText, Value: cc, cursor: len([]rune(cc))},
 		{Label: "Subject", Kind: FieldText, Value: subject, cursor: len([]rune(subject))},
 		{Label: "Body", Kind: FieldTextArea, Value: body, cursor: 0},
 	}
+	c.openWith(from, fields, mode, 3)
 }
 
 // OpenForward opens the composer pre-filled for a forwarded message.
 func (c *Composer) OpenForward(from data.Address, orig *data.Message) {
-	c.from = from
-	c.active = true
-	c.result = nil
-	c.focused = 0
-	c.mode = "Forward"
-	c.bodyTop = 0
-	c.attachments = nil
-	c.anonymize = false
-	c.attachCursor = 0
-
 	subject := orig.Subject
 	if !strings.HasPrefix(strings.ToLower(subject), "fwd:") {
 		subject = "Fwd: " + subject
 	}
 	body := forwardBody(orig)
 
-	c.fields = []*Field{
+	fields := []*Field{
 		{Label: "To", Kind: FieldText},
 		{Label: "CC", Kind: FieldText},
 		{Label: "Subject", Kind: FieldText, Value: subject, cursor: len([]rune(subject))},
 		{Label: "Body", Kind: FieldTextArea, Value: body, cursor: 0},
 	}
+	c.openWith(from, fields, "Forward", 0)
 }
 
 // IsActive returns true if the composer is open.
@@ -163,6 +180,20 @@ func (c *Composer) HandleKey(key string) {
 		return
 	}
 
+	// Continue/Discard prompt intercepts all keys.
+	if c.prompting {
+		switch key {
+		case "enter", "c", "C":
+			// Continue — restore the saved draft.
+			c.restoreDraft()
+		case "d", "D", "n", "N", "esc":
+			// Discard — clear the saved draft and open fresh.
+			c.savedDraft = nil
+			c.prompting = false
+		}
+		return
+	}
+
 	// If file picker is open, route all keys to it.
 	if c.filePicker.isActive() {
 		path, isDir, accepted, _ := c.filePicker.handleKey(key)
@@ -180,8 +211,7 @@ func (c *Composer) HandleKey(key string) {
 	if c.focused == len(c.fields) { // attachment list
 		switch key {
 		case "esc":
-			c.result = &Result{Action: "cancel"}
-			c.active = false
+			c.cancelOrSaveDraft()
 			return
 		case "ctrl+s", "ctrl+enter":
 			c.submit()
@@ -219,8 +249,7 @@ func (c *Composer) HandleKey(key string) {
 		c.submit()
 		return
 	case "esc":
-		c.result = &Result{Action: "cancel"}
-		c.active = false
+		c.cancelOrSaveDraft()
 		return
 	case "tab":
 		next := c.focused + 1
@@ -406,6 +435,11 @@ func (c *Composer) View() string {
 		return ""
 	}
 	theme := c.theme
+
+	// ── Continue / Discard prompt ─────────────────────────────────────────────
+	if c.prompting {
+		return c.viewDraftPrompt(theme)
+	}
 
 	boxWidth := c.width - 16
 	if boxWidth > 110 {
@@ -978,6 +1012,96 @@ func (c *Composer) scrollBody(delta int) {
 	if c.bodyTop > maxTop {
 		c.bodyTop = maxTop
 	}
+}
+
+// viewDraftPrompt renders the "Continue draft or Discard?" dialog.
+func (c *Composer) viewDraftPrompt(theme *config.Theme) string {
+	boxWidth := c.width - 4
+	if boxWidth < 60 {
+		boxWidth = 60
+	}
+	innerW := boxWidth - 4
+
+	titleSt := lipgloss.NewStyle().Foreground(theme.Accent).Background(theme.Surface).Bold(true).Align(lipgloss.Center).Width(innerW)
+	textSt := lipgloss.NewStyle().Foreground(theme.Text).Background(theme.Surface).Align(lipgloss.Center).Width(innerW)
+	hintSt := lipgloss.NewStyle().Foreground(theme.TextMuted).Background(theme.Surface).Align(lipgloss.Center).Width(innerW)
+	divSt := lipgloss.NewStyle().Foreground(theme.Border).Background(theme.Surface)
+
+	divider := divSt.Render(strings.Repeat("─", innerW))
+
+	rows := []string{
+		titleSt.Render("Unsaved Draft"),
+		divider,
+		textSt.Render("You have an unsaved draft."),
+		textSt.Render(""),
+		hintSt.Render("  [enter / c]  Continue editing    [d / esc]  Discard  "),
+	}
+
+	content := strings.Join(rows, "\n")
+	box := lipgloss.NewStyle().
+		Background(theme.Surface).
+		Foreground(theme.Text).
+		Padding(1, 2).
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(theme.Accent).
+		Width(boxWidth).
+		Render(content)
+
+	return lipgloss.Place(c.width, c.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// hasDraftContent returns true if any field has been filled in or any
+// attachment added — i.e. the composer has meaningful content worth saving.
+func (c *Composer) hasDraftContent() bool {
+	for _, f := range c.fields {
+		if strings.TrimSpace(f.Value) != "" {
+			return true
+		}
+	}
+	return len(c.attachments) > 0
+}
+
+// cancelOrSaveDraft closes the composer. If there is content, it stashes the
+// current state as a saved draft and emits "save-draft"; otherwise "cancel".
+func (c *Composer) cancelOrSaveDraft() {
+	if c.hasDraftContent() {
+		c.savedDraft = &savedDraftState{
+			fields:      c.fields,
+			from:        c.from,
+			mode:        c.mode,
+			attachments: c.attachments,
+			anonymize:   c.anonymize,
+			focused:     c.focused,
+			bodyTop:     c.bodyTop,
+		}
+		// Build a minimal ComposedMessage so app.go can append it to Drafts.
+		draft := &outsmtp.ComposedMessage{
+			From:    c.from,
+			Subject: c.fields[2].Value,
+			Body:    c.fields[3].Value,
+		}
+		c.result = &Result{Action: "save-draft", Draft: draft}
+	} else {
+		c.result = &Result{Action: "cancel"}
+	}
+	c.active = false
+}
+
+// restoreDraft swaps in the saved draft fields and clears the prompt.
+func (c *Composer) restoreDraft() {
+	if c.savedDraft == nil {
+		c.prompting = false
+		return
+	}
+	c.fields = c.savedDraft.fields
+	c.from = c.savedDraft.from
+	c.mode = c.savedDraft.mode
+	c.attachments = c.savedDraft.attachments
+	c.anonymize = c.savedDraft.anonymize
+	c.focused = c.savedDraft.focused
+	c.bodyTop = c.savedDraft.bodyTop
+	c.savedDraft = nil
+	c.prompting = false
 }
 
 // bodyQuoteDepth counts leading '>' characters in a body line and returns the

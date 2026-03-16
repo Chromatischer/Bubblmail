@@ -76,6 +76,13 @@ type CreateFolderResultMsg struct {
 	Err     error
 }
 
+// AppendMessageResultMsg carries the result of AppendMessage.
+type AppendMessageResultMsg struct {
+	Account string
+	Folder  string
+	Err     error
+}
+
 // MoveMessageResultMsg carries the result of MoveMessage.
 type MoveMessageResultMsg struct {
 	Account string
@@ -170,6 +177,30 @@ func (c *Client) CreateFolder(name string) tea.Cmd {
 		defer c.mu.Unlock()
 		err := c.conn.Create(name, nil).Wait()
 		return CreateFolderResultMsg{Account: c.cfg.Name, Name: name, Err: err}
+	}
+}
+
+// AppendMessage returns a tea.Cmd that appends a raw RFC 2822 message to a
+// mailbox (e.g. "Sent" or "Drafts") with the given flags.
+func (c *Client) AppendMessage(folder string, raw []byte, flags []data.Flag) tea.Cmd {
+	return func() tea.Msg {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		imapFlags := make([]imaplib.Flag, len(flags))
+		for i, f := range flags {
+			imapFlags[i] = imaplib.Flag(f)
+		}
+		opts := &imaplib.AppendOptions{Flags: imapFlags}
+		cmd := c.conn.Append(folder, int64(len(raw)), opts)
+		if _, err := cmd.Write(raw); err != nil {
+			_ = cmd.Close()
+			return AppendMessageResultMsg{Account: c.cfg.Name, Folder: folder, Err: err}
+		}
+		if err := cmd.Close(); err != nil {
+			return AppendMessageResultMsg{Account: c.cfg.Name, Folder: folder, Err: err}
+		}
+		_, err := cmd.Wait()
+		return AppendMessageResultMsg{Account: c.cfg.Name, Folder: folder, Err: err}
 	}
 }
 

@@ -610,6 +610,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return a, nil
 
+	case imaplib.AppendMessageResultMsg:
+		// Silently ignore Sent/Drafts append errors — the send already succeeded.
+		return a, nil
+
 	case imaplib.CreateFolderResultMsg:
 		if msg.Err != nil {
 			a.flash(fmt.Sprintf("%s Failed to create folder: %s", icons.Error, msg.Err.Error()), "err")
@@ -2077,6 +2081,54 @@ func (a *App) findTrashFolder(account string) string {
 	return ""
 }
 
+// findSentFolder returns the IMAP name of the Sent folder for the given account.
+// It checks for the \Sent attribute first, then falls back to common names.
+func (a *App) findSentFolder(account string) string {
+	for _, acct := range a.accounts {
+		if acct.Name != account {
+			continue
+		}
+		for _, f := range acct.Folders {
+			for _, attr := range f.Attributes {
+				if attr == `\Sent` {
+					return f.Name
+				}
+			}
+		}
+		for _, f := range acct.Folders {
+			switch f.DisplayName {
+			case "Sent", "Sent Items", "Sent Mail", "Sent Messages":
+				return f.Name
+			}
+		}
+	}
+	return ""
+}
+
+// findDraftsFolder returns the IMAP name of the Drafts folder for the given account.
+// It checks for the \Drafts attribute first, then falls back to common names.
+func (a *App) findDraftsFolder(account string) string {
+	for _, acct := range a.accounts {
+		if acct.Name != account {
+			continue
+		}
+		for _, f := range acct.Folders {
+			for _, attr := range f.Attributes {
+				if attr == `\Drafts` || attr == `\Draft` {
+					return f.Name
+				}
+			}
+		}
+		for _, f := range acct.Folders {
+			switch f.DisplayName {
+			case "Drafts", "Draft":
+				return f.Name
+			}
+		}
+	}
+	return ""
+}
+
 func (a *App) archiveMessage() tea.Cmd {
 	a.flash(fmt.Sprintf("%s Archive not yet implemented", icons.Archive), "info")
 	return nil
@@ -2324,10 +2376,30 @@ func (a *App) handleComposerResult(r *composer.Result) tea.Cmd {
 			if a.cfg.Accounts[i].Name == a.activeAccount {
 				acfg := &a.cfg.Accounts[i]
 				a.flash(fmt.Sprintf("%s Sending…", icons.Send), "info")
-				return outsmtp.SendMessage(acfg, r.Draft)
+				cmds := []tea.Cmd{outsmtp.SendMessage(acfg, r.Draft)}
+				// Append a copy to Sent if we can find the folder.
+				if sent := a.findSentFolder(a.activeAccount); sent != "" {
+					if client, ok := a.imapClients[a.activeAccount]; ok {
+						if raw, err := outsmtp.BuildRawMessage(r.Draft); err == nil {
+							cmds = append(cmds, client.AppendMessage(sent, raw, []data.Flag{data.FlagSeen}))
+						}
+					}
+				}
+				return tea.Batch(cmds...)
 			}
 		}
 		a.flash("No account configured for sending", "err")
+	case "save-draft":
+		if r.Draft == nil {
+			return nil
+		}
+		if drafts := a.findDraftsFolder(a.activeAccount); drafts != "" {
+			if client, ok := a.imapClients[a.activeAccount]; ok {
+				if raw, err := outsmtp.BuildRawMessage(r.Draft); err == nil {
+					return client.AppendMessage(drafts, raw, []data.Flag{data.FlagDraft, data.FlagSeen})
+				}
+			}
+		}
 	case "cancel":
 		// nothing
 	}
