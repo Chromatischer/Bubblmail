@@ -3,6 +3,7 @@ package ui
 import (
 	"strings"
 
+	"github.com/bubblmail/bubblmail/ui/components"
 	"github.com/bubblmail/bubblmail/ui/icons"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -58,13 +59,5 @@ func (h *HelpOverlay) View(w, height int) string {
 
 	content := strings.Join(rows, "\n")
 
-	box := lipgloss.NewStyle().
-		Foreground(theme.Text).
-		Background(theme.Surface).
-		Padding(1, 2).
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(theme.Accent).
-		Render(content)
-
-	return lipgloss.Place(w, height, lipgloss.Center, lipgloss.Center, box)
+	return components.ModalBox(theme, content, 0, 0, w, height)
 }

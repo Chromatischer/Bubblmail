@@ -1,10 +1,88 @@
 package components
 
 import (
+	"strings"
+
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/util"
 	"github.com/charmbracelet/lipgloss"
 )
+
+// Divider renders a full-width horizontal rule styled with the theme border colour.
+func Divider(theme *config.Theme, width int) string {
+	return lipgloss.NewStyle().
+		Foreground(theme.Border).
+		Background(theme.Surface).
+		Width(width).
+		Render(strings.Repeat("─", width))
+}
+
+// ModalBox wraps content in a rounded-border surface box and centres it over a
+// (fullW × fullH) area. Pass boxW=0 or boxH=0 to let lipgloss size that
+// dimension from the content.
+func ModalBox(theme *config.Theme, content string, boxW, boxH, fullW, fullH int) string {
+	style := lipgloss.NewStyle().
+		Background(theme.Surface).
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(theme.Accent).
+		Padding(1, 2)
+	if boxW > 0 {
+		style = style.Width(boxW)
+	}
+	if boxH > 0 {
+		style = style.Height(boxH)
+	}
+	box := style.Render(content)
+	return lipgloss.Place(fullW, fullH, lipgloss.Center, lipgloss.Center, box)
+}
+
+// ScrollList tracks cursor and scroll-offset state for a virtualized list.
+type ScrollList struct {
+	Cursor int
+	Offset int
+}
+
+// MoveUp moves the cursor up one row, scrolling the viewport if needed.
+func (sl *ScrollList) MoveUp() {
+	if sl.Cursor > 0 {
+		sl.Cursor--
+		if sl.Cursor < sl.Offset {
+			sl.Offset--
+		}
+	}
+}
+
+// MoveDown moves the cursor down one row, scrolling the viewport if needed.
+// count is the total number of items; visible is the number of visible rows.
+func (sl *ScrollList) MoveDown(count, visible int) {
+	if sl.Cursor < count-1 {
+		sl.Cursor++
+		if sl.Cursor >= sl.Offset+visible {
+			sl.Offset++
+		}
+	}
+}
+
+// Reset moves cursor and offset back to the top.
+func (sl *ScrollList) Reset() {
+	sl.Cursor = 0
+	sl.Offset = 0
+}
+
+// Clamp ensures cursor and offset are valid for a list of the given length.
+func (sl *ScrollList) Clamp(count int) {
+	if count == 0 {
+		sl.Cursor = 0
+		sl.Offset = 0
+		return
+	}
+	if sl.Cursor >= count {
+		sl.Cursor = count - 1
+	}
+	if sl.Cursor < 0 {
+		sl.Cursor = 0
+	}
+}
 
 // RenderButton renders a standardized button with uniform padding.
 func RenderButton(theme *config.Theme, label string, active bool, danger bool) string {

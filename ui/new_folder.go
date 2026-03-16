@@ -4,8 +4,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/bubblmail/bubblmail/ui/components"
 	"github.com/bubblmail/bubblmail/ui/icons"
-	"github.com/bubblmail/bubblmail/util"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -141,39 +141,16 @@ func (o *NewFolderOverlay) View() string {
 		Render(icons.FolderNew + " New Folder")
 
 	// ── Input row — mirrors search.go ────────────────────────────────────────
-	// iconCellW=2: icon(1) + 1 implicit pad from Width(2).
-	const iconCellW = 2
-	iconCell := lipgloss.NewStyle().
-		Width(iconCellW).
-		Background(theme.Surface).
-		Foreground(theme.Accent).
-		Render(icons.FolderNew)
+	ti := components.NewTextInput(theme)
+	ti.Placeholder = "folder name…"
+	ti.Value = o.input
+	ti.Icon = icons.FolderNew
+	ti.Active = true
 
-	inputAreaW := innerW - iconCellW
-	var inputCell string
-	if o.input == "" {
-		inputCell = lipgloss.NewStyle().
-			Width(inputAreaW).
-			Background(theme.Surface).
-			Foreground(theme.TextFaint).
-			Render("folder name…")
-	} else {
-		displayInput := util.TruncateText(util.SingleLine(o.input), inputAreaW-1) + "▌"
-		inputCell = lipgloss.NewStyle().
-			Width(inputAreaW).
-			Background(theme.Surface).
-			Foreground(theme.Text).
-			Bold(true).
-			Render(displayInput)
-	}
-	inputLine := iconCell + inputCell
+	inputLine := ti.Render(innerW)
 
 	// ── Divider ──────────────────────────────────────────────────────────────
-	sep := lipgloss.NewStyle().
-		Foreground(theme.Border).
-		Background(theme.Surface).
-		Width(innerW).
-		Render(strings.Repeat("─", innerW))
+	sep := components.Divider(theme, innerW)
 
 	// ── Footer: hints or error ────────────────────────────────────────────────
 	// Error state: replace hints with icon + message.
@@ -214,13 +191,5 @@ func (o *NewFolderOverlay) View() string {
 
 	content := strings.Join([]string{titleLine, blank, inputLine, sep, footerLine}, "\n")
 
-	box := lipgloss.NewStyle().
-		Width(cw).
-		Background(theme.Surface).
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(theme.Accent).
-		Padding(1, 2).
-		Render(content)
-
-	return lipgloss.Place(o.width, o.height, lipgloss.Center, lipgloss.Center, box)
+	return components.ModalBox(theme, content, cw, 0, o.width, o.height)
 }

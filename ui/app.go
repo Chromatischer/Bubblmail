@@ -1390,15 +1390,25 @@ func (a *App) handleLeftPress(x, y int) (tea.Model, tea.Cmd) {
 			a.drag.zoneX0, a.drag.zoneX1 = 0, a.width-1
 			a.drag.zoneY0, a.drag.zoneY1 = statusY, a.height-1
 		default:
-			// Content zone — copyable in the reader and composer.
-			a.drag.zoneX0, a.drag.zoneX1 = sidebarW, a.width-1
-			a.drag.zoneY0, a.drag.zoneY1 = headerH, statusY-1
-			a.drag.canCopy = a.viewID == ViewReader || a.comp.IsActive()
+			if a.comp.IsActive() {
+				// Restrict copy zone to the body text area only: excludes
+				// box borders, padding, field labels, title, dividers, and hints.
+				x0, y0, x1, y1 := a.comp.BodyDragZone(headerH)
+				a.drag.zoneX0, a.drag.zoneX1 = x0, x1
+				a.drag.zoneY0, a.drag.zoneY1 = y0, y1
+				a.drag.canCopy = true
+			} else {
+				// Content zone — copyable in the reader.
+				a.drag.zoneX0, a.drag.zoneX1 = sidebarW, a.width-1
+				a.drag.zoneY0, a.drag.zoneY1 = headerH, statusY-1
+				a.drag.canCopy = a.viewID == ViewReader
+			}
 		}
 	}
 
-	// Sidebar click
-	if a.showSidebar && x < sidebarRenderedWidth() {
+	// Sidebar click — skip when any overlay is active (sidebar is not rendered then).
+	overlayActive := a.comp.IsActive() || a.searchOverlay.IsActive() || a.folderPicker.IsActive() || a.newFolder.IsActive()
+	if !overlayActive && a.showSidebar && x < sidebarRenderedWidth() {
 		contentY := y - headerH
 		acct, folder, ok := a.sidebar.HitTest(x, contentY)
 		if ok && folder != "" {
@@ -1431,6 +1441,60 @@ func (a *App) handleLeftPress(x, y int) (tea.Model, tea.Cmd) {
 	// Content area click
 	if y >= headerH && y < statusY {
 		contentY := y - headerH
+
+		// Overlay hit testing — overlays cover the full content area and consume
+		// all clicks so the underlying views are not accidentally activated.
+		if a.comp.IsActive() {
+			if a.comp.IsPrompting() {
+				if key := a.comp.HitTestDraftPrompt(x, contentY); key != "" {
+					a.comp.HandleKey(key)
+				}
+			} else if field := a.comp.HitTestField(contentY); field >= 0 {
+				a.comp.SetFocus(field)
+			} else if key := a.comp.HitTestFooter(x, contentY); key != "" {
+				a.comp.HandleKey(key)
+				if r := a.comp.Result(); r != nil {
+					cmd := a.handleComposerResult(r)
+					a.comp.ClearResult()
+					return a, cmd
+				}
+			}
+			return a, nil
+		}
+
+		if a.searchOverlay.IsActive() {
+			idx := a.searchOverlay.HitTestResult(contentY)
+			if idx >= 0 {
+				if idx == a.searchOverlay.Cursor() {
+					// Second click on the focused result: open it.
+					return a.handleKey(syntheticKeyMsg("enter"))
+				}
+				a.searchOverlay.SetCursor(idx)
+			}
+			return a, nil
+		}
+
+		if a.folderPicker.IsActive() {
+			idx := a.folderPicker.HitTestFolder(contentY)
+			if idx >= 0 {
+				a.folderPicker.SetCursor(idx)
+				closed := a.folderPicker.HandleKey("enter")
+				if closed {
+					folder := a.folderPicker.Result()
+					a.folderPicker.Close()
+					if folder != nil {
+						return a, a.moveMessageToFolder(folder.Name)
+					}
+				}
+			}
+			return a, nil
+		}
+
+		if a.newFolder.IsActive() {
+			// New-folder overlay has no clickable rows; consume the click.
+			return a, nil
+		}
+
 		sidebarOff := 0
 		if a.showSidebar {
 			sidebarOff = sidebarRenderedWidth()

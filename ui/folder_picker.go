@@ -5,6 +5,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/bubblmail/bubblmail/data"
+	"github.com/bubblmail/bubblmail/ui/components"
 	"github.com/bubblmail/bubblmail/ui/icons"
 	"github.com/bubblmail/bubblmail/util"
 	"github.com/charmbracelet/lipgloss"
@@ -19,8 +20,7 @@ type FolderPickerOverlay struct {
 	all      []*data.Folder // all selectable folders (excluding current)
 	filtered []*data.Folder // folders matching the current query
 	query    string
-	cursor   int
-	offset   int
+	list     components.ScrollList
 	result   *data.Folder
 }
 
@@ -46,8 +46,7 @@ func (f *FolderPickerOverlay) Open(folders []*data.Folder, currentFolder string)
 	f.all = sel
 	f.filtered = sel
 	f.query = ""
-	f.cursor = 0
-	f.offset = 0
+	f.list.Reset()
 	f.result = nil
 	f.active = true
 }
@@ -76,6 +75,38 @@ func (f *FolderPickerOverlay) ClearResult() {
 	f.result = nil
 }
 
+// SetCursor moves the cursor to the given filtered-list index, adjusting scroll offset.
+func (f *FolderPickerOverlay) SetCursor(filteredIdx int) {
+	if filteredIdx < 0 || filteredIdx >= len(f.filtered) {
+		return
+	}
+	f.list.Cursor = filteredIdx
+	lh := f.listHeight()
+	if f.list.Cursor < f.list.Offset {
+		f.list.Offset = f.list.Cursor
+	} else if f.list.Cursor >= f.list.Offset+lh {
+		f.list.Offset = f.list.Cursor - lh + 1
+	}
+}
+
+// HitTestFolder returns the filtered-list index for a click at the given
+// content-area y, or -1 if no folder row was hit.
+//
+// Geometry: rendered box height = (listH+4)+2; boxY0 = (height-renderedH)/2.
+// Inside the box: border(1)+padding(1)+title(1)+blank(1)+input(1)+sep(1) = 6
+// rows of overhead before folder rows.
+func (f *FolderPickerOverlay) HitTestFolder(contentY int) int {
+	listH := f.listHeight()
+	boxH := listH + 4
+	boxY0 := (f.height - (boxH + 2)) / 2
+	rowY0 := boxY0 + 6
+	i := contentY - rowY0
+	if i < 0 || i >= listH || f.list.Offset+i >= len(f.filtered) {
+		return -1
+	}
+	return f.list.Offset + i
+}
+
 // applyFilter recomputes filtered from all using the current query.
 func (f *FolderPickerOverlay) applyFilter() {
 	if f.query == "" {
@@ -93,12 +124,6 @@ func (f *FolderPickerOverlay) applyFilter() {
 	f.filtered = out
 }
 
-// resetCursor resets cursor and offset to the top of the list.
-func (f *FolderPickerOverlay) resetCursor() {
-	f.cursor = 0
-	f.offset = 0
-}
-
 // HandleKey processes a key. Returns closed=true when done; check Result() for selection.
 func (f *FolderPickerOverlay) HandleKey(key string) (closed bool) {
 	switch key {
@@ -106,38 +131,28 @@ func (f *FolderPickerOverlay) HandleKey(key string) (closed bool) {
 		if f.query != "" {
 			f.query = ""
 			f.applyFilter()
-			f.resetCursor()
+			f.list.Reset()
 			return false
 		}
 		return true
 
 	case "enter":
-		if len(f.filtered) > 0 && f.cursor < len(f.filtered) {
-			f.result = f.filtered[f.cursor]
+		if len(f.filtered) > 0 && f.list.Cursor < len(f.filtered) {
+			f.result = f.filtered[f.list.Cursor]
 		}
 		return true
 
 	case "up", "k":
-		if f.cursor > 0 {
-			f.cursor--
-			if f.cursor < f.offset {
-				f.offset--
-			}
-		}
+		f.list.MoveUp()
 
 	case "down", "j":
-		if f.cursor < len(f.filtered)-1 {
-			f.cursor++
-			if f.cursor >= f.offset+f.listHeight() {
-				f.offset++
-			}
-		}
+		f.list.MoveDown(len(f.filtered), f.listHeight())
 
 	case "ctrl+u":
 		if f.query != "" {
 			f.query = ""
 			f.applyFilter()
-			f.resetCursor()
+			f.list.Reset()
 		}
 
 	case "backspace", "ctrl+h":
@@ -145,7 +160,7 @@ func (f *FolderPickerOverlay) HandleKey(key string) (closed bool) {
 			_, size := utf8.DecodeLastRuneInString(f.query)
 			f.query = f.query[:len(f.query)-size]
 			f.applyFilter()
-			f.resetCursor()
+			f.list.Reset()
 		}
 
 	default:
@@ -153,7 +168,7 @@ func (f *FolderPickerOverlay) HandleKey(key string) (closed bool) {
 		if len(key) == 1 && key >= " " {
 			f.query += key
 			f.applyFilter()
-			f.resetCursor()
+			f.list.Reset()
 		}
 	}
 	return false
@@ -175,7 +190,7 @@ func (f *FolderPickerOverlay) listHeight() int {
 // innerWidth computes the content area width that fits all folder names.
 // Row layout: " " + icon(1) + " " + name → prefixW=3 + name width.
 func (f *FolderPickerOverlay) innerWidth() int {
-	const prefixW = 3     // " " + icon(1) + " "
+	const prefixW = 3 // " " + icon(1) + " "
 	const titleStr = "Move to folder"
 	w := util.VisibleWidth(icons.FolderOpen+" "+titleStr) + 1
 	for _, folder := range f.all {
@@ -261,31 +276,14 @@ func (f *FolderPickerOverlay) View() string {
 		Width(innerW).
 		Render(icons.FolderOpen + " Move to folder")
 
-	// Input row: split into two Width(N) plain cells so every character has
-	// an explicit Background(Surface) — no stray resets between segments.
-	// Cell 1: " " + search icon (3 cols). Cell 2: query/placeholder (innerW-3 cols).
-	const iconCellW = 3 // " " + icon(1) + implicit pad(1)
-	iconCell := lipgloss.NewStyle().
-		Background(theme.Surface).
-		Foreground(theme.Accent).
-		Width(iconCellW).
-		Render(" " + icons.Search)
+	// Input row
+	ti := components.NewTextInput(theme)
+	ti.Placeholder = "type to filter…"
+	ti.Value = f.query
+	ti.Icon = icons.Search
+	ti.Active = true
 
-	var textCell string
-	if f.query == "" {
-		textCell = lipgloss.NewStyle().
-			Background(theme.Surface).
-			Foreground(theme.TextFaint).
-			Width(innerW - iconCellW).
-			Render("type to filter…")
-	} else {
-		textCell = lipgloss.NewStyle().
-			Background(theme.Surface).
-			Foreground(theme.Text).
-			Width(innerW - iconCellW).
-			Render(util.TruncateText(util.SingleLine(f.query)+"▌", innerW-iconCellW))
-	}
-	inputLine := iconCell + textCell
+	inputLine := ti.Render(innerW)
 
 	// Folder rows
 	isFiltering := f.query != ""
@@ -304,9 +302,9 @@ func (f *FolderPickerOverlay) View() string {
 			Render(emptyMsg))
 	}
 
-	for i := f.offset; i < len(f.filtered) && i < f.offset+listH; i++ {
+	for i := f.list.Offset; i < len(f.filtered) && i < f.list.Offset+listH; i++ {
 		folder := f.filtered[i]
-		isSelected := i == f.cursor
+		isSelected := i == f.list.Cursor
 		icon := pickerFolderIcon(folder)
 
 		// Build the display name as a plain string.
@@ -345,11 +343,7 @@ func (f *FolderPickerOverlay) View() string {
 		rows = append(rows, blank)
 	}
 
-	sep := lipgloss.NewStyle().
-		Foreground(theme.Border).
-		Background(theme.Surface).
-		Width(innerW).
-		Render(strings.Repeat("─", innerW))
+	sep := components.Divider(theme, innerW)
 
 	// Content: title + blank + input + separator + folder rows
 	contentParts := []string{titleLine, "", inputLine, sep}
@@ -358,14 +352,5 @@ func (f *FolderPickerOverlay) View() string {
 
 	boxH := listH + 4 // title(1) + blank(1) + input(1) + sep(1) + listH rows
 
-	box := lipgloss.NewStyle().
-		Width(cw).
-		Height(boxH).
-		Background(theme.Surface).
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(theme.Accent).
-		Padding(1, 2).
-		Render(content)
-
-	return lipgloss.Place(f.width, f.height, lipgloss.Center, lipgloss.Center, box)
+	return components.ModalBox(theme, content, cw, boxH, f.width, f.height)
 }

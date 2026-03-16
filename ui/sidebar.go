@@ -238,15 +238,19 @@ func (sb *Sidebar) View() string {
 				if isActive {
 					marker = marker.Background(theme.Accent).Foreground(theme.Background)
 				}
-				indent = baseIndent + marker.Render(">") + " "
+				indent = "  " + baseIndent + marker.Render(">") + " "
 			} else {
-				indent = baseIndent + "  "
+				indent = "  " + baseIndent + "  "
 			}
 
 			var line string
-			if f.Unread > 0 && !isActive {
-				countStyle := lipgloss.NewStyle().
-					Foreground(theme.Unread)
+			if f.Unread > 0 {
+				var countStyle lipgloss.Style
+				if isActive {
+					countStyle = lipgloss.NewStyle().Foreground(theme.Background).Background(theme.Accent)
+				} else {
+					countStyle = lipgloss.NewStyle().Foreground(theme.Unread)
+				}
 				unreadStr := countStyle.Render(fmt.Sprintf(" %d", f.Unread))
 				available := sb.width - lipgloss.Width(indent) - 2 - lipgloss.Width(unreadStr)
 				if available < 0 {

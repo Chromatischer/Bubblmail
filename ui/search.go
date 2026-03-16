@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/bubblmail/bubblmail/data"
+	"github.com/bubblmail/bubblmail/ui/components"
 	"github.com/bubblmail/bubblmail/ui/icons"
 	"github.com/bubblmail/bubblmail/util"
 	"github.com/charmbracelet/lipgloss"
@@ -17,8 +18,7 @@ type SearchOverlay struct {
 	active   bool
 	query    string
 	results  []*SearchResult
-	cursor   int
-	offset   int
+	list     components.ScrollList
 	loading  bool
 	minChars int
 
@@ -55,8 +55,7 @@ func (s *SearchOverlay) Open() {
 	s.active = true
 	s.query = ""
 	s.results = nil
-	s.cursor = 0
-	s.offset = 0
+	s.list.Reset()
 	s.loading = false
 	s.debounceID = 0
 }
@@ -107,8 +106,7 @@ func (s *SearchOverlay) SetResults(msgs []*data.Message) {
 	}
 	s.results = results
 	s.loading = false
-	s.cursor = 0
-	s.offset = 0
+	s.list.Reset()
 }
 
 // SetSearchResults updates results from a streaming semantic search.
@@ -119,23 +117,49 @@ func (s *SearchOverlay) SetSearchResults(results []*SearchResult, loading bool) 
 	s.results = results
 	s.loading = loading
 	if len(s.results) == 0 {
-		s.cursor = 0
-		s.offset = 0
+		s.list.Reset()
 	}
-	if s.cursor >= len(s.results) {
-		s.cursor = len(s.results) - 1
-	}
-	if s.cursor < 0 {
-		s.cursor = 0
-	}
+	s.list.Clamp(len(s.results))
 }
 
 // SelectedMessage returns the currently focused result, or nil.
 func (s *SearchOverlay) SelectedMessage() *data.Message {
-	if s.cursor < 0 || s.cursor >= len(s.results) {
+	if s.list.Cursor < 0 || s.list.Cursor >= len(s.results) {
 		return nil
 	}
-	return s.results[s.cursor].Message
+	return s.results[s.list.Cursor].Message
+}
+
+// Cursor returns the current cursor position.
+func (s *SearchOverlay) Cursor() int { return s.list.Cursor }
+
+// SetCursor moves the cursor to the given result index, adjusting the scroll offset.
+func (s *SearchOverlay) SetCursor(idx int) {
+	if idx < 0 || idx >= len(s.results) {
+		return
+	}
+	s.list.Cursor = idx
+	vr := s.visibleRowCount()
+	if s.list.Cursor < s.list.Offset {
+		s.list.Offset = s.list.Cursor
+	} else if s.list.Cursor >= s.list.Offset+vr {
+		s.list.Offset = s.list.Cursor - vr + 1
+	}
+}
+
+// HitTestResult returns the result index for a click at the given content-area y,
+// or -1 if no result row was hit.
+//
+// Geometry: the search box fills the content area with boxY0=1 (1-row gap from
+// lipgloss.Place centering). Inside the box: border(1)+padding(1)=2 rows of
+// overhead, then inputRow(1)+divider(1)=2 more, so result rows start at y=5.
+func (s *SearchOverlay) HitTestResult(contentY int) int {
+	const resultY0 = 5
+	i := contentY - resultY0
+	if i < 0 || i >= s.visibleRowCount() || s.list.Offset+i >= len(s.results) {
+		return -1
+	}
+	return s.list.Offset + i
 }
 
 // HandleKey processes a key press. Returns (queryChanged, closed, selected).
@@ -150,32 +174,20 @@ func (s *SearchOverlay) HandleKey(key string) (queryChanged bool, closed bool, s
 		}
 		return false, false, false
 	case "up", "k":
-		if s.cursor > 0 {
-			s.cursor--
-			if s.cursor < s.offset {
-				s.offset--
-			}
-		}
+		s.list.MoveUp()
 	case "down", "j":
-		if s.cursor < len(s.results)-1 {
-			s.cursor++
-			if s.cursor >= s.offset+s.visibleRowCount() {
-				s.offset++
-			}
-		}
+		s.list.MoveDown(len(s.results), s.visibleRowCount())
 	case "backspace", "ctrl+h":
 		if len(s.query) > 0 {
 			runes := []rune(s.query)
 			s.query = string(runes[:len(runes)-1])
-			s.cursor = 0
-			s.offset = 0
+			s.list.Reset()
 			return true, false, false
 		}
 	default:
 		if len(key) == 1 && key[0] >= 32 {
 			s.query += key
-			s.cursor = 0
-			s.offset = 0
+			s.list.Reset()
 			return true, false, false
 		}
 	}
@@ -226,43 +238,16 @@ func (s *SearchOverlay) View() string {
 	}
 
 	// ── Input row ────────────────────────────────────────────────────────────
-	// Two adjacent Width(N) cells, each with explicit Background(Surface).
-	// iconCellW=2: icon(1) + 1 padding from Width(2).
-	const iconCellW = 2
-	iconCell := lipgloss.NewStyle().
-		Width(iconCellW).
-		Background(surf).
-		Foreground(theme.Accent).
-		Render(icons.Search)
+	ti := components.NewTextInput(theme)
+	ti.Placeholder = "Search mail…"
+	ti.Value = s.query
+	ti.Icon = icons.Search
+	ti.Active = true
 
-	inputAreaW := innerW - iconCellW
-	if inputAreaW < 1 {
-		inputAreaW = 1
-	}
-	var inputCell string
-	if s.query == "" {
-		inputCell = lipgloss.NewStyle().
-			Width(inputAreaW).
-			Background(surf).
-			Foreground(theme.TextFaint).
-			Render("Search mail…")
-	} else {
-		// leave 1 col for the cursor glyph; truncate then append it
-		displayQ := util.TruncateText(util.SingleLine(s.query), inputAreaW-1) + "▌"
-		inputCell = lipgloss.NewStyle().
-			Width(inputAreaW).
-			Background(surf).
-			Foreground(theme.Text).
-			Bold(true).
-			Render(displayQ)
-	}
-	inputRow := iconCell + inputCell
+	inputRow := ti.Render(innerW)
 
 	// ── Divider ──────────────────────────────────────────────────────────────
-	divider := lipgloss.NewStyle().
-		Background(surf).
-		Foreground(theme.Border).
-		Render(strings.Repeat("─", innerW))
+	divider := components.Divider(theme, innerW)
 
 	// ── Result rows ──────────────────────────────────────────────────────────
 	blankLine := lipgloss.NewStyle().Background(surf).Width(innerW).Render("")
@@ -302,8 +287,8 @@ func (s *SearchOverlay) View() string {
 			resultLines = append(resultLines, blankLine)
 		}
 	} else {
-		for i := s.offset; i < len(s.results) && i < s.offset+vr; i++ {
-			resultLines = append(resultLines, s.renderRow(s.results[i], i == s.cursor, innerW, sp))
+		for i := s.list.Offset; i < len(s.results) && i < s.list.Offset+vr; i++ {
+			resultLines = append(resultLines, s.renderRow(s.results[i], i == s.list.Cursor, innerW, sp))
 		}
 		for len(resultLines) < vr {
 			resultLines = append(resultLines, blankLine)
@@ -343,16 +328,7 @@ func (s *SearchOverlay) View() string {
 	lines = append(lines, resultLines...)
 	lines = append(lines, footerStr)
 
-	box := lipgloss.NewStyle().
-		Width(boxW).
-		Height(boxH).
-		Background(surf).
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(theme.Accent).
-		Padding(1, 2).
-		Render(strings.Join(lines, "\n"))
-
-	return lipgloss.Place(s.width, s.height, lipgloss.Center, lipgloss.Center, box)
+	return components.ModalBox(theme, strings.Join(lines, "\n"), boxW, boxH, s.width, s.height)
 }
 
 // renderRow renders a single search result at the given width.

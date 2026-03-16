@@ -356,6 +356,156 @@ func (c *Composer) removeAttachment(idx int) {
 	}
 }
 
+// IsPrompting returns true while the continue/discard draft prompt is showing.
+func (c *Composer) IsPrompting() bool { return c.prompting }
+
+// BodyDragZone returns the screen-coordinate bounding box of the body text
+// content — the only area that makes sense to drag-select for copying.
+// headerH is the height of the app header so the caller can convert from
+// content-area to screen coordinates.
+//
+// Geometry (all in screen coords, y=0 is terminal top):
+//   x: skip left-border(1) + left-pad(2) + label(10) + sep(3) = 16 cols from box left
+//   y: border(1)+pad(1)+title(1)+from(1)+divider(1)+3fields(3)+sectionDiv(1) = 9 rows down
+func (c *Composer) BodyDragZone(headerH int) (x0, y0, x1, y1 int) {
+	if !c.active || c.prompting {
+		return
+	}
+	boxWidth := c.width - 16
+	if boxWidth > 110 {
+		boxWidth = 110
+	}
+	if boxWidth < 60 {
+		boxWidth = 60
+	}
+	boxX0 := (c.width - boxWidth - 2) / 2
+	// x: past left-border(1) + left-pad(2) + label(composerLabelWidth) + sep(" │ "=3)
+	x0 = boxX0 + 1 + 2 + composerLabelWidth + 3
+	// x: last content col, before right-pad(2) + right-border(1)
+	x1 = boxX0 + boxWidth - 2
+	// y: 9 rows of overhead (see comment above), then bodyHeight rows of text
+	y0 = headerH + 9
+	y1 = y0 + c.bodyHeight() - 1
+	return
+}
+
+// SetFocus moves keyboard focus to the given field index (0=To,1=CC,2=Subject,3=Body).
+func (c *Composer) SetFocus(field int) {
+	if field < 0 || field > len(c.fields) {
+		return
+	}
+	c.focused = field
+	c.ensureBodyVisible()
+}
+
+// HitTestField returns the field index for a click at the given content-area y,
+// or -1 if no field was hit.
+//
+// Geometry: composer box is Top-aligned (boxY0=0). Inside the box:
+// border(1)+padding(1)=2 rows overhead, then title(1)+from(1)+divider(1)=3 more.
+// Fields start at content-area y=5: To(5), CC(6), Subject(7), sectionDiv(8), Body(9+).
+func (c *Composer) HitTestField(contentY int) int {
+	if !c.active || c.prompting {
+		return -1
+	}
+	switch contentY {
+	case 5:
+		return 0 // To
+	case 6:
+		return 1 // CC
+	case 7:
+		return 2 // Subject
+	}
+	// Body occupies rows 9 through 8+bodyHeight.
+	bodyY0 := 9
+	if contentY >= bodyY0 && contentY < bodyY0+c.bodyHeight() {
+		return 3
+	}
+	return -1
+}
+
+// HitTestDraftPrompt returns "c" (Continue) or "d" (Discard) for a click on
+// the hint row of the draft prompt dialog, or "" if not on that row.
+//
+// Geometry: prompt box has 5 content rows + 2 padding + 2 border = 9 rows total;
+// boxY0 = (height-9)/2. Hint row is at boxY0+6. Left half = Continue, right = Discard.
+func (c *Composer) HitTestDraftPrompt(x, contentY int) string {
+	boxY0 := (c.height - 9) / 2
+	if contentY != boxY0+6 {
+		return ""
+	}
+	if x < c.width/2 {
+		return "c"
+	}
+	return "d"
+}
+
+// HitTestFooter returns the key string for a click on the in-box footer hint
+// row, or "" if the click doesn't land on an actionable hint.
+//
+// Geometry: footer hint row is at content-area y = 10 + bodyHeight + attachRows.
+// Hint x positions are computed the same way View() does it.
+func (c *Composer) HitTestFooter(x, contentY int) string {
+	if !c.active || c.prompting {
+		return ""
+	}
+	expectedY := 10 + c.bodyHeight() + c.attachSectionRows()
+	if contentY != expectedY {
+		return ""
+	}
+
+	boxWidth := c.width - 16
+	if boxWidth > 110 {
+		boxWidth = 110
+	}
+	if boxWidth < 60 {
+		boxWidth = 60
+	}
+	boxX0 := (c.width - boxWidth - 2) / 2
+	innerW := boxWidth - 4
+
+	type hintItem struct{ icon, key, desc string }
+	hints := []hintItem{
+		{icons.Send, "ctrl+s", "send"},
+		{icons.ChevronRight, "tab", "next field"},
+		{icons.ArrowUpDown, "", "scroll"}, // pgup/pgdn not a single key
+		{icons.Attachment, "@", "attach"},
+	}
+	if len(c.attachments) > 0 {
+		anonDesc := "anonymize"
+		if c.anonymize {
+			anonDesc = "anonymize ON"
+		}
+		hints = append(hints, hintItem{icons.Label, "ctrl+r", anonDesc})
+	}
+	hints = append(hints, hintItem{icons.Close, "esc", "cancel"})
+
+	// Reproduce the plain-width calculation from View() to get the same padLeft.
+	var plainParts []string
+	for _, h := range hints {
+		plainParts = append(plainParts, h.icon+" "+h.desc+" ("+h.key+")")
+	}
+	plainW := len([]rune(strings.Join(plainParts, "  ")))
+	padLeft := (innerW - plainW) / 2
+	if padLeft < 0 {
+		padLeft = 0
+	}
+
+	// Hit-test each hint: content starts at boxX0+border(1)+pad(2) = boxX0+3.
+	curX := boxX0 + 3 + padLeft
+	for i, h := range hints {
+		if i > 0 {
+			curX += 2 // "  " gap between hints
+		}
+		partW := len([]rune(h.icon + " " + h.desc + " (" + h.key + ")"))
+		if x >= curX && x < curX+partW {
+			return h.key // "" for the scroll hint = no action
+		}
+		curX += partW
+	}
+	return ""
+}
+
 // HandleMouse processes mouse input for composer scrolling.
 func (c *Composer) HandleMouse(msg tea.MouseMsg) bool {
 	if !c.active {
