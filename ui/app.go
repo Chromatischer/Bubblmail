@@ -1135,7 +1135,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.inboxView.ClearSelection()
 		}
 		a.moveDown()
-		return a, a.maybeLoadMore()
+		return a, tea.Batch(a.markFocusedThreadRead(), a.maybeLoadMore())
 
 	case "k", "up":
 		a.closeQuickMenu()
@@ -1143,6 +1143,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.inboxView.ClearSelection()
 		}
 		a.moveUp()
+		return a, a.markFocusedThreadRead()
 
 	case "ctrl+d":
 		a.closeQuickMenu()
@@ -1150,7 +1151,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.inboxView.ClearSelection()
 		}
 		a.pageDown()
-		return a, a.maybeLoadMore()
+		return a, tea.Batch(a.markFocusedThreadRead(), a.maybeLoadMore())
 
 	case "ctrl+u":
 		a.closeQuickMenu()
@@ -1158,6 +1159,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.inboxView.ClearSelection()
 		}
 		a.pageUp()
+		return a, a.markFocusedThreadRead()
 
 	case "g":
 		a.closeQuickMenu()
@@ -1165,6 +1167,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.inboxView.ClearSelection()
 		}
 		a.goToTop()
+		return a, a.markFocusedThreadRead()
 
 	case "G":
 		a.closeQuickMenu()
@@ -1172,7 +1175,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.inboxView.ClearSelection()
 		}
 		a.goToBottom()
-		return a, a.maybeLoadMore()
+		return a, tea.Batch(a.markFocusedThreadRead(), a.maybeLoadMore())
 
 	case "enter":
 		if a.viewID == ViewReader && a.readerView.AttachFocusActive() {
@@ -2756,6 +2759,38 @@ func removeByUID(msgs []*data.Message, uid uint32) []*data.Message {
 		}
 	}
 	return result
+}
+
+// markFocusedThreadRead marks the focused inbox thread's latest message as read
+// and syncs the change to cache and IMAP immediately. Safe to call after any
+// navigation — it is a no-op when no thread is focused or it is already read.
+func (a *App) markFocusedThreadRead() tea.Cmd {
+	if a.viewID != ViewInbox && a.viewID != ViewSmartFolder {
+		return nil
+	}
+	t := a.inboxView.SelectedThread()
+	if t == nil {
+		return nil
+	}
+	latest := t.Latest()
+	if latest == nil || latest.IsRead() {
+		return nil
+	}
+	newFlags := append(latest.Flags, data.FlagSeen)
+	_ = a.store.SetFlags(latest.AccountName, latest.FolderName, latest.UID, newFlags)
+	latest.Flags = newFlags
+	t.HasUnread = false
+	for _, m := range t.Messages {
+		if !m.IsRead() {
+			t.HasUnread = true
+			break
+		}
+	}
+	client, ok := a.imapClients[latest.AccountName]
+	if !ok {
+		return nil
+	}
+	return client.SetFlag(latest.FolderName, latest.UID, data.FlagSeen, true)
 }
 
 func toggleFlag(flags []data.Flag, f data.Flag, add bool) []data.Flag {
