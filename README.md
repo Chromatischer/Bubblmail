@@ -28,8 +28,6 @@ A keyboard-driven terminal email client built for people who live in the shell. 
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-*Screenshot placeholder — real UI screenshots coming soon.*
-
 ---
 
 ## Features
@@ -237,11 +235,9 @@ Pressing the opposite direction, or any navigation key (`j`/`k` etc.), closes th
 | Click folder row | Move cursor; click again to open |
 | Click status bar hint | Trigger that action |
 | Click reader button (Open / Download / Editor / Copy Plain / Copy JSON / Reject) | Execute that button |
-| Drag to select text | Highlight selection; release to copy as **Markdown** (bold → `**…**`, italic → `_…_`) |
+| Drag to select text | Highlight selection in the reader or composer; release to copy as **Markdown** (bold → `**…**`, italic → `_…_`) |
 | Ctrl + release drag | Copy selection as plain text instead |
 | Scroll wheel | Scroll current view |
-
-Selection is scoped to the element where the drag begins — dragging inside the email body will not capture sidebar or header text.
 
 ### Composer
 
