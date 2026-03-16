@@ -81,6 +81,19 @@ func (v *InboxView) AppendThreads(threads []*data.Thread) {
 // Len returns the number of threads loaded.
 func (v *InboxView) Len() int { return len(v.threads) }
 
+// HitTestThread returns the thread index for a click at contentY (rows from the
+// top of the inbox area), or -1 if the click doesn't land on a thread row.
+func (v *InboxView) HitTestThread(contentY int) int {
+	if contentY < 0 || len(v.threads) == 0 {
+		return -1
+	}
+	idx := v.offset + contentY/2 // each thread occupies 2 rows
+	if idx >= 0 && idx < len(v.threads) {
+		return idx
+	}
+	return -1
+}
+
 // CursorPos returns the current cursor index.
 func (v *InboxView) CursorPos() int { return v.cursor }
 

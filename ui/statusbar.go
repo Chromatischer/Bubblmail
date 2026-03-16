@@ -8,6 +8,12 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// StatusHitZone records the screen x-range and action key for one hint in the hints row.
+type StatusHitZone struct {
+	X0, X1    int
+	ActionKey string
+}
+
 // StatusBar renders the bottom hint bar with context-sensitive keys and flash messages.
 type StatusBar struct {
 	styles    *Styles
@@ -18,6 +24,7 @@ type StatusBar struct {
 	loading   bool
 	embedding embeddingStats
 	moveHint  string // suggested destination folder for quick-move
+	hitZones  []StatusHitZone
 }
 
 var spinnerFrames = []string{
@@ -70,6 +77,46 @@ func (sb *StatusBar) SetMoveHint(hint string) {
 
 // MoveHint returns the current move hint value.
 func (sb *StatusBar) MoveHint() string { return sb.moveHint }
+
+// HitTest returns the action key for the hint clicked at (x, y), where y is
+// relative to the top of the status bar (0 = divider, 1 = hints row).
+// Returns "" if no actionable hint was hit.
+func (sb *StatusBar) HitTest(x, y int) string {
+	if y != 1 {
+		return ""
+	}
+	for _, z := range sb.hitZones {
+		if x >= z.X0 && x <= z.X1 {
+			return z.ActionKey
+		}
+	}
+	return ""
+}
+
+// hintActionKey maps a display key string (as shown in the status bar) to the
+// tea.KeyMsg string expected by handleKey. Returns "" for informational hints.
+func hintActionKey(displayKey string) string {
+	switch displayKey {
+	case "j/k":
+		return "j"
+	case "←/→":
+		return "right"
+	case "l/r":
+		return "l"
+	case "esc/q/h":
+		return "esc"
+	case `esc/\`:
+		return "esc"
+	case "esc/q":
+		return "esc"
+	case "pgup/pgdn":
+		return "ctrl+d"
+	case "type":
+		return "" // informational only
+	default:
+		return displayKey
+	}
+}
 
 // AdvanceSpinner advances the spinner frame.
 func (sb *StatusBar) AdvanceSpinner() {
@@ -205,6 +252,23 @@ func (sb *StatusBar) View(context string) string {
 	}
 
 	hintsStr := strings.Join(parts, sepStyle.Render("  "))
+
+	// Build mouse hit zones — one per hint, using visual widths.
+	// The hints row has Padding(0,1), so hints start at x=1. Hints are
+	// separated by a 2-column gap ("  ").
+	var newHitZones []StatusHitZone
+	curX := 1
+	for i, part := range parts {
+		if i > 0 {
+			curX += 2 // "  " separator
+		}
+		w := lipgloss.Width(part)
+		if ak := hintActionKey(hints[i].key); ak != "" {
+			newHitZones = append(newHitZones, StatusHitZone{X0: curX, X1: curX + w - 1, ActionKey: ak})
+		}
+		curX += w
+	}
+	sb.hitZones = newHitZones
 
 	// Inline right side: loading + embedding stats (short, predictable width).
 	var inlineParts []string

@@ -8,6 +8,7 @@ import (
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/data"
 	"github.com/bubblmail/bubblmail/render"
+	"github.com/bubblmail/bubblmail/ui/components"
 	"github.com/bubblmail/bubblmail/ui/icons"
 	"github.com/bubblmail/bubblmail/util"
 	"github.com/charmbracelet/lipgloss"
@@ -32,6 +33,10 @@ type ReaderView struct {
 	lines             []string // all rendered lines
 	// msgLineOffsets[i] is the first line index of thread.Messages[i].
 	msgLineOffsets []int
+	// Button-row tracking for mouse hit testing.
+	attachButtonScrollRow int // index in v.lines where attach action buttons appear, or -1
+	eventButtonScrollRow  int // index in v.lines where event action buttons appear (thread mode), or -1
+	eventButtonHeaderRow  int // row within static single-mode header where event buttons appear, or -1
 }
 
 // NewReaderView creates a new reader view.
@@ -57,6 +62,9 @@ func (v *ReaderView) SetMessage(msg *data.Message) {
 	v.attachFocus = -1
 	v.attachActionFocus = 0
 	v.scrollY = 0
+	v.attachButtonScrollRow = -1
+	v.eventButtonScrollRow = -1
+	v.eventButtonHeaderRow = -1
 	v.buildLines()
 }
 
@@ -69,6 +77,9 @@ func (v *ReaderView) SetThread(t *data.Thread) {
 	v.attachFocus = -1
 	v.attachActionFocus = 0
 	v.scrollY = 0
+	v.attachButtonScrollRow = -1
+	v.eventButtonScrollRow = -1
+	v.eventButtonHeaderRow = -1
 	v.buildLines()
 	// Default scroll position: start of the latest message.
 	if len(v.msgLineOffsets) > 1 {
@@ -215,6 +226,98 @@ func (v *ReaderView) FocusedAttachmentAction() string {
 	}
 }
 
+// HitTestContent tests a mouse click at (contentY, x), where contentY is
+// relative to the top of the reader's allocated area. Returns one of:
+// "attach:open", "attach:download", "attach:editor",
+// "event:plain", "event:json", "event:reject", or "".
+func (v *ReaderView) HitTestContent(contentY, x int) string {
+	if v.thread != nil {
+		absLine := v.scrollY + contentY
+		if v.eventButtonScrollRow >= 0 && absLine == v.eventButtonScrollRow {
+			return readerHitTestEventButtons(x)
+		}
+		if v.attachButtonScrollRow >= 0 && absLine == v.attachButtonScrollRow {
+			return readerHitTestAttachButtons(x)
+		}
+	} else if v.message != nil {
+		hh := v.headerHeight()
+		if contentY < hh {
+			// Click is in the static header — check event buttons.
+			if v.eventButtonHeaderRow >= 0 && contentY == v.eventButtonHeaderRow {
+				return readerHitTestEventButtons(x)
+			}
+			return ""
+		}
+		absLine := v.scrollY + (contentY - hh)
+		if v.attachButtonScrollRow >= 0 && absLine == v.attachButtonScrollRow {
+			return readerHitTestAttachButtons(x)
+		}
+	}
+	return ""
+}
+
+// readerHitTestAttachButtons maps an x coordinate to an attachment button action.
+// Buttons are rendered at indent=12: Open(6) space Download(10) space Editor(8).
+func readerHitTestAttachButtons(x int) string {
+	const indent = 12
+	if x < indent {
+		return ""
+	}
+	if x < indent+6 {
+		return "attach:open"
+	}
+	if x < indent+7 {
+		return ""
+	}
+	if x < indent+17 {
+		return "attach:download"
+	}
+	if x < indent+18 {
+		return ""
+	}
+	if x < indent+26 {
+		return "attach:editor"
+	}
+	return ""
+}
+
+// readerHitTestEventButtons maps an x coordinate to an event button action.
+// Buttons are rendered at indent=12: CopyPlain(12) space CopyJSON(11) space Reject(8).
+func readerHitTestEventButtons(x int) string {
+	const indent = 12
+	if x < indent {
+		return ""
+	}
+	if x < indent+12 {
+		return "event:plain"
+	}
+	if x < indent+13 {
+		return ""
+	}
+	if x < indent+24 {
+		return "event:json"
+	}
+	if x < indent+25 {
+		return ""
+	}
+	if x < indent+33 {
+		return "event:reject"
+	}
+	return ""
+}
+
+// SetAttachActionFocus sets the action button focus directly (0=Open, 1=Download, 2=Editor).
+func (v *ReaderView) SetAttachActionFocus(idx int) {
+	v.attachActionFocus = idx
+	v.rebuildLines()
+}
+
+// SetEventFocus sets the event action button focus directly (0=Copy Plain, 1=Copy JSON, 2=Reject).
+func (v *ReaderView) SetEventFocus(idx int) {
+	v.eventFocus = idx
+	v.rebuildLines()
+}
+
 // messageAttachments returns attachments for the current single message or the
 // latest message in a thread (which gets the interactive attachment panel).
 func (v *ReaderView) messageAttachments() []data.Attachment {
@@ -357,7 +460,12 @@ func (v *ReaderView) buildSingleLines() {
 	} else {
 		v.lines = nil
 	}
-	v.lines = append(v.lines, v.renderAttachmentLines()...)
+	baseOffset := len(v.lines)
+	attachLines := v.renderAttachmentLines()
+	if v.attachButtonScrollRow >= 0 {
+		v.attachButtonScrollRow += baseOffset
+	}
+	v.lines = append(v.lines, attachLines...)
 }
 
 // buildThreadLines renders all messages in the thread as a single scrollable
@@ -369,6 +477,7 @@ func (v *ReaderView) buildThreadLines() {
 		return
 	}
 	v.msgLineOffsets = make([]int, len(msgs))
+	v.eventButtonScrollRow = -1
 	var all []string
 
 	divider := lipgloss.NewStyle().Foreground(v.theme.Border).Render(strings.Repeat("─", v.width))
@@ -391,6 +500,10 @@ func (v *ReaderView) buildThreadLines() {
 					all = append(all, divider)
 				}
 				all = append(all, extra...)
+				// Event buttons are the last line only when the event has actions.
+				if v.event != nil && v.event.HasEvent {
+					v.eventButtonScrollRow = len(all) - 1
+				}
 				all = append(all, divider)
 			}
 		}
@@ -411,15 +524,23 @@ func (v *ReaderView) buildThreadLines() {
 		}
 	}
 	// Interactive attachment panel for the latest message (supports tab focus).
-	all = append(all, v.renderAttachmentLines()...)
+	attachBaseOffset := len(all)
+	attachLines := v.renderAttachmentLines()
+	if v.attachButtonScrollRow >= 0 {
+		v.attachButtonScrollRow += attachBaseOffset
+	}
+	all = append(all, attachLines...)
 	v.lines = all
 }
 
 // renderAttachmentLines renders the interactive attachment section for the current
-// single-message. Returns nil if there are no attachments.
+// single-message. Returns nil if there are no attachments. Also sets
+// v.attachButtonScrollRow to the index of the button row within the returned
+// slice (caller must add its own base offset to get the absolute line index).
 func (v *ReaderView) renderAttachmentLines() []string {
 	atts := v.messageAttachments()
 	if len(atts) == 0 {
+		v.attachButtonScrollRow = -1
 		return nil
 	}
 	theme := v.theme
@@ -433,6 +554,7 @@ func (v *ReaderView) renderAttachmentLines() []string {
 		maxNameW = 10
 	}
 
+	v.attachButtonScrollRow = -1
 	lines := []string{divider}
 	for i, att := range atts {
 		label := "        "
@@ -450,6 +572,7 @@ func (v *ReaderView) renderAttachmentLines() []string {
 		row := label + "  " + rowStyle.Render(icons.Attachment+" "+name+"  "+size)
 		lines = append(lines, row)
 		if focused {
+			v.attachButtonScrollRow = len(lines) // relative to this slice's start
 			lines = append(lines, "            "+v.renderAttachmentButtons())
 		}
 	}
@@ -485,20 +608,15 @@ func (v *ReaderView) renderAttachmentLinesSimple(atts []data.Attachment) []strin
 }
 
 func (v *ReaderView) renderAttachmentButtons() string {
-	normal := lipgloss.NewStyle().Foreground(v.theme.Text).Background(v.theme.Surface).Padding(0, 1)
-	active := lipgloss.NewStyle().Foreground(v.theme.Background).Background(v.theme.Accent).Bold(true).Padding(0, 1)
-	open := normal
-	download := normal
-	editor := normal
-	switch v.attachActionFocus {
-	case 0:
-		open = active
-	case 1:
-		download = active
-	case 2:
-		editor = active
-	}
-	return open.Render("Open") + " " + download.Render("Download") + " " + editor.Render("Editor")
+	openActive := v.attachActionFocus == 0
+	downloadActive := v.attachActionFocus == 1
+	editorActive := v.attachActionFocus == 2
+
+	open := components.RenderButton(v.theme, "Open", openActive, false)
+	download := components.RenderButton(v.theme, "Download", downloadActive, false)
+	editor := components.RenderButton(v.theme, "Editor", editorActive, false)
+
+	return open + " " + download + " " + editor
 }
 
 func formatAttachmentSize(n int) string {
@@ -708,7 +826,12 @@ func (v *ReaderView) singleHeaderLines() []string {
 		labelStyle.Render("Subject") + "  " + boldStyle.Render(subjectStr) + stars,
 	}
 	lines = append(lines, divider)
+	v.eventButtonHeaderRow = -1
 	if extra := v.renderSuggestedEventSection(); len(extra) > 0 {
+		// Event buttons are the last line only when the event has actions.
+		if v.event != nil && v.event.HasEvent {
+			v.eventButtonHeaderRow = len(lines) + len(extra) - 1
+		}
 		lines = append(lines, extra...)
 		lines = append(lines, divider)
 	}
@@ -816,21 +939,15 @@ func (v *ReaderView) renderSuggestedEventSection() []string {
 }
 
 func (v *ReaderView) renderEventButtons() string {
-	normal := lipgloss.NewStyle().Foreground(v.theme.Text).Background(v.theme.Surface).Padding(0, 1)
-	active := lipgloss.NewStyle().Foreground(v.theme.Background).Background(v.theme.Accent).Bold(true).Padding(0, 1)
-	danger := lipgloss.NewStyle().Foreground(v.theme.Background).Background(v.theme.Error).Bold(true).Padding(0, 1)
-	copyPlain := normal
-	copyJSON := normal
-	reject := normal
-	switch v.eventFocus {
-	case 0:
-		copyPlain = active
-	case 1:
-		copyJSON = active
-	case 2:
-		reject = danger
-	}
-	return copyPlain.Render("Copy Plain") + " " + copyJSON.Render("Copy JSON") + " " + reject.Render("Reject")
+	copyPlainActive := v.eventFocus == 0
+	copyJSONActive := v.eventFocus == 1
+	rejectActive := v.eventFocus == 2
+
+	copyPlain := components.RenderButton(v.theme, "Copy Plain", copyPlainActive, false)
+	copyJSON := components.RenderButton(v.theme, "Copy JSON", copyJSONActive, false)
+	reject := components.RenderButton(v.theme, "Reject", rejectActive, true)
+
+	return copyPlain + " " + copyJSON + " " + reject
 }
 
 func formatSuggestedEventPlain(ev *data.SuggestedEvent) string {

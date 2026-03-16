@@ -25,6 +25,7 @@ import (
 	"github.com/bubblmail/bubblmail/util"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // ViewID identifies which main pane is active.
@@ -152,6 +153,22 @@ type App struct {
 	quickMenu      *quickMenuState
 
 	accounts []*data.Account
+
+	// Text selection via mouse drag
+	drag       *dragState
+	plainLines []string // ANSI-stripped lines of last render, used for plain-text copy
+	ansiLines  []string // ANSI-rich lines of last render, used for markdown copy
+}
+
+// dragState tracks an in-progress mouse drag for text selection.
+type dragState struct {
+	startX, startY int
+	endX, endY     int
+	isDrag         bool // true once the pointer moved ≥1 cell from start
+	// Zone bounds (inclusive) constrain the selection to the UI element where
+	// the drag started, so a drag begun in the email body cannot bleed into
+	// the sidebar, header, or status bar.
+	zoneX0, zoneY0, zoneX1, zoneY1 int
 }
 
 type quickMenuSide int
@@ -1027,7 +1044,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				a.viewID = ViewInbox
 				return a, a.fetchMessages()
 			}
-		case "esc", "h", "left", "\\", "q":
+		case "esc", "h", "left", "tab", "q":
 			a.sidebarFocused = false
 			a.sidebar.SetFocused(false)
 		case "ctrl+c":
@@ -1060,7 +1077,11 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.wantSidebar = !a.wantSidebar
 		a.updateLayout()
 
-	case "\\":
+	case "tab":
+		if a.viewID == ViewReader && a.readerView.HasAttachments() {
+			a.readerView.FocusNextAttachment(1)
+			return a, nil
+		}
 		if a.showSidebar {
 			a.sidebarFocused = true
 			a.sidebar.SetFocused(true)
@@ -1083,19 +1104,11 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.statusbar.SetLoading(true)
 		return a, tea.Batch(a.fetchMessages(), spinnerTick())
 
-	case "tab":
-		if a.viewID == ViewReader && a.readerView.HasAttachments() {
-			a.readerView.FocusNextAttachment(1)
-			return a, nil
-		}
-		a.cycleAccount(1)
-
 	case "shift+tab":
 		if a.viewID == ViewReader && a.readerView.HasAttachments() {
 			a.readerView.FocusNextAttachment(-1)
 			return a, nil
 		}
-		a.cycleAccount(-1)
 
 	case "/":
 		contentH := a.height - a.headerHeight() - a.statusHeight()
@@ -1288,31 +1301,217 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (a *App) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress {
-		// Sidebar click
-		if a.showSidebar && msg.X < sidebarRenderedWidth() {
-			contentY := msg.Y - a.headerHeight()
-			acct, folder, ok := a.sidebar.HitTest(msg.X, contentY)
-			if ok && folder != "" {
-				if acct == "" {
-					// Smart folder clicked
-					a.smartFolder = folder
-					a.viewID = ViewSmartFolder
-					a.sidebar.SetActive("", folder)
-					a.header.SetFolder(folder)
-					return a, a.fetchSmartFolder(folder)
+	// Mouse wheel scrolling for content views.
+	if msg.Button == tea.MouseButtonWheelDown {
+		a.moveDown()
+		return a, tea.Batch(a.markFocusedThreadRead(), a.maybeLoadMore())
+	}
+	if msg.Button == tea.MouseButtonWheelUp {
+		a.moveUp()
+		return a, a.markFocusedThreadRead()
+	}
+
+	if msg.Button != tea.MouseButtonLeft {
+		return a, nil
+	}
+
+	switch msg.Action {
+	case tea.MouseActionPress:
+		// Start drag tracking so motion events can build a selection.
+		a.drag = &dragState{startX: msg.X, startY: msg.Y, endX: msg.X, endY: msg.Y}
+		// Also fire the immediate click action.
+		return a.handleLeftPress(msg.X, msg.Y)
+
+	case tea.MouseActionMotion:
+		if a.drag != nil {
+			a.drag.endX = msg.X
+			a.drag.endY = msg.Y
+			dx := msg.X - a.drag.startX
+			if dx < 0 {
+				dx = -dx
+			}
+			dy := msg.Y - a.drag.startY
+			if dy < 0 {
+				dy = -dy
+			}
+			if dx >= 1 || dy >= 1 {
+				a.drag.isDrag = true
+			}
+		}
+
+	case tea.MouseActionRelease:
+		if a.drag != nil && a.drag.isDrag {
+			asMarkdown := !msg.Ctrl
+			text := a.extractSelectedText(a.drag.startX, a.drag.startY, msg.X, msg.Y, asMarkdown)
+			a.drag = nil
+			if text != "" {
+				if err := util.CopyToClipboard(text); err != nil {
+					return a, a.flash("Copy failed: "+err.Error(), "err")
 				}
-				a.activeAccount = acct
-				a.activeFolder = folder
-				a.sidebar.SetActive(acct, folder)
-				a.header.SetAccount(acct)
+				label := "Copied as Markdown"
+				if !asMarkdown {
+					label = "Copied as plain text"
+				}
+				return a, a.flash(label, "ok")
+			}
+			return a, nil
+		}
+		a.drag = nil
+	}
+
+	return a, nil
+}
+
+// handleLeftPress fires the immediate-action for a left-button press at (x, y).
+func (a *App) handleLeftPress(x, y int) (tea.Model, tea.Cmd) {
+	headerH := a.headerHeight()
+	statusH := a.statusHeight()
+	statusY := a.height - statusH
+
+	// Record the zone where this drag started so the selection cannot bleed
+	// into adjacent UI elements (e.g. drag in content ≠ selects sidebar).
+	if a.drag != nil {
+		sidebarW := 0
+		if a.showSidebar {
+			sidebarW = sidebarRenderedWidth()
+		}
+		switch {
+		case a.showSidebar && x < sidebarW:
+			// Sidebar zone
+			a.drag.zoneX0, a.drag.zoneX1 = 0, sidebarW-1
+			a.drag.zoneY0, a.drag.zoneY1 = headerH, statusY-1
+		case y < headerH:
+			// Header zone
+			a.drag.zoneX0, a.drag.zoneX1 = 0, a.width-1
+			a.drag.zoneY0, a.drag.zoneY1 = 0, headerH-1
+		case y >= statusY:
+			// Status bar zone
+			a.drag.zoneX0, a.drag.zoneX1 = 0, a.width-1
+			a.drag.zoneY0, a.drag.zoneY1 = statusY, a.height-1
+		default:
+			// Content zone (main view area)
+			a.drag.zoneX0, a.drag.zoneX1 = sidebarW, a.width-1
+			a.drag.zoneY0, a.drag.zoneY1 = headerH, statusY-1
+		}
+	}
+
+	// Sidebar click
+	if a.showSidebar && x < sidebarRenderedWidth() {
+		contentY := y - headerH
+		acct, folder, ok := a.sidebar.HitTest(x, contentY)
+		if ok && folder != "" {
+			if acct == "" {
+				a.smartFolder = folder
+				a.viewID = ViewSmartFolder
+				a.sidebar.SetActive("", folder)
 				a.header.SetFolder(folder)
-				a.viewID = ViewInbox
-				return a, a.fetchMessages()
+				return a, a.fetchSmartFolder(folder)
+			}
+			a.activeAccount = acct
+			a.activeFolder = folder
+			a.sidebar.SetActive(acct, folder)
+			a.header.SetAccount(acct)
+			a.header.SetFolder(folder)
+			a.viewID = ViewInbox
+			return a, a.fetchMessages()
+		}
+		return a, nil
+	}
+
+	// Status bar hint click
+	if y >= statusY {
+		if key := a.statusbar.HitTest(x, y-statusY); key != "" {
+			return a.handleKey(syntheticKeyMsg(key))
+		}
+		return a, nil
+	}
+
+	// Content area click
+	if y >= headerH && y < statusY {
+		contentY := y - headerH
+		sidebarOff := 0
+		if a.showSidebar {
+			sidebarOff = sidebarRenderedWidth()
+		}
+		cx := x - sidebarOff
+
+		switch a.viewID {
+		case ViewInbox, ViewSmartFolder:
+			idx := a.inboxView.HitTestThread(contentY)
+			if idx >= 0 {
+				if idx == a.inboxView.CursorPos() {
+					return a, a.handleEnter()
+				}
+				a.closeQuickMenu()
+				a.inboxView.SetCursor(idx)
+				return a, a.markFocusedThreadRead()
+			}
+
+		case ViewFolder:
+			idx := a.folderView.HitTestFolder(contentY)
+			if idx >= 0 {
+				if idx == a.folderView.CursorPos() {
+					return a, a.handleEnter()
+				}
+				a.folderView.SetCursor(idx)
+			}
+
+		case ViewReader:
+			action := a.readerView.HitTestContent(contentY, cx)
+			switch action {
+			case "attach:open":
+				a.readerView.SetAttachActionFocus(0)
+				return a, a.executeAttachmentAction()
+			case "attach:download":
+				a.readerView.SetAttachActionFocus(1)
+				return a, a.executeAttachmentAction()
+			case "attach:editor":
+				a.readerView.SetAttachActionFocus(2)
+				return a, a.executeAttachmentAction()
+			case "event:plain":
+				a.readerView.SetEventFocus(0)
+				return a, a.copySuggestedEvent()
+			case "event:json":
+				a.readerView.SetEventFocus(1)
+				return a, a.copySuggestedEvent()
+			case "event:reject":
+				a.readerView.SetEventFocus(2)
+				return a, a.copySuggestedEvent()
 			}
 		}
 	}
 	return a, nil
+}
+
+// syntheticKeyMsg constructs a tea.KeyMsg for the given key string so that
+// status-bar hint clicks can be routed through handleKey unchanged.
+func syntheticKeyMsg(key string) tea.KeyMsg {
+	switch key {
+	case "enter":
+		return tea.KeyMsg{Type: tea.KeyEnter}
+	case "esc":
+		return tea.KeyMsg{Type: tea.KeyEsc}
+	case "tab":
+		return tea.KeyMsg{Type: tea.KeyTab}
+	case "shift+tab":
+		return tea.KeyMsg{Type: tea.KeyShiftTab}
+	case "right":
+		return tea.KeyMsg{Type: tea.KeyRight}
+	case "left":
+		return tea.KeyMsg{Type: tea.KeyLeft}
+	case "ctrl+f":
+		return tea.KeyMsg{Type: tea.KeyCtrlF}
+	case "ctrl+r":
+		return tea.KeyMsg{Type: tea.KeyCtrlR}
+	case "ctrl+d":
+		return tea.KeyMsg{Type: tea.KeyCtrlD}
+	case "ctrl+enter":
+		return tea.KeyMsg{Type: tea.KeyCtrlJ}
+	}
+	if len([]rune(key)) == 1 {
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)}
+	}
+	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)}
 }
 
 // --- navigation helpers ---
@@ -2544,24 +2743,6 @@ func writeAttachmentTemp(att data.Attachment) (string, error) {
 	return f.Name(), nil
 }
 
-func (a *App) cycleAccount(dir int) {
-	if len(a.accounts) == 0 {
-		return
-	}
-	idx := 0
-	for i, acct := range a.accounts {
-		if acct.Name == a.activeAccount {
-			idx = i
-			break
-		}
-	}
-	idx = (idx + dir + len(a.accounts)) % len(a.accounts)
-	a.activeAccount = a.accounts[idx].Name
-	a.activeFolder = "INBOX"
-	a.sidebar.SetActive(a.activeAccount, a.activeFolder)
-	a.header.SetAccount(a.activeAccount)
-	a.header.SetFolder(a.activeFolder)
-}
 
 // --- layout ---
 
@@ -2672,10 +2853,13 @@ func (a *App) View() string {
 
 	var mainContent string
 
-	// Composer overlay takes full screen
+	// Composer overlay takes full screen (no drag-selection while composing)
 	if a.comp.IsActive() {
+		a.drag = nil
 		mainContent = a.comp.View()
-		return lipgloss.JoinVertical(lipgloss.Left, header, mainContent, a.statusbar.View("composer"))
+		output := lipgloss.JoinVertical(lipgloss.Left, header, mainContent, a.statusbar.View("composer"))
+		a.updateLineBuffers(output)
+		return output
 	}
 
 	// Active view
@@ -2717,7 +2901,19 @@ func (a *App) View() string {
 
 	statusbar := a.statusbar.View(a.currentSbContext())
 
-	return lipgloss.JoinVertical(lipgloss.Left, header, mainContent, statusbar)
+	output := lipgloss.JoinVertical(lipgloss.Left, header, mainContent, statusbar)
+
+	// Update line buffers for drag-selection text extraction.
+	lines := a.updateLineBuffers(output)
+
+	// Apply visual selection highlight during an active drag.
+	if a.drag != nil && a.drag.isDrag {
+		output = applySelectionHighlight(lines,
+			a.drag.startX, a.drag.startY, a.drag.endX, a.drag.endY,
+			a.drag.zoneX0, a.drag.zoneY0, a.drag.zoneX1, a.drag.zoneY1)
+	}
+
+	return output
 }
 
 func (a *App) maybeLoadMore() tea.Cmd {
@@ -2749,6 +2945,225 @@ func (a *App) flash(msg, kind string) tea.Cmd {
 	return tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
 		return clearStatusMsg{}
 	})
+}
+
+// updateLineBuffers splits the rendered output into per-line buffers used for
+// text selection: ansiLines keeps ANSI codes (for markdown copy), plainLines
+// strips them (for plain-text copy). Returns the split lines slice so callers
+// can reuse it without re-splitting.
+func (a *App) updateLineBuffers(output string) []string {
+	lines := strings.Split(output, "\n")
+	a.ansiLines = lines
+	a.plainLines = make([]string, len(lines))
+	for i, l := range lines {
+		a.plainLines[i] = ansi.Strip(l)
+	}
+	return lines
+}
+
+// ansiToMarkdown converts an ANSI-escaped string to Markdown, mapping bold
+// (SGR 1/22) to **…** and italic (SGR 3/23) to _…_. All other escape
+// sequences (colors, underline, etc.) are stripped.
+func ansiToMarkdown(s string) string {
+	var b strings.Builder
+	inBold, inItalic := false, false
+	i := 0
+	for i < len(s) {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			// Scan to the final byte of the escape sequence (a letter @–~).
+			j := i + 2
+			for j < len(s) && (s[j] < '@' || s[j] > '~') {
+				j++
+			}
+			if j < len(s) && s[j] == 'm' { // SGR only
+				for _, param := range strings.Split(s[i+2:j], ";") {
+					switch param {
+					case "0", "": // reset
+						if inItalic {
+							b.WriteByte('_')
+							inItalic = false
+						}
+						if inBold {
+							b.WriteString("**")
+							inBold = false
+						}
+					case "1": // bold on
+						if !inBold {
+							b.WriteString("**")
+							inBold = true
+						}
+					case "22": // bold off
+						if inBold {
+							b.WriteString("**")
+							inBold = false
+						}
+					case "3": // italic on
+						if !inItalic {
+							b.WriteByte('_')
+							inItalic = true
+						}
+					case "23": // italic off
+						if inItalic {
+							b.WriteByte('_')
+							inItalic = false
+						}
+					}
+				}
+			}
+			if j < len(s) {
+				i = j + 1
+			} else {
+				i++
+			}
+		} else {
+			b.WriteByte(s[i])
+			i++
+		}
+	}
+	if inItalic {
+		b.WriteByte('_')
+	}
+	if inBold {
+		b.WriteString("**")
+	}
+	return b.String()
+}
+
+// normalizeSelection returns (startRow, startCol, endRow, endCol) with the start
+// guaranteed to come before the end in reading order (top-left → bottom-right).
+func normalizeSelection(startX, startY, endX, endY int) (sr, sc, er, ec int) {
+	if startY < endY || (startY == endY && startX <= endX) {
+		return startY, startX, endY, endX
+	}
+	return endY, endX, startY, startX
+}
+
+// extractSelectedText returns the text covered by the drag from (startX, startY)
+// to (endX, endY), clamped to the drag's zone bounds.
+// asMarkdown=true uses the ANSI-rich line buffer and converts bold/italic to
+// Markdown syntax; asMarkdown=false returns raw stripped plain text.
+func (a *App) extractSelectedText(startX, startY, endX, endY int, asMarkdown bool) string {
+	if a.drag == nil {
+		return ""
+	}
+	if asMarkdown && len(a.ansiLines) == 0 {
+		return ""
+	}
+	if !asMarkdown && len(a.plainLines) == 0 {
+		return ""
+	}
+
+	zx0 := a.drag.zoneX0
+	zx1 := a.drag.zoneX1
+	zy0 := a.drag.zoneY0
+	zy1 := a.drag.zoneY1
+
+	sr, sc, er, ec := normalizeSelection(startX, startY, endX, endY)
+	if sr == er && sc == ec {
+		return ""
+	}
+
+	// Clamp row range to zone.
+	if sr < zy0 {
+		sr, sc = zy0, zx0
+	}
+	if er > zy1 {
+		er, ec = zy1, zx1+1
+	}
+
+	nLines := len(a.plainLines)
+	if asMarkdown {
+		nLines = len(a.ansiLines)
+	}
+
+	var parts []string
+	for r := sr; r <= er && r < nLines; r++ {
+		// Column range for this row, clamped to zone x bounds.
+		c0 := zx0
+		c1 := zx1 + 1
+		if r == sr && sc > c0 {
+			c0 = sc
+		}
+		if r == er && ec < c1 {
+			c1 = ec
+		}
+
+		var chunk string
+		if asMarkdown {
+			chunk = ansiToMarkdown(ansi.Cut(a.ansiLines[r], c0, c1))
+		} else {
+			runes := []rune(a.plainLines[r])
+			if c0 > len(runes) {
+				c0 = len(runes)
+			}
+			if c1 > len(runes) {
+				c1 = len(runes)
+			}
+			if c0 < c1 {
+				chunk = string(runes[c0:c1])
+			}
+		}
+		parts = append(parts, strings.TrimRight(chunk, " \t"))
+	}
+
+	return strings.TrimRight(strings.Join(parts, "\n"), "\n")
+}
+
+// applySelectionHighlight overlays a reverse-video highlight on the selected
+// cells of the already-rendered (ANSI-escaped) lines slice, then re-joins them.
+// The selection is clamped to [zx0,zx1] × [zy0,zy1] so it cannot bleed into
+// adjacent UI zones.
+func applySelectionHighlight(lines []string, startX, startY, endX, endY int,
+	zx0, zy0, zx1, zy1 int) string {
+	sr, sc, er, ec := normalizeSelection(startX, startY, endX, endY)
+	selStyle := lipgloss.NewStyle().Reverse(true)
+
+	// Clamp row range to zone.
+	if sr < zy0 {
+		sr, sc = zy0, zx0
+	}
+	if er > zy1 {
+		er, ec = zy1, zx1+1
+	}
+
+	result := make([]string, len(lines))
+	copy(result, lines)
+
+	for r := sr; r <= er && r < len(lines); r++ {
+		// Column range for this row, clamped to zone x bounds.
+		c0 := zx0
+		c1 := zx1 + 1
+		if r == sr && sc > c0 {
+			c0 = sc
+		}
+		if r == er && ec < c1 {
+			c1 = ec
+		}
+		if c0 >= c1 {
+			continue
+		}
+		result[r] = selectionHighlightLine(lines[r], c0, c1, selStyle)
+	}
+
+	return strings.Join(result, "\n")
+}
+
+// selectionHighlightLine applies highlight to columns [c0, c1) of a single
+// ANSI-escaped line, preserving original styling outside the selection.
+func selectionHighlightLine(line string, c0, c1 int, style lipgloss.Style) string {
+	// Clamp c1 to the visual width of actual content (no trailing-space highlight).
+	plain := ansi.Strip(line)
+	contentEnd := lipgloss.Width(strings.TrimRight(plain, " "))
+	if c1 > contentEnd {
+		c1 = contentEnd
+	}
+	if c0 >= c1 {
+		return line
+	}
+	prefix := ansi.Truncate(line, c0, "")
+	middle := ansi.Strip(ansi.Cut(line, c0, c1))
+	suffix := ansi.TruncateLeft(line, c1, "")
+	return prefix + style.Render(middle) + suffix
 }
 
 func removeByUID(msgs []*data.Message, uid uint32) []*data.Message {

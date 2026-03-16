@@ -64,6 +64,39 @@ func (v *FolderView) listHeight() int {
 	return h
 }
 
+// CursorPos returns the current cursor index.
+func (v *FolderView) CursorPos() int { return v.cursor }
+
+// SetCursor moves the cursor to the given index, clamped to valid bounds.
+func (v *FolderView) SetCursor(i int) {
+	if len(v.folders) == 0 {
+		v.cursor = 0
+		return
+	}
+	if i >= len(v.folders) {
+		i = len(v.folders) - 1
+	}
+	if i < 0 {
+		i = 0
+	}
+	v.cursor = i
+}
+
+// HitTestFolder returns the folder index for a click at contentY (rows from the
+// top of the folder view area), or -1 if the click doesn't land on a folder row.
+func (v *FolderView) HitTestFolder(contentY int) int {
+	listStart := folderHeaderRows
+	listEnd := v.height - folderFooterRows
+	if contentY < listStart || contentY >= listEnd || len(v.folders) == 0 {
+		return -1
+	}
+	idx := v.offset + (contentY - listStart)
+	if idx >= 0 && idx < len(v.folders) {
+		return idx
+	}
+	return -1
+}
+
 // MoveUp moves cursor up.
 func (v *FolderView) MoveUp() {
 	if v.cursor > 0 {
