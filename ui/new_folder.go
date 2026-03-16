@@ -2,6 +2,7 @@ package ui
 
 import (
 	"strings"
+	"unicode/utf8"
 
 	"github.com/bubblmail/bubblmail/ui/icons"
 	"github.com/bubblmail/bubblmail/util"
@@ -92,8 +93,8 @@ func (o *NewFolderOverlay) HandleKey(key string) (closed bool) {
 
 	case "backspace", "ctrl+h":
 		if len(o.input) > 0 {
-			runes := []rune(o.input)
-			o.input = string(runes[:len(runes)-1])
+			_, size := utf8.DecodeLastRuneInString(o.input)
+			o.input = o.input[:len(o.input)-size]
 		}
 		o.errMsg = ""
 
@@ -118,79 +119,103 @@ func (o *NewFolderOverlay) HandleKey(key string) (closed bool) {
 func (o *NewFolderOverlay) View() string {
 	theme := o.styles.Theme
 
-	const minBoxW = 40
-	const labelW = 7 // "Name  │"
-
-	// Box content width: enough for the input field and hints.
-	boxW := minBoxW
+	const minBoxW = 42
+	cw := minBoxW
 	if o.width > minBoxW+10 {
-		boxW = minBoxW + (o.width-minBoxW-10)/2
+		cw = minBoxW + (o.width-minBoxW-10)/3
 	}
-	if boxW > 60 {
-		boxW = 60
-	}
-
-	// Input display: cursor appended to current text, truncated to fit.
-	inputAvail := boxW - labelW - 4 // subtract label + padding
-	if inputAvail < 8 {
-		inputAvail = 8
-	}
-	displayInput := o.input
-	// Show only the tail of the input if it's too long.
-	runes := []rune(displayInput)
-	if util.VisibleWidth(displayInput) > inputAvail-1 {
-		for util.VisibleWidth(string(runes)) > inputAvail-1 && len(runes) > 0 {
-			runes = runes[1:]
-		}
-		displayInput = string(runes)
-	}
-	cursor := lipgloss.NewStyle().
-		Foreground(theme.Background).
-		Background(theme.Accent).
-		Render(" ")
-	inputStr := displayInput + cursor
-	inputField := lipgloss.NewStyle().
-		Foreground(theme.Text).
-		Background(theme.SurfaceAlt).
-		Width(inputAvail).
-		Padding(0, 1).
-		Render(inputStr)
-
-	labelStyle := lipgloss.NewStyle().Foreground(theme.TextMuted)
-	sepStyle := lipgloss.NewStyle().Foreground(theme.Border)
-
-	nameRow := labelStyle.Render("Name  ") +
-		sepStyle.Render("│") + " " +
-		inputField
-
-	// Hint / error row
-	var hintLine string
-	if o.errMsg != "" {
-		hintLine = lipgloss.NewStyle().
-			Foreground(theme.Error).
-			Render(icons.Error + " " + o.errMsg)
-	} else {
-		hintLine = lipgloss.NewStyle().
-			Foreground(theme.TextFaint).
-			Render("enter to create  ·  esc to cancel")
+	if cw > 60 {
+		cw = 60
 	}
 
-	// Title
+	// innerW: content area inside Padding(1, 2) = cw − 4.
+	const hPad = 2
+	innerW := cw - 2*hPad
+
+	// ── Title ────────────────────────────────────────────────────────────────
 	titleLine := lipgloss.NewStyle().
+		Background(theme.Surface).
 		Foreground(theme.Accent).
 		Bold(true).
+		Width(innerW).
 		Render(icons.FolderNew + " New Folder")
 
-	content := strings.Join([]string{
-		titleLine,
-		"",
-		nameRow,
-		"",
-		hintLine,
-	}, "\n")
+	// ── Input row — mirrors search.go ────────────────────────────────────────
+	// iconCellW=2: icon(1) + 1 implicit pad from Width(2).
+	const iconCellW = 2
+	iconCell := lipgloss.NewStyle().
+		Width(iconCellW).
+		Background(theme.Surface).
+		Foreground(theme.Accent).
+		Render(icons.FolderNew)
+
+	inputAreaW := innerW - iconCellW
+	var inputCell string
+	if o.input == "" {
+		inputCell = lipgloss.NewStyle().
+			Width(inputAreaW).
+			Background(theme.Surface).
+			Foreground(theme.TextFaint).
+			Render("folder name…")
+	} else {
+		displayInput := util.TruncateText(util.SingleLine(o.input), inputAreaW-1) + "▌"
+		inputCell = lipgloss.NewStyle().
+			Width(inputAreaW).
+			Background(theme.Surface).
+			Foreground(theme.Text).
+			Bold(true).
+			Render(displayInput)
+	}
+	inputLine := iconCell + inputCell
+
+	// ── Divider ──────────────────────────────────────────────────────────────
+	sep := lipgloss.NewStyle().
+		Foreground(theme.Border).
+		Background(theme.Surface).
+		Width(innerW).
+		Render(strings.Repeat("─", innerW))
+
+	// ── Footer: hints or error ────────────────────────────────────────────────
+	// Error state: replace hints with icon + message.
+	// Normal state: statusbar-style hint pills — icon desc (key).
+	var footerLine string
+	if o.errMsg != "" {
+		footerLine = lipgloss.NewStyle().
+			Background(theme.Surface).
+			Foreground(theme.Error).
+			Width(innerW).
+			Render(icons.Error + " " + o.errMsg)
+	} else {
+		iconStyle := lipgloss.NewStyle().Foreground(theme.Accent).Background(theme.Surface)
+		descStyle := lipgloss.NewStyle().Foreground(theme.TextMuted).Background(theme.Surface)
+		keyStyle := lipgloss.NewStyle().Foreground(theme.TextFaint).Background(theme.Surface)
+		sp := lipgloss.NewStyle().Background(theme.Surface).Render(" ")
+		gap := lipgloss.NewStyle().Background(theme.Surface).Render("  ")
+
+		type hint struct{ icon, key, desc string }
+		hints := []hint{
+			{icons.Check, "enter", "create"},
+			{icons.Close, "esc", "cancel"},
+		}
+		var parts []string
+		for _, h := range hints {
+			parts = append(parts,
+				iconStyle.Render(h.icon)+sp+descStyle.Render(h.desc)+sp+keyStyle.Render("("+h.key+")"),
+			)
+		}
+		hintStr := strings.Join(parts, gap)
+		footerLine = lipgloss.NewStyle().
+			Background(theme.Surface).
+			Width(innerW).
+			Render(hintStr)
+	}
+
+	blank := lipgloss.NewStyle().Background(theme.Surface).Width(innerW).Render("")
+
+	content := strings.Join([]string{titleLine, blank, inputLine, sep, footerLine}, "\n")
 
 	box := lipgloss.NewStyle().
-		Width(boxW).
+		Width(cw).
 		Background(theme.Surface).
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(theme.Accent).

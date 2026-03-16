@@ -248,17 +248,22 @@ func (f *FolderPickerOverlay) View() string {
 	cw := f.innerWidth()
 	listH := f.listHeight()
 
+	// innerW: actual content area inside Padding(1, 2) = cw − 4.
+	// All cells and the separator must use innerW, not cw.
+	const hPad = 2
+	innerW := cw - 2*hPad
+
 	// Title row — plain string, single style, no resets mid-row.
 	titleLine := lipgloss.NewStyle().
 		Background(theme.Surface).
 		Foreground(theme.Accent).
 		Bold(true).
-		Width(cw).
+		Width(innerW).
 		Render(icons.FolderOpen + " Move to folder")
 
 	// Input row: split into two Width(N) plain cells so every character has
 	// an explicit Background(Surface) — no stray resets between segments.
-	// Cell 1: " " + search icon (3 cols). Cell 2: query/placeholder (cw-3 cols).
+	// Cell 1: " " + search icon (3 cols). Cell 2: query/placeholder (innerW-3 cols).
 	const iconCellW = 3 // " " + icon(1) + implicit pad(1)
 	iconCell := lipgloss.NewStyle().
 		Background(theme.Surface).
@@ -271,20 +276,20 @@ func (f *FolderPickerOverlay) View() string {
 		textCell = lipgloss.NewStyle().
 			Background(theme.Surface).
 			Foreground(theme.TextFaint).
-			Width(cw - iconCellW).
+			Width(innerW - iconCellW).
 			Render("type to filter…")
 	} else {
 		textCell = lipgloss.NewStyle().
 			Background(theme.Surface).
 			Foreground(theme.Text).
-			Width(cw - iconCellW).
-			Render(util.TruncateText(util.SingleLine(f.query)+"▌", cw-iconCellW))
+			Width(innerW - iconCellW).
+			Render(util.TruncateText(util.SingleLine(f.query)+"▌", innerW-iconCellW))
 	}
 	inputLine := iconCell + textCell
 
 	// Folder rows
 	isFiltering := f.query != ""
-	nameAvail := cw - 3 // " " + icon(1) + " "
+	nameAvail := innerW - 3 // " " + icon(1) + " "
 
 	var rows []string
 	if len(f.filtered) == 0 {
@@ -295,7 +300,7 @@ func (f *FolderPickerOverlay) View() string {
 		rows = append(rows, lipgloss.NewStyle().
 			Background(theme.Surface).
 			Foreground(theme.TextFaint).
-			Width(cw).
+			Width(innerW).
 			Render(emptyMsg))
 	}
 
@@ -315,7 +320,7 @@ func (f *FolderPickerOverlay) View() string {
 			nameStr = indent + util.SingleLine(folder.DisplayName)
 		}
 
-		// plainRow is pure plain text — safe for Width(cw).
+		// plainRow is pure plain text — safe for Width(innerW).
 		plainRow := " " + icon + " " + util.TruncateText(nameStr, nameAvail)
 
 		if isSelected {
@@ -323,19 +328,19 @@ func (f *FolderPickerOverlay) View() string {
 				Background(theme.Selected).
 				Foreground(theme.Background).
 				Bold(true).
-				Width(cw).
+				Width(innerW).
 				Render(plainRow))
 		} else {
 			rows = append(rows, lipgloss.NewStyle().
 				Background(theme.Surface).
 				Foreground(theme.Text).
-				Width(cw).
+				Width(innerW).
 				Render(plainRow))
 		}
 	}
 
 	// Pad remaining rows to keep the box height stable.
-	blank := lipgloss.NewStyle().Background(theme.Surface).Width(cw).Render("")
+	blank := lipgloss.NewStyle().Background(theme.Surface).Width(innerW).Render("")
 	for len(rows) < listH {
 		rows = append(rows, blank)
 	}
@@ -343,8 +348,8 @@ func (f *FolderPickerOverlay) View() string {
 	sep := lipgloss.NewStyle().
 		Foreground(theme.Border).
 		Background(theme.Surface).
-		Width(cw).
-		Render(strings.Repeat("─", cw))
+		Width(innerW).
+		Render(strings.Repeat("─", innerW))
 
 	// Content: title + blank + input + separator + folder rows
 	contentParts := []string{titleLine, "", inputLine, sep}
