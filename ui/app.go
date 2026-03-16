@@ -165,6 +165,7 @@ type dragState struct {
 	startX, startY int
 	endX, endY     int
 	isDrag         bool // true once the pointer moved ≥1 cell from start
+	canCopy        bool // true only when drag started in a copyable zone (reader body)
 	// Zone bounds (inclusive) constrain the selection to the UI element where
 	// the drag started, so a drag begun in the email body cannot bleed into
 	// the sidebar, header, or status bar.
@@ -1340,7 +1341,7 @@ func (a *App) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.MouseActionRelease:
-		if a.drag != nil && a.drag.isDrag {
+		if a.drag != nil && a.drag.isDrag && a.drag.canCopy {
 			asMarkdown := !msg.Ctrl
 			text := a.extractSelectedText(a.drag.startX, a.drag.startY, msg.X, msg.Y, asMarkdown)
 			a.drag = nil
@@ -1389,9 +1390,10 @@ func (a *App) handleLeftPress(x, y int) (tea.Model, tea.Cmd) {
 			a.drag.zoneX0, a.drag.zoneX1 = 0, a.width-1
 			a.drag.zoneY0, a.drag.zoneY1 = statusY, a.height-1
 		default:
-			// Content zone (main view area)
+			// Content zone — copyable in the reader and composer.
 			a.drag.zoneX0, a.drag.zoneX1 = sidebarW, a.width-1
 			a.drag.zoneY0, a.drag.zoneY1 = headerH, statusY-1
+			a.drag.canCopy = a.viewID == ViewReader || a.comp.IsActive()
 		}
 	}
 
@@ -2853,12 +2855,16 @@ func (a *App) View() string {
 
 	var mainContent string
 
-	// Composer overlay takes full screen (no drag-selection while composing)
+	// Composer overlay takes full screen.
 	if a.comp.IsActive() {
-		a.drag = nil
 		mainContent = a.comp.View()
 		output := lipgloss.JoinVertical(lipgloss.Left, header, mainContent, a.statusbar.View("composer"))
-		a.updateLineBuffers(output)
+		lines := a.updateLineBuffers(output)
+		if a.drag != nil && a.drag.isDrag && a.drag.canCopy {
+			output = applySelectionHighlight(lines,
+				a.drag.startX, a.drag.startY, a.drag.endX, a.drag.endY,
+				a.drag.zoneX0, a.drag.zoneY0, a.drag.zoneX1, a.drag.zoneY1)
+		}
 		return output
 	}
 
@@ -2906,8 +2912,8 @@ func (a *App) View() string {
 	// Update line buffers for drag-selection text extraction.
 	lines := a.updateLineBuffers(output)
 
-	// Apply visual selection highlight during an active drag.
-	if a.drag != nil && a.drag.isDrag {
+	// Apply visual selection highlight during an active drag (reader only).
+	if a.drag != nil && a.drag.isDrag && a.drag.canCopy {
 		output = applySelectionHighlight(lines,
 			a.drag.startX, a.drag.startY, a.drag.endX, a.drag.endY,
 			a.drag.zoneX0, a.drag.zoneY0, a.drag.zoneX1, a.drag.zoneY1)
