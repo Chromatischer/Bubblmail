@@ -1167,7 +1167,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.inboxView.ClearSelection()
 		}
 		a.moveDown()
-		return a, tea.Batch(a.markFocusedThreadRead(), a.maybeLoadMore())
+		return a, a.maybeLoadMore()
 
 	case "k", "up":
 		a.closeQuickMenu()
@@ -1175,7 +1175,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.inboxView.ClearSelection()
 		}
 		a.moveUp()
-		return a, a.markFocusedThreadRead()
+		return a, nil
 
 	case "ctrl+d":
 		a.closeQuickMenu()
@@ -1183,7 +1183,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.inboxView.ClearSelection()
 		}
 		a.pageDown()
-		return a, tea.Batch(a.markFocusedThreadRead(), a.maybeLoadMore())
+		return a, a.maybeLoadMore()
 
 	case "ctrl+u":
 		a.closeQuickMenu()
@@ -1191,7 +1191,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.inboxView.ClearSelection()
 		}
 		a.pageUp()
-		return a, a.markFocusedThreadRead()
+		return a, nil
 
 	case "g":
 		a.closeQuickMenu()
@@ -1199,7 +1199,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.inboxView.ClearSelection()
 		}
 		a.goToTop()
-		return a, a.markFocusedThreadRead()
+		return a, nil
 
 	case "G":
 		a.closeQuickMenu()
@@ -1207,7 +1207,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.inboxView.ClearSelection()
 		}
 		a.goToBottom()
-		return a, tea.Batch(a.markFocusedThreadRead(), a.maybeLoadMore())
+		return a, a.maybeLoadMore()
 
 	case "enter":
 		if a.viewID == ViewReader && a.readerView.AttachFocusActive() {
@@ -1323,11 +1323,11 @@ func (a *App) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	// Mouse wheel scrolling for content views.
 	if msg.Button == tea.MouseButtonWheelDown {
 		a.moveDown()
-		return a, tea.Batch(a.markFocusedThreadRead(), a.maybeLoadMore())
+		return a, a.maybeLoadMore()
 	}
 	if msg.Button == tea.MouseButtonWheelUp {
 		a.moveUp()
-		return a, a.markFocusedThreadRead()
+		return a, nil
 	}
 
 	if msg.Button != tea.MouseButtonLeft {
@@ -1528,7 +1528,7 @@ func (a *App) handleLeftPress(x, y int) (tea.Model, tea.Cmd) {
 				}
 				a.closeQuickMenu()
 				a.inboxView.SetCursor(idx)
-				return a, a.markFocusedThreadRead()
+				return a, nil
 			}
 
 		case ViewFolder:
@@ -1744,18 +1744,20 @@ func (a *App) openThread(t *data.Thread) tea.Cmd {
 
 	var cmds []tea.Cmd
 
-	// Mark the latest (most recent) message as read.
-	latest := t.Latest()
-	if latest != nil && !latest.IsRead() {
-		client, ok := a.imapClients[a.activeAccount]
-		if ok {
-			cmds = append(cmds, client.SetFlag(a.activeFolder, latest.UID, data.FlagSeen, true))
+	// Mark all messages in this thread as read
+	for _, msg := range t.Messages {
+		if !msg.IsRead() {
+			client, ok := a.imapClients[a.activeAccount]
+			if ok {
+				cmds = append(cmds, client.SetFlag(a.activeFolder, msg.UID, data.FlagSeen, true))
+			}
+			_ = a.store.SetFlags(a.activeAccount, a.activeFolder, msg.UID,
+				append(msg.Flags, data.FlagSeen))
+			msg.Flags = append(msg.Flags, data.FlagSeen)
 		}
-		_ = a.store.SetFlags(a.activeAccount, a.activeFolder, latest.UID,
-			append(latest.Flags, data.FlagSeen))
-		latest.Flags = append(latest.Flags, data.FlagSeen)
 	}
-
+	t.HasUnread = false
+	
 	// Fetch body for every message in the thread that doesn't have one yet.
 	client, ok := a.imapClients[a.activeAccount]
 	if ok {
@@ -1766,10 +1768,11 @@ func (a *App) openThread(t *data.Thread) tea.Cmd {
 		}
 	}
 
-	// Trigger suggested event extraction for the latest message.
-	if latest != nil {
-		a.debugLog("openThread: calling loadSuggestedEvent for msg.ID=%d", latest.ID)
-		if cmd := a.loadSuggestedEvent(latest); cmd != nil {
+	
+	// Trigger suggested event extraction for every message in the thread
+	for _, msg := range t.Messages {
+		a.debugLog("loadSuggestedEvent for thread %s: msg.ID=%d", t.ID, msg.ID)
+		if cmd := a.loadSuggestedEvent(msg); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
 	}
@@ -3262,38 +3265,6 @@ func removeByUID(msgs []*data.Message, uid uint32) []*data.Message {
 		}
 	}
 	return result
-}
-
-// markFocusedThreadRead marks the focused inbox thread's latest message as read
-// and syncs the change to cache and IMAP immediately. Safe to call after any
-// navigation — it is a no-op when no thread is focused or it is already read.
-func (a *App) markFocusedThreadRead() tea.Cmd {
-	if a.viewID != ViewInbox && a.viewID != ViewSmartFolder {
-		return nil
-	}
-	t := a.inboxView.SelectedThread()
-	if t == nil {
-		return nil
-	}
-	latest := t.Latest()
-	if latest == nil || latest.IsRead() {
-		return nil
-	}
-	newFlags := append(latest.Flags, data.FlagSeen)
-	_ = a.store.SetFlags(latest.AccountName, latest.FolderName, latest.UID, newFlags)
-	latest.Flags = newFlags
-	t.HasUnread = false
-	for _, m := range t.Messages {
-		if !m.IsRead() {
-			t.HasUnread = true
-			break
-		}
-	}
-	client, ok := a.imapClients[latest.AccountName]
-	if !ok {
-		return nil
-	}
-	return client.SetFlag(latest.FolderName, latest.UID, data.FlagSeen, true)
 }
 
 func toggleFlag(flags []data.Flag, f data.Flag, add bool) []data.Flag {
