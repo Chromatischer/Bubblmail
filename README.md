@@ -6,27 +6,10 @@ A keyboard-driven terminal email client built for people who live in the shell. 
 
 ---
 
-## Screenshot
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│ bubblmail                                              ● synced         │
-│  work › INBOX                                                           │
-├─────────────────────────────────────────────────────────────────────────┤
-│  ACCOUNTS    │  ▌ Alice Nguyen          invoice  Jun 12                 │
-│  ─────────── │    Re: Q2 invoices…              (3)                     │
-│  work        │  ● Bob Martinez                  Mon                     │
-│   INBOX  12  │    Deploy checklist for Friday                           │
-│   Sent       │  ○ Carol Kim            work      Jun 9                  │
-│   Drafts     │    Offsite logistics                                     │
-│   Archive    │  ○ Dave Okafor                   Jun 8                   │
-│  personal    │    Weekend plans                                         │
-│   INBOX   3  │                                                          │
-│   Sent       │                                                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│ j/k nav  enter open  c compose  r reply  / search  ? help               │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+## Screenshots
+![inbox](resources/images/inbox.png)
+![search](resources/images/search.png)
+![reader](resources/images/reader.png)
 
 ---
 
@@ -39,7 +22,7 @@ A keyboard-driven terminal email client built for people who live in the shell. 
 - **Compose, reply, reply-all, forward** — full composer with To/CC/Subject/Body fields
 - **Semantic search** — embed mail bodies via OpenRouter and rank results by vector similarity alongside keyword search; background backfill keeps the index fresh
 - **Quick actions** — press `←`/`→` in the inbox to reveal action panels that slide in from the edges of the selected row; press again to expose a second action, press a third time to execute; `Enter` executes the highlighted action at any step
-- **Smart move** — the MOVE quick action uses OpenRouter embeddings and cosine similarity to suggest the best destination folder automatically; falls back to the folder picker if no confident match is found
+- **Smart move** — the MOVE quick action uses OpenRouter embeddings and cosine similarity to suggest the best destination folder automatically
 - **Move to folder** — folder picker with QWERTY quick-select for fast filing
 - **Star and mark read/unread** — local flag changes synced back to IMAP
 - **Delete** — moves to Trash on the server
