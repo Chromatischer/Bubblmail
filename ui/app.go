@@ -99,6 +99,10 @@ type App struct {
 	embQueue  *embeddingQueue
 	debugFile *os.File
 
+	// Demo mode: skip IMAP connects and inject pre-canned data.
+	demoMode bool
+	demoData *demoInitData
+
 	// Classification (smart folders)
 	classifyClient  *classifylib.Client
 	classifyQueue   *classifylib.Queue
@@ -318,6 +322,20 @@ func (a *App) Init() tea.Cmd {
 	}
 
 	if len(a.cfg.Accounts) == 0 {
+		return tea.Batch(cmds...)
+	}
+
+	// In demo mode, inject pre-canned data instead of connecting to IMAP.
+	if a.demoMode && a.demoData != nil {
+		dd := a.demoData
+		cmds = append(cmds,
+			func() tea.Msg {
+				return imaplib.FolderListMsg{Account: dd.account, Folders: dd.folders}
+			},
+			func() tea.Msg {
+				return imaplib.MessageListMsg{Account: dd.account, Folder: "INBOX", Messages: dd.messages}
+			},
+		)
 		return tea.Batch(cmds...)
 	}
 

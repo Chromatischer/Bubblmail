@@ -10,19 +10,19 @@ A keyboard-driven terminal email client built for people who live in the shell. 
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│ bubblmail                                              ● synced          │
-│  work › INBOX                                                            │
+│ bubblmail                                              ● synced         │
+│  work › INBOX                                                           │
 ├─────────────────────────────────────────────────────────────────────────┤
-│  ACCOUNTS    │  ▌ Alice Nguyen          invoice  Jun 12                  │
-│  ─────────── │    Re: Q2 invoices…              (3)                      │
+│  ACCOUNTS    │  ▌ Alice Nguyen          invoice  Jun 12                 │
+│  ─────────── │    Re: Q2 invoices…              (3)                     │
 │  work        │  ● Bob Martinez                  Mon                     │
 │   INBOX  12  │    Deploy checklist for Friday                           │
 │   Sent       │  ○ Carol Kim            work      Jun 9                  │
-│   Drafts     │    Offsite logistics                                      │
+│   Drafts     │    Offsite logistics                                     │
 │   Archive    │  ○ Dave Okafor                   Jun 8                   │
-│  personal    │    Weekend plans                                          │
-│   INBOX   3  │                                                           │
-│   Sent       │                                                           │
+│  personal    │    Weekend plans                                         │
+│   INBOX   3  │                                                          │
+│   Sent       │                                                          │
 ├─────────────────────────────────────────────────────────────────────────┤
 │ j/k nav  enter open  c compose  r reply  / search  ? help               │
 └─────────────────────────────────────────────────────────────────────────┘
