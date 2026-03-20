@@ -568,7 +568,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		if a.viewID == ViewReader {
-			a.readerView.UpdateMessageBody(msg.UID, msg.Text, msg.HTML, msg.Attachments)
+			a.readerView.UpdateMessageBody(msg.Folder, msg.UID, msg.Text, msg.HTML, msg.Attachments)
 		}
 		if msg.MsgID > 0 && a.embQueue != nil && msg.Text != "" {
 			m := a.findMessageByID(msg.MsgID)
@@ -1218,6 +1218,11 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return a, cmd
 			}
 		}
+		if a.viewID == ViewReader {
+			if msg := a.readerView.CurrentMessage(); msg != nil && msg.Body == "" && msg.HTMLBody == "" {
+				return a, a.openMessage(msg)
+			}
+		}
 		if (a.viewID == ViewInbox || a.viewID == ViewSmartFolder) && a.quickMenu != nil && a.quickMenu.side != quickMenuNone {
 			cmd := a.handleQuickMenuEnter()
 			return a, cmd
@@ -1722,12 +1727,20 @@ func (a *App) openMessage(msg *data.Message) tea.Cmd {
 		msg.Flags = append(msg.Flags, data.FlagSeen)
 	}
 
-	// Fetch body if not yet loaded
+	// Fetch body if not yet loaded, using the message's own account/folder.
 	var fetchCmd tea.Cmd
 	if msg.Body == "" {
-		client, ok := a.imapClients[a.activeAccount]
+		acctName := msg.AccountName
+		if acctName == "" {
+			acctName = a.activeAccount
+		}
+		folder := msg.FolderName
+		if folder == "" {
+			folder = a.activeFolder
+		}
+		client, ok := a.imapClients[acctName]
 		if ok {
-			fetchCmd = client.FetchBody(a.activeFolder, msg.UID, msg.ID)
+			fetchCmd = client.FetchBody(folder, msg.UID, msg.ID)
 		}
 	}
 
@@ -1759,12 +1772,22 @@ func (a *App) openThread(t *data.Thread) tea.Cmd {
 	t.HasUnread = false
 	
 	// Fetch body for every message in the thread that doesn't have one yet.
-	client, ok := a.imapClients[a.activeAccount]
-	if ok {
-		for _, msg := range t.Messages {
-			if msg.Body == "" && msg.HTMLBody == "" {
-				cmds = append(cmds, client.FetchBody(a.activeFolder, msg.UID, msg.ID))
+	// Use each message's own account and folder — threads can span folders (e.g. INBOX + Sent).
+	for _, msg := range t.Messages {
+		if msg.Body == "" && msg.HTMLBody == "" {
+			acctName := msg.AccountName
+			if acctName == "" {
+				acctName = a.activeAccount
 			}
+			client, ok := a.imapClients[acctName]
+			if !ok {
+				continue
+			}
+			folder := msg.FolderName
+			if folder == "" {
+				folder = a.activeFolder
+			}
+			cmds = append(cmds, client.FetchBody(folder, msg.UID, msg.ID))
 		}
 	}
 

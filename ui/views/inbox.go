@@ -68,8 +68,25 @@ func (v *InboxView) SetThreads(threads []*data.Thread) {
 
 // AppendThreads replaces the thread list while preserving cursor position.
 func (v *InboxView) AppendThreads(threads []*data.Thread) {
+	// Remember which thread is currently selected so we can find it after reorder.
+	var selectedID string
+	if v.cursor >= 0 && v.cursor < len(v.threads) {
+		selectedID = v.threads[v.cursor].ID
+	}
+
 	v.threads = threads
 	v.selectionAnchor = -1
+
+	// Try to find the previously selected thread in the new (possibly reordered) list.
+	if selectedID != "" {
+		for i, t := range v.threads {
+			if t.ID == selectedID {
+				v.cursor = i
+				return
+			}
+		}
+	}
+	// Fallback: clamp cursor.
 	if v.cursor >= len(v.threads) {
 		v.cursor = len(v.threads) - 1
 	}

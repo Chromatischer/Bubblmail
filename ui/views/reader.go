@@ -139,12 +139,13 @@ func (v *ReaderView) FocusedEventAction() string {
 // SuggestedEvent returns the current event suggestion.
 func (v *ReaderView) SuggestedEvent() *data.SuggestedEvent { return v.event }
 
-// UpdateMessageBody updates the body of the message with the given UID in the
+// UpdateMessageBody updates the body of the message with the given folder+UID in the
 // current thread (or single message) and rebuilds lines without resetting scroll.
-func (v *ReaderView) UpdateMessageBody(uid uint32, text, html string, attachments []data.Attachment) {
+// Both folder and uid must match to avoid cross-folder UID collisions.
+func (v *ReaderView) UpdateMessageBody(folder string, uid uint32, text, html string, attachments []data.Attachment) {
 	if v.thread != nil {
 		for _, m := range v.thread.Messages {
-			if m.UID == uid {
+			if m.UID == uid && m.FolderName == folder {
 				m.Body = text
 				m.HTMLBody = html
 				m.Attachments = attachments
@@ -153,7 +154,7 @@ func (v *ReaderView) UpdateMessageBody(uid uint32, text, html string, attachment
 			}
 		}
 	}
-	if v.message != nil && v.message.UID == uid {
+	if v.message != nil && v.message.UID == uid && v.message.FolderName == folder {
 		v.message.Body = text
 		v.message.HTMLBody = html
 		v.message.Attachments = attachments
