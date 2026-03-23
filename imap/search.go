@@ -29,14 +29,28 @@ func (c *Client) searchIMAP(folder, query string) ([]*data.Message, error) {
 		return nil, err
 	}
 
-	// Search for messages containing the query in body or subject header
-	criteria := &imaplib.SearchCriteria{
-		Or: [][2]imaplib.SearchCriteria{
+	pq := data.ParseSearchQuery(query)
+	criteria := &imaplib.SearchCriteria{}
+
+	// Free-text: search body or full message text
+	if pq.FreeText != "" {
+		criteria.Or = [][2]imaplib.SearchCriteria{
 			{
-				{Text: []string{query}},
-				{Body: []string{query}},
+				{Text: []string{pq.FreeText}},
+				{Body: []string{pq.FreeText}},
 			},
-		},
+		}
+	}
+
+	// From / To / Subject header filters
+	for _, addr := range pq.From {
+		criteria.Header = append(criteria.Header, imaplib.SearchCriteriaHeaderField{Key: "From", Value: addr})
+	}
+	for _, addr := range pq.To {
+		criteria.Header = append(criteria.Header, imaplib.SearchCriteriaHeaderField{Key: "To", Value: addr})
+	}
+	if pq.Subject != "" {
+		criteria.Header = append(criteria.Header, imaplib.SearchCriteriaHeaderField{Key: "Subject", Value: pq.Subject})
 	}
 
 	searchOpts := &imaplib.SearchOptions{

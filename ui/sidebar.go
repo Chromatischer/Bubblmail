@@ -199,7 +199,7 @@ func (sb *Sidebar) View() string {
 		row++
 
 		folders := sb.folders[acct.Name]
-		for _, f := range folders {
+		for fi, f := range folders {
 			isActive := acct.Name == sb.activeAccount && f.Name == sb.activeFolder
 			isCursor := sb.focused && acct.Name == sb.cursorAccount && f.Name == sb.cursorFolder
 
@@ -230,36 +230,36 @@ func (sb *Sidebar) View() string {
 				name = icon + " " + name
 			}
 
-			// Build indent: depth spaces, then cursor indicator or space
-			baseIndent := strings.Repeat("  ", f.Depth)
-			var indent string
-			if isCursor {
-				marker := lipgloss.NewStyle().Foreground(theme.Accent)
-				if isActive {
-					marker = marker.Background(theme.Accent).Foreground(theme.Background)
-				}
-				indent = "  " + baseIndent + marker.Render(">") + " "
-			} else {
-				indent = "  " + baseIndent + "  "
+			// Tree-line prefix (always shown) + leading space
+			treePfx := " " + sidebarTreePrefix(folders, fi)
+			treeStyle := lipgloss.NewStyle().Foreground(theme.Border)
+			if isActive {
+				treeStyle = treeStyle.Background(theme.Accent)
+			} else if isCursor {
+				treeStyle = treeStyle.Background(theme.Surface)
 			}
+			indent := treeStyle.Render(treePfx)
 
 			var line string
 			if f.Unread > 0 {
 				var countStyle lipgloss.Style
 				if isActive {
-					countStyle = lipgloss.NewStyle().Foreground(theme.Background).Background(theme.Accent)
+					countStyle = lipgloss.NewStyle().Foreground(theme.Background).Background(theme.Accent).Bold(true)
 				} else {
-					countStyle = lipgloss.NewStyle().Foreground(theme.Unread)
+					countStyle = lipgloss.NewStyle().Foreground(theme.Unread).Bold(true)
 				}
-				unreadStr := countStyle.Render(fmt.Sprintf(" %d", f.Unread))
-				available := sb.width - lipgloss.Width(indent) - 2 - lipgloss.Width(unreadStr)
+				badge := fmt.Sprintf("●%d", f.Unread)
+				badgeStr := countStyle.Render(badge)
+				// available width: total − treePrefix(plain) − 2 padding − badge
+				treePfxW := len([]rune(treePfx)) // safe since treePfx is ASCII
+				available := sb.width - treePfxW - 2 - len([]rune(badge))
 				if available < 0 {
 					available = 0
 				}
 				nameTrunc := truncateFolderName(name, available)
-				line = folderStyle.Render(indent+nameTrunc) + unreadStr
+				line = indent + folderStyle.Render(nameTrunc) + badgeStr
 			} else {
-				line = folderStyle.Render(indent + name)
+				line = indent + folderStyle.Render(name)
 			}
 
 			// Pad to full width
@@ -288,7 +288,7 @@ func (sb *Sidebar) View() string {
 		lines = append(lines, sectionLine)
 		row++
 
-		for _, cat := range sb.smartCategories {
+		for ci, cat := range sb.smartCategories {
 			isActive := sb.activeAccount == "" && sb.activeFolder == cat
 			isCursor := sb.focused && sb.cursorAccount == "" && sb.cursorFolder == cat
 
@@ -317,35 +317,51 @@ func (sb *Sidebar) View() string {
 				name = catIcon + " " + name
 			}
 
-			var indent string
-			if isCursor {
-				marker := lipgloss.NewStyle().Foreground(theme.Accent)
-				if isActive {
-					marker = marker.Background(theme.Accent).Foreground(theme.Background)
-				}
-				indent = "  " + marker.Render(">") + " "
+			// Tree-line prefix: same style as regular folders (flat list, depth 0)
+			isLastCat := ci == len(sb.smartCategories)-1
+			var branch string
+			if isLastCat {
+				branch = "└─ "
 			} else {
-				indent = "    "
+				branch = "├─ "
 			}
+			treePfx := " " + branch
+			treePfxW := len([]rune(treePfx)) // ASCII-safe
+			treeStyle := lipgloss.NewStyle().Foreground(theme.Border)
+			if isActive {
+				treeStyle = treeStyle.Background(theme.Accent)
+			} else if isCursor {
+				treeStyle = treeStyle.Background(theme.Surface)
+			}
+			indent := treeStyle.Render(treePfx)
+
+			// innerW: sidebar content width minus border/padding (1 left + 1 right).
+			innerW := sb.width - 2
+			nameW := innerW - treePfxW
 
 			count := sb.smartCounts[cat]
 			var line string
 			if count > 0 {
 				var countStyle lipgloss.Style
 				if isActive {
-					countStyle = lipgloss.NewStyle().Foreground(theme.Background).Background(theme.Accent)
+					countStyle = lipgloss.NewStyle().Foreground(theme.Background).Background(theme.Accent).Bold(true)
 				} else {
-					countStyle = lipgloss.NewStyle().Foreground(theme.Unread)
+					countStyle = lipgloss.NewStyle().Foreground(theme.Unread).Bold(true)
 				}
-				countStr := countStyle.Render(fmt.Sprintf(" %d", count))
-				available := sb.width - lipgloss.Width(indent) - 2 - lipgloss.Width(countStr)
-				if available < 0 {
-					available = 0
+				badge := fmt.Sprintf("●%d", count)
+				badgeStr := countStyle.Render(badge)
+				// nameW - badgeW leaves a fixed slot for the name; Width(N) pads
+				// it so the badge always lands at the right edge.
+				cellW := nameW - len([]rune(badge))
+				if cellW < 0 {
+					cellW = 0
 				}
-				nameTrunc := truncateFolderName(name, available)
-				line = folderStyle.Render(indent+nameTrunc) + countStr
+				nameTrunc := truncateFolderName(name, cellW)
+				nameCell := folderStyle.Width(cellW).Render(nameTrunc)
+				line = indent + nameCell + badgeStr
 			} else {
-				line = folderStyle.Render(indent + name)
+				nameTrunc := truncateFolderName(name, nameW)
+				line = indent + folderStyle.Width(nameW).Render(nameTrunc)
 			}
 
 			// Pad to full width
@@ -407,6 +423,45 @@ func (sb *Sidebar) View() string {
 		Width(sb.width).
 		Height(sb.height).
 		Render(content)
+}
+
+// sidebarTreePrefix returns the tree-drawing prefix (e.g. "│  ├─ ") for
+// folder at index idx in the folder slice. Each depth level occupies 3 columns.
+func sidebarTreePrefix(folders []*data.Folder, idx int) string {
+	d := folders[idx].Depth
+	var b strings.Builder
+	// Ancestor vertical lines: │  or spaces
+	for a := 0; a < d; a++ {
+		drawBar := false
+		for j := idx + 1; j < len(folders); j++ {
+			if folders[j].Depth <= a {
+				drawBar = folders[j].Depth == a
+				break
+			}
+		}
+		if drawBar {
+			b.WriteString("│  ")
+		} else {
+			b.WriteString("   ")
+		}
+	}
+	// Branch connector for current node
+	isLast := true
+	for j := idx + 1; j < len(folders); j++ {
+		if folders[j].Depth < d {
+			break
+		}
+		if folders[j].Depth == d {
+			isLast = false
+			break
+		}
+	}
+	if isLast {
+		b.WriteString("└─ ")
+	} else {
+		b.WriteString("├─ ")
+	}
+	return b.String()
 }
 
 func truncateFolderName(name string, maxCols int) string {
