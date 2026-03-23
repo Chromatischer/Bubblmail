@@ -684,6 +684,93 @@ func (s *Store) SearchLocalFiltered(query, account, folder string, limit int) ([
 	return scanMessagesWithAccount(rows)
 }
 
+// KnownAddresses returns a sorted, deduplicated list of all email addresses
+// seen in From, To, and CC fields across all cached messages.
+func (s *Store) KnownAddresses() ([]string, error) {
+	rows, err := s.db.Query(`
+		SELECT from_addr FROM messages WHERE from_addr != '' AND from_addr != '[]'
+		UNION ALL
+		SELECT to_addr   FROM messages WHERE to_addr   != '' AND to_addr   != '[]'
+		UNION ALL
+		SELECT cc_addr   FROM messages WHERE cc_addr   != '' AND cc_addr   != '[]'
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	seen := make(map[string]bool)
+	var result []string
+	for rows.Next() {
+		var jsonStr string
+		if err := rows.Scan(&jsonStr); err != nil {
+			continue
+		}
+		var addrs []data.Address
+		if err := json.Unmarshal([]byte(jsonStr), &addrs); err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if addr.Address != "" && !seen[addr.Address] {
+				seen[addr.Address] = true
+				result = append(result, addr.Address)
+			}
+		}
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+// SearchLocalWithFilters performs a full-text search with optional chip filters
+// parsed from a compiled query string like "[from:alice@x.com] invoice".
+func (s *Store) SearchLocalWithFilters(compiledQuery string) ([]*data.Message, error) {
+	pq := data.ParseSearchQuery(compiledQuery)
+
+	if pq.FreeText == "" && len(pq.From) == 0 && len(pq.To) == 0 && pq.Subject == "" {
+		return nil, nil
+	}
+
+	var b strings.Builder
+	b.WriteString(`SELECT m.id, m.uid, 0, m.message_id, m.in_reply_to, m.refs,
+		       m.subject, m.from_addr, m.to_addr, m.cc_addr, m.date,
+		       m.flags, m.size, m.snippet, m.thread_id,
+		       m.account_name, m.folder_name
+		FROM messages m`)
+
+	var args []any
+	var conditions []string
+
+	if pq.FreeText != "" {
+		b.WriteString("\n\tJOIN messages_fts ON messages_fts.docid = m.id")
+		conditions = append(conditions, "messages_fts MATCH ?")
+		args = append(args, pq.FreeText)
+	}
+	for _, addr := range pq.From {
+		conditions = append(conditions, "m.from_addr LIKE ?")
+		args = append(args, "%"+addr+"%")
+	}
+	for _, addr := range pq.To {
+		conditions = append(conditions, "(m.to_addr LIKE ? OR m.cc_addr LIKE ?)")
+		args = append(args, "%"+addr+"%", "%"+addr+"%")
+	}
+	if pq.Subject != "" {
+		conditions = append(conditions, "m.subject LIKE ?")
+		args = append(args, "%"+pq.Subject+"%")
+	}
+
+	if len(conditions) > 0 {
+		b.WriteString("\n\tWHERE " + strings.Join(conditions, " AND "))
+	}
+	b.WriteString("\n\tORDER BY m.date DESC LIMIT 100")
+
+	rows, err := s.db.Query(b.String(), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanMessagesWithAccount(rows)
+}
+
 // SetFlags updates flags for a message by UID.
 func (s *Store) SetFlags(account, folder string, uid uint32, flags []data.Flag) error {
 	_, err := s.db.Exec(`
@@ -994,13 +1081,14 @@ func (s *Store) GetMessagesByCategory(accountName, category string) ([]*data.Mes
 	return scanMessagesWithAccount(rows)
 }
 
-// GetCategoryCounts returns a map of category → message count for an account.
+// GetCategoryCounts returns a map of category → unread message count for an account.
 func (s *Store) GetCategoryCounts(accountName string) (map[string]int, error) {
 	rows, err := s.db.Query(`
 		SELECT mc.category, COUNT(*) as cnt
 		FROM message_categories mc
 		JOIN messages m ON m.id = mc.message_id
 		WHERE m.account_name = ?
+		  AND m.flags NOT LIKE '%\Seen%'
 		GROUP BY mc.category
 	`, accountName)
 	if err != nil {

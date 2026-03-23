@@ -19,13 +19,14 @@ import (
 // Thread mode: thread != nil — all messages rendered oldest→newest, scrolled to latest.
 // Single mode: message != nil — classic static-header + scrollable-body layout.
 type ReaderView struct {
-	theme      *config.Theme
-	width      int
-	height     int
-	thread     *data.Thread  // thread mode
-	message    *data.Message // single-message mode
-	event      *data.SuggestedEvent
-	eventFocus int
+	theme        *config.Theme
+	width        int
+	height       int
+	thread       *data.Thread  // thread mode
+	message      *data.Message // single-message mode
+	quotesFolded bool          // collapse quoted blocks into summary lines
+	event        *data.SuggestedEvent
+	eventFocus   int
 	// attachment focus state (single-message mode only)
 	attachFocus       int // -1 = none, 0+ = focused attachment index
 	attachActionFocus int // 0=Open, 1=Download, 2=Editor
@@ -41,8 +42,17 @@ type ReaderView struct {
 
 // NewReaderView creates a new reader view.
 func NewReaderView(theme *config.Theme) *ReaderView {
-	return &ReaderView{theme: theme}
+	return &ReaderView{theme: theme, quotesFolded: true}
 }
+
+// ToggleQuoteFolds toggles quote block folding and rebuilds the line cache.
+func (v *ReaderView) ToggleQuoteFolds() {
+	v.quotesFolded = !v.quotesFolded
+	v.rebuildLines()
+}
+
+// QuotesFolded reports whether quote blocks are currently collapsed.
+func (v *ReaderView) QuotesFolded() bool { return v.quotesFolded }
 
 // SetSize sets the view dimensions and re-renders cached lines.
 func (v *ReaderView) SetSize(w, h int) {
@@ -457,7 +467,11 @@ func (v *ReaderView) buildSingleLines() {
 		textWidth = 20
 	}
 	if bodyLoaded {
-		v.lines = render.RenderBody(v.message.Body, v.message.HTMLBody, textWidth, v.theme)
+		plainBody := v.message.Body
+		if v.quotesFolded && v.message.HTMLBody == "" && plainBody != "" {
+			plainBody = render.FoldQuoteBlocks(plainBody)
+		}
+		v.lines = render.RenderBody(plainBody, v.message.HTMLBody, textWidth, v.theme)
 	} else {
 		v.lines = nil
 	}
@@ -516,7 +530,11 @@ func (v *ReaderView) buildThreadLines() {
 		if msg.Body == "" && msg.HTMLBody == "" {
 			all = append(all, fmt.Sprintf("  (%s Loading…)", icons.Syncing))
 		} else {
-			all = append(all, render.RenderBody(msg.Body, msg.HTMLBody, textWidth, v.theme)...)
+			plainBody := msg.Body
+			if v.quotesFolded && msg.HTMLBody == "" && plainBody != "" {
+				plainBody = render.FoldQuoteBlocks(plainBody)
+			}
+			all = append(all, render.RenderBody(plainBody, msg.HTMLBody, textWidth, v.theme)...)
 		}
 		// The latest message's attachments are handled by the interactive
 		// section appended below; render all others non-interactively.

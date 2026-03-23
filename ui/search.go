@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/bubblmail/bubblmail/data"
@@ -10,13 +11,24 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// SearchChip is a structured filter attached to a search query.
+type SearchChip struct {
+	Key   string // "from", "to", "subject", "has"
+	Value string // e.g. "alice@example.com" or "attachment"
+}
+
+// String returns the bracketed chip representation included in compiled queries.
+func (c SearchChip) String() string {
+	return fmt.Sprintf("[%s:%s]", c.Key, c.Value)
+}
+
 // SearchOverlay is a floating search box with FTS + semantic results.
 type SearchOverlay struct {
 	styles   *Styles
 	width    int
 	height   int
 	active   bool
-	query    string
+	query    string // free-text portion
 	results  []*SearchResult
 	list     components.ScrollList
 	loading  bool
@@ -27,6 +39,14 @@ type SearchOverlay struct {
 
 	// spinner frame for loading indicator
 	spinnerFrame int
+
+	// filter chips
+	chips         []SearchChip
+	chipKey       string   // chip type being built ("from","to","subject","has"), "" = normal
+	chipInput     string   // value being typed for the active chip
+	autocomplete  []string // filtered suggestions shown during chip entry
+	acCursor      int      // cursor within autocomplete list
+	knownAddresses []string // address list mined from cache on open
 }
 
 // SearchResult holds a search match and its source labels.
@@ -42,6 +62,14 @@ var searchSpinnerFrames = []string{
 	icons.Spinner4, icons.Spinner5, icons.Spinner6,
 }
 
+// chipPrefixes maps typed prefixes to chip keys.
+var chipPrefixes = map[string]string{
+	"from:":    "from",
+	"to:":      "to",
+	"subject:": "subject",
+	"has:":     "has",
+}
+
 // NewSearchOverlay creates a new search overlay.
 func NewSearchOverlay(styles *Styles) *SearchOverlay {
 	return &SearchOverlay{styles: styles, minChars: 3}
@@ -50,10 +78,18 @@ func NewSearchOverlay(styles *Styles) *SearchOverlay {
 // SetSize sets the overlay dimensions.
 func (s *SearchOverlay) SetSize(w, h int) { s.width = w; s.height = h }
 
+// SetKnownAddresses provides the address list used for from:/to: autocomplete.
+func (s *SearchOverlay) SetKnownAddresses(addrs []string) { s.knownAddresses = addrs }
+
 // Open opens the overlay and resets all state.
 func (s *SearchOverlay) Open() {
 	s.active = true
 	s.query = ""
+	s.chips = nil
+	s.chipKey = ""
+	s.chipInput = ""
+	s.autocomplete = nil
+	s.acCursor = 0
 	s.results = nil
 	s.list.Reset()
 	s.loading = false
@@ -64,6 +100,9 @@ func (s *SearchOverlay) Open() {
 func (s *SearchOverlay) Close() {
 	s.active = false
 	s.query = ""
+	s.chips = nil
+	s.chipKey = ""
+	s.chipInput = ""
 	s.results = nil
 	s.loading = false
 }
@@ -74,17 +113,34 @@ func (s *SearchOverlay) IsActive() bool { return s.active }
 // IsLoading returns true if a search is in progress.
 func (s *SearchOverlay) IsLoading() bool { return s.loading }
 
-// Query returns the current search query.
+// Query returns the free-text portion of the current query.
 func (s *SearchOverlay) Query() string { return s.query }
 
-// CanSearch reports whether the query is long enough to trigger a search.
+// CompiledQuery returns the full search string including chip filters, e.g.
+// "[from:alice@x.com] [has:attachment] invoice". This is what gets sent to
+// both local FTS and IMAP search backends.
+func (s *SearchOverlay) CompiledQuery() string {
+	if len(s.chips) == 0 {
+		return s.query
+	}
+	var b strings.Builder
+	for _, c := range s.chips {
+		b.WriteString(c.String())
+		b.WriteString(" ")
+	}
+	b.WriteString(s.query)
+	return strings.TrimSpace(b.String())
+}
+
+// CanSearch reports whether there is enough input to trigger a search.
 func (s *SearchOverlay) CanSearch() bool {
+	if len(s.chips) > 0 {
+		return true
+	}
 	return len([]rune(strings.TrimSpace(s.query))) >= s.minChars
 }
 
 // BumpDebounce increments and returns the debounce counter.
-// The caller stores the returned ID and fires search only if the ID still
-// matches after the debounce delay.
 func (s *SearchOverlay) BumpDebounce() int {
 	s.debounceID++
 	return s.debounceID
@@ -149,12 +205,10 @@ func (s *SearchOverlay) SetCursor(idx int) {
 
 // HitTestResult returns the result index for a click at the given content-area y,
 // or -1 if no result row was hit.
-//
-// Geometry: the search box fills the content area with boxY0=1 (1-row gap from
-// lipgloss.Place centering). Inside the box: border(1)+padding(1)=2 rows of
-// overhead, then inputRow(1)+divider(1)=2 more, so result rows start at y=5.
 func (s *SearchOverlay) HitTestResult(contentY int) int {
-	const resultY0 = 5
+	// Geometry: box border(1)+padding(1)=2 rows overhead, then inputRow(1)+divider(1)=2,
+	// plus autocomplete rows (if shown), then results.
+	resultY0 := 5 + s.acRowCount()
 	i := contentY - resultY0
 	if i < 0 || i >= s.visibleRowCount() || s.list.Offset+i >= len(s.results) {
 		return -1
@@ -164,6 +218,59 @@ func (s *SearchOverlay) HitTestResult(contentY int) int {
 
 // HandleKey processes a key press. Returns (queryChanged, closed, selected).
 func (s *SearchOverlay) HandleKey(key string) (queryChanged bool, closed bool, selected bool) {
+	// ── Chip-entry mode ──────────────────────────────────────────────────────
+	if s.chipKey != "" {
+		switch key {
+		case "esc":
+			// Abort chip entry — restore chip prefix to free text
+			s.query += s.chipKey + ":"
+			s.chipKey = ""
+			s.chipInput = ""
+			s.autocomplete = nil
+			return true, false, false
+		case "enter":
+			val := s.commitChipValue()
+			if val != "" {
+				s.chips = append(s.chips, SearchChip{Key: s.chipKey, Value: val})
+			}
+			s.chipKey = ""
+			s.chipInput = ""
+			s.autocomplete = nil
+			s.acCursor = 0
+			s.list.Reset()
+			return true, false, false
+		case "up", "k":
+			if s.acCursor > 0 {
+				s.acCursor--
+			}
+		case "down", "j":
+			if s.acCursor < len(s.autocomplete)-1 {
+				s.acCursor++
+			}
+		case "backspace", "ctrl+h":
+			if len(s.chipInput) > 0 {
+				runes := []rune(s.chipInput)
+				s.chipInput = string(runes[:len(runes)-1])
+				s.updateAutocomplete()
+				s.acCursor = 0
+			} else {
+				// Empty chip input: exit chip mode entirely
+				s.chipKey = ""
+				s.autocomplete = nil
+			}
+			return true, false, false
+		default:
+			if len(key) == 1 && key[0] >= 32 {
+				s.chipInput += key
+				s.updateAutocomplete()
+				s.acCursor = 0
+				return true, false, false
+			}
+		}
+		return false, false, false
+	}
+
+	// ── Normal mode ──────────────────────────────────────────────────────────
 	switch key {
 	case "esc":
 		s.Close()
@@ -177,6 +284,17 @@ func (s *SearchOverlay) HandleKey(key string) (queryChanged bool, closed bool, s
 		s.list.MoveUp()
 	case "down", "j":
 		s.list.MoveDown(len(s.results), s.visibleRowCount())
+	case "left":
+		// Move cursor into the last chip for editing (no deletion).
+		if s.query == "" && len(s.chips) > 0 {
+			last := s.chips[len(s.chips)-1]
+			s.chips = s.chips[:len(s.chips)-1]
+			s.chipKey = last.Key
+			s.chipInput = last.Value
+			s.updateAutocomplete()
+			s.acCursor = 0
+			return true, false, false
+		}
 	case "backspace", "ctrl+h":
 		if len(s.query) > 0 {
 			runes := []rune(s.query)
@@ -184,14 +302,99 @@ func (s *SearchOverlay) HandleKey(key string) (queryChanged bool, closed bool, s
 			s.list.Reset()
 			return true, false, false
 		}
+		// Enter the last chip for editing, deleting its last character.
+		if len(s.chips) > 0 {
+			last := s.chips[len(s.chips)-1]
+			s.chips = s.chips[:len(s.chips)-1]
+			s.chipKey = last.Key
+			runes := []rune(last.Value)
+			if len(runes) > 0 {
+				s.chipInput = string(runes[:len(runes)-1])
+			} else {
+				s.chipInput = ""
+			}
+			s.updateAutocomplete()
+			s.acCursor = 0
+			s.list.Reset()
+			return true, false, false
+		}
 	default:
 		if len(key) == 1 && key[0] >= 32 {
 			s.query += key
+			// Check if query ends with a chip prefix trigger
+			if chipKey, triggered := s.detectChipTrigger(); triggered {
+				s.chipKey = chipKey
+				s.chipInput = ""
+				s.updateAutocomplete()
+				s.acCursor = 0
+				return true, false, false
+			}
 			s.list.Reset()
 			return true, false, false
 		}
 	}
 	return false, false, false
+}
+
+// detectChipTrigger checks if the current query ends with a chip prefix like
+// "from:". If so, it strips the prefix from query and returns the chip key.
+func (s *SearchOverlay) detectChipTrigger() (string, bool) {
+	for prefix, key := range chipPrefixes {
+		if strings.HasSuffix(s.query, prefix) {
+			s.query = strings.TrimSuffix(s.query, prefix)
+			// Strip any trailing space that was before the prefix
+			s.query = strings.TrimRight(s.query, " ")
+			return key, true
+		}
+	}
+	return "", false
+}
+
+// updateAutocomplete rebuilds the filtered autocomplete list for the current
+// chip type and chipInput.
+func (s *SearchOverlay) updateAutocomplete() {
+	switch s.chipKey {
+	case "from", "to":
+		input := strings.ToLower(s.chipInput)
+		s.autocomplete = s.autocomplete[:0]
+		for _, addr := range s.knownAddresses {
+			if input == "" || strings.Contains(strings.ToLower(addr), input) {
+				s.autocomplete = append(s.autocomplete, addr)
+				if len(s.autocomplete) >= 6 {
+					break
+				}
+			}
+		}
+	case "has":
+		if strings.HasPrefix("attachment", strings.ToLower(s.chipInput)) {
+			s.autocomplete = []string{"attachment"}
+		} else {
+			s.autocomplete = nil
+		}
+	default:
+		s.autocomplete = nil
+	}
+}
+
+// commitChipValue returns the value to commit for the active chip. If an
+// autocomplete item is selected it is used; otherwise the raw chipInput.
+func (s *SearchOverlay) commitChipValue() string {
+	if s.acCursor >= 0 && s.acCursor < len(s.autocomplete) {
+		return s.autocomplete[s.acCursor]
+	}
+	return strings.TrimSpace(s.chipInput)
+}
+
+// acRowCount returns how many autocomplete rows are currently displayed.
+func (s *SearchOverlay) acRowCount() int {
+	if s.chipKey == "" || len(s.autocomplete) == 0 {
+		return 0
+	}
+	n := len(s.autocomplete)
+	if n > 4 {
+		n = 4
+	}
+	return n + 1 // +1 for the AC divider line
 }
 
 // visibleRowCount returns how many result rows fit inside the overlay.
@@ -200,8 +403,8 @@ func (s *SearchOverlay) visibleRowCount() int {
 	if boxH < 10 {
 		boxH = 10
 	}
-	// Padding(1,2) consumes 2 rows; input + divider + footer consume 3 more.
-	vr := boxH - 5
+	// Padding(1,2) = 2 rows; input(1)+divider(1)+footer(1) = 3; ac rows on top.
+	vr := boxH - 5 - s.acRowCount()
 	if vr < 1 {
 		vr = 1
 	}
@@ -239,15 +442,42 @@ func (s *SearchOverlay) View() string {
 
 	// ── Input row ────────────────────────────────────────────────────────────
 	ti := components.NewTextInput(theme)
-	ti.Placeholder = "Search mail…"
-	ti.Value = s.query
+	ti.Placeholder = "Search mail… (type from: to: subject: has:)"
+	ti.Value = s.inputDisplayValue()
 	ti.Icon = icons.Search
-	ti.Active = true
+	ti.Active = s.chipKey == ""
 
 	inputRow := ti.Render(innerW)
 
 	// ── Divider ──────────────────────────────────────────────────────────────
 	divider := components.Divider(theme, innerW)
+
+	// ── Autocomplete rows (chip mode only) ───────────────────────────────────
+	var acLines []string
+	if s.chipKey != "" && len(s.autocomplete) > 0 {
+		maxAC := len(s.autocomplete)
+		if maxAC > 4 {
+			maxAC = 4
+		}
+		for i := 0; i < maxAC; i++ {
+			addr := s.autocomplete[i]
+			selected := i == s.acCursor
+			bg := surf
+			fg := theme.Text
+			if selected {
+				bg = theme.Selected
+				fg = theme.Background
+			}
+			row := lipgloss.NewStyle().
+				Width(innerW).
+				Background(bg).
+				Foreground(fg).
+				Render(" " + util.TruncateText(addr, innerW-2))
+			acLines = append(acLines, row)
+		}
+		// Separator below AC list
+		acLines = append(acLines, components.Divider(theme, innerW))
+	}
 
 	// ── Result rows ──────────────────────────────────────────────────────────
 	blankLine := lipgloss.NewStyle().Background(surf).Width(innerW).Render("")
@@ -257,11 +487,12 @@ func (s *SearchOverlay) View() string {
 		var stateMsg string
 		var stateColor lipgloss.Color
 		switch {
-		case s.query == "":
-			stateMsg = "Type to search"
-			stateColor = theme.TextFaint
 		case !s.CanSearch():
-			stateMsg = "Keep typing…"
+			if s.query == "" && len(s.chips) == 0 {
+				stateMsg = "Type to search, or use from: to: subject: has:"
+			} else {
+				stateMsg = "Keep typing…"
+			}
 			stateColor = theme.TextFaint
 		case s.loading:
 			stateMsg = searchSpinnerFrames[s.spinnerFrame] + " Searching…"
@@ -270,7 +501,6 @@ func (s *SearchOverlay) View() string {
 			stateMsg = "No results"
 			stateColor = theme.TextMuted
 		}
-		// Center the message vertically within vr rows, all with Surface bg.
 		topPad := (vr - 1) / 2
 		for i := 0; i < topPad; i++ {
 			resultLines = append(resultLines, blankLine)
@@ -323,12 +553,29 @@ func (s *SearchOverlay) View() string {
 	}
 
 	// ── Assemble ─────────────────────────────────────────────────────────────
-	lines := make([]string, 0, 3+vr)
+	lines := make([]string, 0, 3+len(acLines)+vr)
 	lines = append(lines, inputRow, divider)
+	lines = append(lines, acLines...)
 	lines = append(lines, resultLines...)
 	lines = append(lines, footerStr)
 
 	return components.ModalBox(theme, strings.Join(lines, "\n"), boxW, boxH, s.width, s.height)
+}
+
+// inputDisplayValue builds the text shown in the input box: committed chips
+// followed by the current free-text query or chip-in-progress value.
+func (s *SearchOverlay) inputDisplayValue() string {
+	var b strings.Builder
+	for _, c := range s.chips {
+		b.WriteString(c.String())
+		b.WriteString(" ")
+	}
+	if s.chipKey != "" {
+		b.WriteString(s.chipKey + ":" + s.chipInput)
+	} else {
+		b.WriteString(s.query)
+	}
+	return b.String()
 }
 
 // renderRow renders a single search result at the given width.
@@ -374,7 +621,6 @@ func (s *SearchOverlay) renderRow(res *SearchResult, selected bool, innerW int, 
 	unreadCell := cell(1, unreadFg, unreadChar)
 
 	// Date — fixed width so the indicator column stays vertically aligned.
-	// FormatDate can return "Yesterday" (9 cols); replace it before truncating.
 	const dateW = 6
 	dateFmt := util.FormatDate(msg.Date)
 	if dateFmt == "Yesterday" {
@@ -384,8 +630,6 @@ func (s *SearchOverlay) renderRow(res *SearchResult, selected bool, innerW int, 
 	dateCell := cell(dateW, metaFg, dateRaw)
 
 	// Match-type indicator: 1-col character right before the date.
-	// Rendered as a Width(2) cell (char + 1 padding space) to keep it tidy.
-	// * = semantic (AI embedding match)  ~ = similar (cosine distance)
 	const indCellW = 2
 	var indChar string
 	var indFg lipgloss.Color
@@ -402,7 +646,6 @@ func (s *SearchOverlay) renderRow(res *SearchResult, selected bool, innerW int, 
 	}
 	indCell := cell(indCellW, indFg, indChar)
 
-	// suffixW: sp(1) + ind(2) + sp(1) + date(6) = 10, constant across all rows
 	suffixW := 1 + indCellW + 1 + dateW
 
 	// From (fixed 18 cols)
@@ -410,14 +653,12 @@ func (s *SearchOverlay) renderRow(res *SearchResult, selected bool, innerW int, 
 	fromCell := cell(fromW, rowFg, util.TruncateText(util.SingleLine(msg.FromString()), fromW))
 
 	// Subject fills remaining space
-	// Layout: unread(1) + sp(1) + from(18) + sp(1) + subject + suffixW = innerW
 	subjectW := innerW - 1 - 1 - fromW - 1 - suffixW
 	if subjectW < 1 {
 		subjectW = 1
 	}
 	subjectCell := cell(subjectW, rowFg, util.TruncateText(util.SingleLine(msg.Subject), subjectW))
 
-	// Subject gets a dimmer style when read and not selected
 	if !selected && msg.IsRead() {
 		subjectCell = lipgloss.NewStyle().
 			Width(subjectW).

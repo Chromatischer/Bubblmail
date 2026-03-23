@@ -738,7 +738,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !a.searchOverlay.IsActive() || msg.id != a.searchOverlay.DebounceID() {
 			return a, nil
 		}
-		q := a.searchOverlay.Query()
+		q := a.searchOverlay.CompiledQuery()
 		if !a.searchOverlay.CanSearch() {
 			return a, nil
 		}
@@ -961,7 +961,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// ctrl+f triggers an IMAP server search using the current query
 		if key == "ctrl+f" {
 			if client, ok := a.imapClients[a.activeAccount]; ok {
-				q := a.searchOverlay.Query()
+				q := a.searchOverlay.CompiledQuery()
 				a.searchOverlay.SetSearchResults(nil, true)
 				a.flash(fmt.Sprintf("%s Searching server…", icons.Search), "info")
 				cmds := []tea.Cmd{client.SearchIMAP(a.activeFolder, q)}
@@ -1092,6 +1092,11 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "?":
 		a.showHelp = true
 
+	case "z":
+		if a.viewID == ViewReader {
+			a.readerView.ToggleQuoteFolds()
+		}
+
 	case "b":
 		a.wantSidebar = !a.wantSidebar
 		a.updateLayout()
@@ -1135,6 +1140,9 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			contentH = 1
 		}
 		a.searchOverlay.SetSize(a.width, contentH)
+		if addrs, err := a.store.KnownAddresses(); err == nil {
+			a.searchOverlay.SetKnownAddresses(addrs)
+		}
 		a.searchOverlay.Open()
 		a.searchState = nil
 
@@ -1216,11 +1224,6 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if a.viewID == ViewReader && a.readerView.HasFocusableEvent() {
 			if cmd := a.copySuggestedEvent(); cmd != nil {
 				return a, cmd
-			}
-		}
-		if a.viewID == ViewReader {
-			if msg := a.readerView.CurrentMessage(); msg != nil && msg.Body == "" && msg.HTMLBody == "" {
-				return a, a.openMessage(msg)
 			}
 		}
 		if (a.viewID == ViewInbox || a.viewID == ViewSmartFolder) && a.quickMenu != nil && a.quickMenu.side != quickMenuNone {
@@ -1711,41 +1714,13 @@ func (a *App) handleEnter() tea.Cmd {
 // --- message/folder actions ---
 
 func (a *App) openMessage(msg *data.Message) tea.Cmd {
-	a.prevViewID = a.viewID
-	a.readerView.SetMessage(msg)
-	a.viewID = ViewReader
-
-	// Mark as read
-	var markCmd tea.Cmd
-	if !msg.IsRead() {
-		client, ok := a.imapClients[a.activeAccount]
-		if ok {
-			markCmd = client.SetFlag(a.activeFolder, msg.UID, data.FlagSeen, true)
-		}
-		_ = a.store.SetFlags(a.activeAccount, a.activeFolder, msg.UID,
-			append(msg.Flags, data.FlagSeen))
-		msg.Flags = append(msg.Flags, data.FlagSeen)
+	t := &data.Thread{
+		ID:       msg.ThreadID,
+		Subject:  msg.Subject,
+		Messages: []*data.Message{msg},
+		LastDate: msg.Date,
 	}
-
-	// Fetch body if not yet loaded, using the message's own account/folder.
-	var fetchCmd tea.Cmd
-	if msg.Body == "" {
-		acctName := msg.AccountName
-		if acctName == "" {
-			acctName = a.activeAccount
-		}
-		folder := msg.FolderName
-		if folder == "" {
-			folder = a.activeFolder
-		}
-		client, ok := a.imapClients[acctName]
-		if ok {
-			fetchCmd = client.FetchBody(folder, msg.UID, msg.ID)
-		}
-	}
-
-	suggestCmd := a.loadSuggestedEvent(msg)
-	return tea.Batch(markCmd, fetchCmd, suggestCmd)
+	return a.openThread(t)
 }
 
 // openThread opens a full thread in the reader, fetching bodies for any
@@ -2448,7 +2423,7 @@ func (a *App) archiveMessage() tea.Cmd {
 
 func (a *App) doLocalSearch(q string) tea.Cmd {
 	return func() tea.Msg {
-		msgs, err := a.store.SearchLocal(q)
+		msgs, err := a.store.SearchLocalWithFilters(q)
 		if err != nil {
 			return imaplib.SearchResultMsg{Err: err}
 		}
@@ -2480,7 +2455,7 @@ func (a *App) doStreamingSearch(q string, seq int) tea.Cmd {
 		}
 
 		semItems := make([]embeddings.TopKItem, 0)
-		semMsgs, semErr := a.store.SearchLocal(query)
+		semMsgs, semErr := a.store.SearchLocalWithFilters(query)
 		if semErr == nil {
 			semItems = make([]embeddings.TopKItem, 0, len(semMsgs))
 			for i, msg := range semMsgs {

@@ -30,6 +30,7 @@ const (
 	KeyTag          = "t"
 	KeySearch       = "/"
 	KeyIMAPSearch   = "ctrl+f"
+	KeyFoldQuotes   = "z"
 	KeyInbox        = "i"
 	KeySidebar      = "b"
 	KeySidebarFocus = "\\"
@@ -68,6 +69,7 @@ func AllHelpLines() []HelpLine {
 		{icons.Read + " m", "Toggle read/unread"},
 		{icons.Tag + " t", "Tag picker"},
 		{"", ""},
+		{"z", "Toggle quote folding"},
 		{icons.Search + " /", "Local search"},
 		{"ctrl+f", "IMAP server search"},
 		{icons.Inbox + " i", "Jump to INBOX"},
