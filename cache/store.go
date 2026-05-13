@@ -823,14 +823,16 @@ func (s *Store) UpsertFolders(account string, folders []*data.Folder) error {
 	for _, f := range folders {
 		attrs := strings.Join(f.Attributes, " ")
 		_, err := tx.Exec(`
-			INSERT INTO folders (account_name, name, display_name, delimiter, attributes, depth)
-			VALUES (?, ?, ?, ?, ?, ?)
+			INSERT INTO folders (account_name, name, display_name, delimiter, attributes, depth, unread, total)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(account_name, name) DO UPDATE SET
 				display_name = excluded.display_name,
 				delimiter    = excluded.delimiter,
 				attributes   = excluded.attributes,
-				depth        = excluded.depth
-		`, account, f.Name, f.DisplayName, f.Delimiter, attrs, f.Depth)
+				depth        = excluded.depth,
+				unread       = CASE WHEN excluded.unread > 0 THEN excluded.unread ELSE folders.unread END,
+				total        = CASE WHEN excluded.total  > 0 THEN excluded.total  ELSE folders.total  END
+		`, account, f.Name, f.DisplayName, f.Delimiter, attrs, f.Depth, f.Unread, f.Total)
 		if err != nil {
 			return err
 		}

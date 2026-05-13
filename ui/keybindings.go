@@ -69,7 +69,7 @@ func AllHelpLines() []HelpLine {
 		{icons.Read + " m", "Toggle read/unread"},
 		{icons.Tag + " t", "Tag picker"},
 		{"", ""},
-		{"z", "Toggle quote folding"},
+		{"z", "Toggle quote folding / fold sidebar folder"},
 		{icons.Search + " /", "Local search"},
 		{"ctrl+f", "IMAP server search"},
 		{icons.Inbox + " i", "Jump to INBOX"},

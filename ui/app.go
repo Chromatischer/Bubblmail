@@ -290,6 +290,10 @@ func NewApp(cfg *config.Config, store *cache.Store) *App {
 	app.sidebar.SetAccounts(app.accounts)
 	app.sidebar.SetActive(app.activeAccount, app.activeFolder)
 
+	if state, err := loadUIState(); err == nil {
+		app.sidebar.SetCollapsed(state.CollapsedFolders)
+	}
+
 	return app
 }
 
@@ -337,6 +341,14 @@ func (a *App) Init() tea.Cmd {
 			},
 		)
 		return tea.Batch(cmds...)
+	}
+
+	// Populate sidebar from cache immediately so it is visible before IMAP connects.
+	for i := range a.cfg.Accounts {
+		acfg := &a.cfg.Accounts[i]
+		if cached, err := a.store.GetFolders(acfg.Name); err == nil && len(cached) > 0 {
+			a.sidebar.SetFolders(acfg.Name, cached)
+		}
 	}
 
 	// Connect to all accounts and fetch folders/messages
@@ -1062,6 +1074,11 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				a.header.SetFolder(folder)
 				a.viewID = ViewInbox
 				return a, a.fetchMessages()
+			}
+		case "z":
+			if acct, folder, ok := a.sidebar.Selected(); ok {
+				a.sidebar.Toggle(acct, folder)
+				_ = saveUIState(&uiState{CollapsedFolders: a.sidebar.CollapsedKeys()})
 			}
 		case "esc", "h", "left", "tab", "q":
 			a.sidebarFocused = false

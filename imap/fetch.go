@@ -243,7 +243,16 @@ func (c *Client) AppendMessage(folder string, raw []byte, flags []data.Flag) tea
 // --- internal implementation ---
 
 func (c *Client) fetchFolders() ([]*data.Folder, error) {
-	mailboxes, err := c.conn.List("", "*", nil).Collect()
+	// Request STATUS (unread/total) alongside the folder list when the server
+	// supports LIST-STATUS (RFC 5819) or IMAP4rev2. Servers that don't support
+	// it silently omit the Status field; counts default to 0.
+	opts := &imaplib.ListOptions{
+		ReturnStatus: &imaplib.StatusOptions{
+			NumMessages: true,
+			NumUnseen:   true,
+		},
+	}
+	mailboxes, err := c.conn.List("", "*", opts).Collect()
 	if err != nil {
 		return nil, fmt.Errorf("listing mailboxes: %w", err)
 	}
@@ -263,14 +272,23 @@ func (c *Client) fetchFolders() ([]*data.Folder, error) {
 			attrs = append(attrs, string(a))
 		}
 
-		folders = append(folders, &data.Folder{
+		f := &data.Folder{
 			Name:        mb.Mailbox,
 			DisplayName: displayName,
 			Delimiter:   delim,
 			Attributes:  attrs,
 			Depth:       depth,
 			AccountName: c.cfg.Name,
-		})
+		}
+		if mb.Status != nil {
+			if mb.Status.NumUnseen != nil {
+				f.Unread = int(*mb.Status.NumUnseen)
+			}
+			if mb.Status.NumMessages != nil {
+				f.Total = int(*mb.Status.NumMessages)
+			}
+		}
+		folders = append(folders, f)
 	}
 	return folders, nil
 }
