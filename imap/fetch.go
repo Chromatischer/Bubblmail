@@ -89,6 +89,7 @@ type MoveMessageResultMsg struct {
 	Folder  string
 	UID     uint32
 	Dest    string
+	DestUID uint32
 	Err     error
 }
 
@@ -154,9 +155,16 @@ func (c *Client) MoveMessage(sourceFolder string, uid uint32, destFolder string)
 	return func() tea.Msg {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		err := c.moveToTrash(sourceFolder, uid, destFolder)
-		return MoveMessageResultMsg{Account: c.cfg.Name, Folder: sourceFolder, UID: uid, Dest: destFolder, Err: err}
+		destUID, err := c.moveToTrash(sourceFolder, uid, destFolder)
+		return MoveMessageResultMsg{Account: c.cfg.Name, Folder: sourceFolder, UID: uid, Dest: destFolder, DestUID: destUID, Err: err}
 	}
+}
+
+// MoveMessageSync moves a message to another folder and waits for completion.
+func (c *Client) MoveMessageSync(sourceFolder string, uid uint32, destFolder string) (uint32, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.moveToTrash(sourceFolder, uid, destFolder)
 }
 
 // MoveToTrash returns a tea.Cmd that moves a message to the trash folder.
@@ -165,7 +173,7 @@ func (c *Client) MoveToTrash(sourceFolder string, uid uint32, trashFolder string
 	return func() tea.Msg {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		err := c.moveToTrash(sourceFolder, uid, trashFolder)
+		_, err := c.moveToTrash(sourceFolder, uid, trashFolder)
 		return MoveToTrashResultMsg{Account: c.cfg.Name, Folder: sourceFolder, UID: uid, Err: err}
 	}
 }
@@ -178,6 +186,34 @@ func (c *Client) CreateFolder(name string) tea.Cmd {
 		err := c.conn.Create(name, nil).Wait()
 		return CreateFolderResultMsg{Account: c.cfg.Name, Name: name, Err: err}
 	}
+}
+
+// FetchBodySync fetches the full body of a message and waits for completion.
+func (c *Client) FetchBodySync(folder string, uid uint32) (string, string, []data.Attachment, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.fetchBody(folder, uid)
+}
+
+// CreateFolderSync creates an IMAP mailbox and waits for completion.
+func (c *Client) CreateFolderSync(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.Create(name, nil).Wait()
+}
+
+// RenameFolder renames an IMAP mailbox and waits for completion.
+func (c *Client) RenameFolder(oldName, newName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.Rename(oldName, newName).Wait()
+}
+
+// DeleteFolder deletes an IMAP mailbox and waits for completion.
+func (c *Client) DeleteFolder(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.Delete(name).Wait()
 }
 
 // AppendMessage returns a tea.Cmd that appends a raw RFC 2822 message to a
@@ -340,14 +376,30 @@ func (c *Client) setFlag(folder string, uid uint32, flag data.Flag, set bool) er
 	return cmd.Close()
 }
 
-func (c *Client) moveToTrash(sourceFolder string, uid uint32, trashFolder string) error {
+func (c *Client) moveToTrash(sourceFolder string, uid uint32, trashFolder string) (uint32, error) {
 	if _, err := c.conn.Select(sourceFolder, nil).Wait(); err != nil {
-		return fmt.Errorf("selecting folder: %w", err)
+		return 0, fmt.Errorf("selecting folder: %w", err)
 	}
 	uidSet := imaplib.UIDSetNum(imaplib.UID(uid))
 	// Move handles MOVE extension fallback (COPY + STORE \Deleted + EXPUNGE) automatically.
-	_, err := c.conn.Move(uidSet, trashFolder).Wait()
-	return err
+	data, err := c.conn.Move(uidSet, trashFolder).Wait()
+	if err != nil {
+		return 0, err
+	}
+	destUID, _ := firstUID(data.DestUIDs)
+	return destUID, nil
+}
+
+func firstUID(uidSet imaplib.NumSet) (uint32, bool) {
+	uids, ok := uidSet.(imaplib.UIDSet)
+	if !ok {
+		return 0, false
+	}
+	nums, ok := uids.Nums()
+	if !ok || len(nums) == 0 {
+		return 0, false
+	}
+	return uint32(nums[0]), true
 }
 
 // convertMessageBuffer converts a FetchMessageBuffer to a data.Message.

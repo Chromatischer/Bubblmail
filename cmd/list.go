@@ -381,6 +381,17 @@ func selectAccounts(cfg *config.Config, account string) ([]*config.AccountConfig
 	return accounts, nil
 }
 
+func selectAccount(cfg *config.Config, account string) (*config.AccountConfig, error) {
+	accounts, err := selectAccounts(cfg, account)
+	if err != nil {
+		return nil, err
+	}
+	if len(accounts) != 1 {
+		return nil, fmt.Errorf("account is required")
+	}
+	return accounts[0], nil
+}
+
 func writeCounts(folders []*data.Folder) error {
 	if len(folders) == 0 {
 		return nil
