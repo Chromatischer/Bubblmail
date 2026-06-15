@@ -16,6 +16,8 @@ type Header struct {
 	activeAccount string
 	activeFolder  string
 	syncState     string // "", "syncing", "synced", "error"
+	unreadFilter  bool
+	unreadCount   int
 }
 
 // NewHeader creates a new header component.
@@ -41,6 +43,12 @@ func (h *Header) SetFolder(folder string) {
 // SetSyncState sets the sync indicator state.
 func (h *Header) SetSyncState(state string) {
 	h.syncState = state
+}
+
+// SetUnreadFilter sets the unread-only filter state and the count of threads shown.
+func (h *Header) SetUnreadFilter(on bool, count int) {
+	h.unreadFilter = on
+	h.unreadCount = count
 }
 
 // View renders the header.
@@ -141,7 +149,22 @@ func (h *Header) View() string {
 		Foreground(theme.Text).
 		Width(h.width).
 		Padding(0, 1)
-	row2 := row2Style.Render(fmt.Sprintf(" %s", breadcrumb))
+
+	var row2 string
+	if h.unreadFilter {
+		bannerText := fmt.Sprintf("Only Showing Unread (%d)", h.unreadCount)
+		bannerRendered := lipgloss.NewStyle().Foreground(theme.Accent).Bold(true).Render(bannerText)
+		bannerW := util.VisibleWidth(bannerRendered)
+		innerW := h.width - 2 // minus Padding(0,1) on each side
+		prefixW := 1 + util.VisibleWidth(breadcrumb)
+		gap := (innerW - prefixW - bannerW) / 2
+		if gap < 1 {
+			gap = 1
+		}
+		row2 = row2Style.Render(" " + breadcrumb + strings.Repeat(" ", gap) + bannerRendered)
+	} else {
+		row2 = row2Style.Render(fmt.Sprintf(" %s", breadcrumb))
+	}
 
 	divider := lipgloss.NewStyle().
 		Foreground(theme.Border).

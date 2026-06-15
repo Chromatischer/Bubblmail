@@ -37,6 +37,7 @@ const (
 	KeyNextAcct     = "tab"
 	KeyPrevAcct     = "shift+tab"
 	KeySync         = "ctrl+r"
+	KeyUnreadFilter = "u"
 	KeyHelp         = "?"
 	KeyQuit         = "q"
 	KeyCtrlC        = "ctrl+c"
@@ -67,6 +68,7 @@ func AllHelpLines() []HelpLine {
 		{icons.Archive + " e", "Archive"},
 		{icons.Star + " s", "Toggle starred"},
 		{icons.Read + " m", "Toggle read/unread"},
+		{"u", "Toggle unread-only filter"},
 		{icons.Tag + " t", "Tag picker"},
 		{"", ""},
 		{"z", "Toggle quote folding / fold sidebar folder"},

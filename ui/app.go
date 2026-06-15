@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -150,6 +151,7 @@ type App struct {
 	fetchedCount   int
 	loadingMore    bool
 	allLoaded      bool
+	unreadOnly     bool
 	quitPending    bool
 	searchSeq      int
 	searchState    *searchState
@@ -523,9 +525,12 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if err := a.store.UpsertMessages(msg.Messages); err != nil {
 			a.flash("Cache write error: "+err.Error(), "err")
 		}
-		threads := thread.BuildThreads(a.loadedMessages)
+		threads := thread.BuildThreads(a.visibleMessages())
 		a.inboxView.SetThreads(threads)
 		a.applyQuickMenuState()
+		if a.unreadOnly {
+			a.header.SetUnreadFilter(true, len(threads))
+		}
 		a.statusbar.SetLoading(false)
 		// Submit new inbox messages for classification
 		if a.classifyQueue != nil {
@@ -549,9 +554,12 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if err := a.store.UpsertMessages(msg.Messages); err != nil {
 			a.flash("Cache write error: "+err.Error(), "err")
 		}
-		threads := thread.BuildThreads(a.loadedMessages)
+		threads := thread.BuildThreads(a.visibleMessages())
 		a.inboxView.AppendThreads(threads)
 		a.applyQuickMenuState()
+		if a.unreadOnly {
+			a.header.SetUnreadFilter(true, len(threads))
+		}
 		// Submit newly loaded messages for classification
 		if a.classifyQueue != nil {
 			a.classifyQueue.Submit(msg.Messages)
@@ -560,10 +568,18 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case imaplib.MessageBodyMsg:
 		if msg.Err != nil {
-			details := fmt.Sprintf("Body fetch error (%s %s uid=%d id=%d): %s", msg.Account, msg.Folder, msg.UID, msg.MsgID, msg.Err.Error())
-			a.flash(details, "err")
 			if msg.MsgID > 0 {
 				a.prefetchSkip[msg.MsgID] = true
+			}
+			if errors.Is(msg.Err, imaplib.ErrMessageNotFound) {
+				// Message was moved or deleted externally; insert a sentinel body row so
+				// the prefetcher never retries this UID again across sessions.
+				if msg.MsgID > 0 {
+					_ = a.store.UpsertBody(msg.MsgID, "", "")
+				}
+			} else {
+				details := fmt.Sprintf("Body fetch error (%s %s uid=%d id=%d): %s", msg.Account, msg.Folder, msg.UID, msg.MsgID, msg.Err.Error())
+				a.flash(details, "err")
 			}
 			return a, nil
 		}
@@ -648,8 +664,11 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cursor := a.inboxView.CursorPos()
 		a.loadedMessages = removeByUID(a.loadedMessages, msg.UID)
 		a.fetchedCount = len(a.loadedMessages)
-		threads := thread.BuildThreads(a.loadedMessages)
+		threads := thread.BuildThreads(a.visibleMessages())
 		a.inboxView.AppendThreads(threads)
+		if a.unreadOnly {
+			a.header.SetUnreadFilter(true, len(threads))
+		}
 		if cursor < len(threads) {
 			a.inboxView.SetCursor(cursor)
 		}
@@ -683,8 +702,11 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cursor := a.inboxView.CursorPos()
 		a.loadedMessages = removeByUID(a.loadedMessages, msg.UID)
 		a.fetchedCount = len(a.loadedMessages)
-		threads := thread.BuildThreads(a.loadedMessages)
+		threads := thread.BuildThreads(a.visibleMessages())
 		a.inboxView.AppendThreads(threads)
+		if a.unreadOnly {
+			a.header.SetUnreadFilter(true, len(threads))
+		}
 		if cursor < len(threads) {
 			a.inboxView.SetCursor(cursor)
 		}
@@ -1339,6 +1361,12 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "e":
 		return a, a.archiveMessage()
+
+	case KeyUnreadFilter:
+		a.unreadOnly = !a.unreadOnly
+		threads := thread.BuildThreads(a.visibleMessages())
+		a.inboxView.SetThreads(threads)
+		a.header.SetUnreadFilter(a.unreadOnly, len(threads))
 	}
 
 	return a, nil
@@ -1831,23 +1859,38 @@ func (a *App) loadSuggestedEvent(msg *data.Message) tea.Cmd {
 	return nil
 }
 
+// visibleMessages returns loadedMessages filtered to unread-only when the
+// unread filter is active, otherwise returns the full slice.
+func (a *App) visibleMessages() []*data.Message {
+	if !a.unreadOnly {
+		return a.loadedMessages
+	}
+	out := make([]*data.Message, 0, len(a.loadedMessages))
+	for _, m := range a.loadedMessages {
+		if !m.HasFlag(data.FlagSeen) {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 func (a *App) fetchMessages() tea.Cmd {
 	a.loadedMessages = nil
 	a.fetchedCount = 0
 	a.loadingMore = false
 	a.allLoaded = false
+	a.unreadOnly = false
+	a.header.SetUnreadFilter(false, 0)
 
 	client, ok := a.imapClients[a.activeAccount]
 	if !ok {
 		// Try loading from cache
 		threads, err := a.store.GetThreads(a.activeAccount, a.activeFolder)
 		if err == nil {
-			// Flatten to messages for BuildThreads
-			var msgs []*data.Message
 			for _, t := range threads {
-				msgs = append(msgs, t.Messages...)
+				a.loadedMessages = append(a.loadedMessages, t.Messages...)
 			}
-			built := thread.BuildThreads(msgs)
+			built := thread.BuildThreads(a.visibleMessages())
 			a.inboxView.SetThreads(built)
 		}
 		return nil

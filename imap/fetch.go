@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -13,6 +14,10 @@ import (
 	"github.com/emersion/go-imap/v2/imapclient"
 	gomail "github.com/emersion/go-message/mail"
 )
+
+// ErrMessageNotFound is returned when the IMAP server has no message at the requested UID.
+// This is expected when a message was moved or deleted by an external client.
+var ErrMessageNotFound = errors.New("message not found")
 
 // --- Message types returned by tea.Cmd ---
 
@@ -359,7 +364,7 @@ func (c *Client) fetchBody(folder string, uid uint32) (string, string, []data.At
 		return "", "", nil, fmt.Errorf("fetching body: %w", err)
 	}
 	if len(buffers) == 0 {
-		return "", "", nil, fmt.Errorf("message not found")
+		return "", "", nil, ErrMessageNotFound
 	}
 
 	buf := buffers[0]
