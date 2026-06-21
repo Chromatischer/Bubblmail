@@ -26,8 +26,23 @@ type InboxView struct {
 	cursor          int // focused thread index
 	offset          int // first visible thread
 	quick           *QuickMenuRender
-	selectionAnchor int // -1 = no multi-selection; ≥0 = anchor index
+	selectionAnchor int  // -1 = no multi-selection; ≥0 = anchor index
+	selectionHidden bool // true while scrolling by mouse wheel: suppress the cursor highlight
+
+	// Empty-state context: distinguishes loading / error / inbox-zero /
+	// filtered-empty so the placeholder can say something useful.
+	state    inboxState
+	errMsg   string
+	filtered bool // unread-only filter is active
 }
+
+type inboxState int
+
+const (
+	inboxReady inboxState = iota
+	inboxLoading
+	inboxError
+)
 
 // QuickMenuRender controls the inline quick action hint rendering.
 type QuickMenuRender struct {
@@ -64,7 +79,23 @@ func (v *InboxView) SetThreads(threads []*data.Thread) {
 	v.cursor = 0
 	v.offset = 0
 	v.selectionAnchor = -1
+	v.selectionHidden = false
+	v.state = inboxReady
+	v.errMsg = ""
 }
+
+// SetLoading marks the inbox as syncing, shown only when the list is empty.
+func (v *InboxView) SetLoading() { v.state = inboxLoading }
+
+// SetError marks a load failure with a message, shown only when the list is empty.
+func (v *InboxView) SetError(msg string) {
+	v.state = inboxError
+	v.errMsg = msg
+}
+
+// SetFiltered records whether the unread-only filter is active, so the
+// empty-state copy can distinguish "no unread" from a truly empty inbox.
+func (v *InboxView) SetFiltered(filtered bool) { v.filtered = filtered }
 
 // AppendThreads replaces the thread list while preserving cursor position.
 func (v *InboxView) AppendThreads(threads []*data.Thread) {
@@ -82,17 +113,13 @@ func (v *InboxView) AppendThreads(threads []*data.Thread) {
 		for i, t := range v.threads {
 			if t.ID == selectedID {
 				v.cursor = i
-				return
+				break
 			}
 		}
 	}
-	// Fallback: clamp cursor.
-	if v.cursor >= len(v.threads) {
-		v.cursor = len(v.threads) - 1
-	}
-	if v.cursor < 0 {
-		v.cursor = 0
-	}
+	// Re-clamp the cursor and scroll offset to the new list so the selection
+	// never ends up outside the rendered window.
+	v.clampScroll()
 }
 
 // Len returns the number of threads loaded.
@@ -114,7 +141,8 @@ func (v *InboxView) HitTestThread(contentY int) int {
 // CursorPos returns the current cursor index.
 func (v *InboxView) CursorPos() int { return v.cursor }
 
-// SetCursor moves the cursor to the given index, clamped to valid bounds.
+// SetCursor moves the cursor to the given index, clamped to valid bounds, and
+// keeps it inside the scrolled window.
 func (v *InboxView) SetCursor(i int) {
 	if i >= len(v.threads) {
 		i = len(v.threads) - 1
@@ -123,6 +151,97 @@ func (v *InboxView) SetCursor(i int) {
 		i = 0
 	}
 	v.cursor = i
+	v.selectionHidden = false
+	v.clampScroll()
+}
+
+// clampScroll keeps the cursor within bounds and repositions the scroll offset
+// so the cursor is always inside the rendered window. It is the single guard
+// against the cursor falling outside the visible list when threads are added,
+// removed, reordered, or the viewport is resized under it.
+func (v *InboxView) clampScroll() {
+	n := len(v.threads)
+	if n == 0 {
+		v.cursor = 0
+		v.offset = 0
+		return
+	}
+	if v.cursor >= n {
+		v.cursor = n - 1
+	}
+	if v.cursor < 0 {
+		v.cursor = 0
+	}
+
+	visible := v.height / 2
+	if visible < 1 {
+		visible = 1
+	}
+	maxOffset := n - visible
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+
+	if v.selectionHidden {
+		// Wheel mode: the offset leads (the viewport moves on every notch). Keep
+		// it in range, and park the hidden cursor near the middle of the viewport
+		// so keyboard navigation later resumes from a sensible, in-view row
+		// without snapping the list back.
+		if v.offset > maxOffset {
+			v.offset = maxOffset
+		}
+		if v.offset < 0 {
+			v.offset = 0
+		}
+		v.cursor = v.offset + visible/2
+		if v.cursor > n-1 {
+			v.cursor = n - 1
+		}
+		return
+	}
+
+	// Keyboard mode: the cursor leads. Pull the offset so the cursor keeps at
+	// least `margin` threads of context from each edge (vim's "scrolloff") — a
+	// smoother feel than pinning to the top/bottom row. The margin is naturally
+	// not enforced past the list's top/bottom.
+	margin := scrollMargin
+	if m := (visible - 1) / 2; margin > m {
+		margin = m
+	}
+	if v.cursor-margin < v.offset {
+		v.offset = v.cursor - margin
+	} else if v.cursor+margin >= v.offset+visible {
+		v.offset = v.cursor + margin - visible + 1
+	}
+	if v.offset > maxOffset {
+		v.offset = maxOffset
+	}
+	if v.offset < 0 {
+		v.offset = 0
+	}
+}
+
+// scrollMargin is the number of threads kept visible above and below the cursor
+// while scrolling, so the selection never sits flush against the viewport edge.
+const scrollMargin = 2
+
+// LastVisibleIndex returns the index of the last thread currently in the
+// viewport. Used to drive "load more" off what's on screen, so it works the
+// same for wheel scrolling (offset-driven) and keyboard navigation.
+func (v *InboxView) LastVisibleIndex() int {
+	n := len(v.threads)
+	if n == 0 {
+		return -1
+	}
+	visible := v.height / 2
+	if visible < 1 {
+		visible = 1
+	}
+	last := v.offset + visible - 1
+	if last > n-1 {
+		last = n - 1
+	}
+	return last
 }
 
 // SelectedThread returns the currently focused thread, or nil.
@@ -135,64 +254,60 @@ func (v *InboxView) SelectedThread() *data.Thread {
 
 // MoveUp moves cursor up.
 func (v *InboxView) MoveUp() {
-	if v.cursor > 0 {
-		v.cursor--
-		if v.cursor < v.offset {
-			v.offset--
-		}
-	}
+	v.cursor--
+	v.selectionHidden = false
+	v.clampScroll()
 }
 
 // MoveDown moves cursor down.
 func (v *InboxView) MoveDown() {
-	if v.cursor < len(v.threads)-1 {
-		v.cursor++
-		rowsPerThread := 2
-		visibleThreads := v.height / rowsPerThread
-		if visibleThreads < 1 {
-			visibleThreads = 1
-		}
-		if v.cursor >= v.offset+visibleThreads {
-			v.offset++
-		}
+	v.cursor++
+	v.selectionHidden = false
+	v.clampScroll()
+}
+
+// WheelScroll scrolls the viewport by delta threads in response to the mouse
+// wheel. It moves the scroll offset directly so the list moves on every notch
+// (not only once a hidden cursor reaches an edge), and keeps the selection
+// highlight hidden — a permanent selection makes no sense while driving with a
+// pointer.
+func (v *InboxView) WheelScroll(delta int) {
+	v.selectionHidden = true
+	v.offset += delta
+	v.clampScroll()
+}
+
+// pageSize is the number of threads a ctrl+d/ctrl+u jump moves. It is half the
+// visible page (vim-style) so the jump is gentle rather than skipping a whole
+// screenful at once.
+func (v *InboxView) pageSize() int {
+	visibleThreads := v.height / 2
+	page := visibleThreads / 2
+	if page < 1 {
+		page = 1
 	}
+	return page
 }
 
 // PageUp moves cursor up by a page.
 func (v *InboxView) PageUp() {
-	rowsPerThread := 2
-	page := v.height / rowsPerThread
-	if page < 1 {
-		page = 1
-	}
-	v.cursor -= page
-	if v.cursor < 0 {
-		v.cursor = 0
-	}
-	v.offset = v.cursor
+	v.cursor -= v.pageSize()
+	v.selectionHidden = false
+	v.clampScroll()
 }
 
 // PageDown moves cursor down by a page.
 func (v *InboxView) PageDown() {
-	rowsPerThread := 2
-	page := v.height / rowsPerThread
-	if page < 1 {
-		page = 1
-	}
-	v.cursor += page
-	if v.cursor >= len(v.threads) {
-		v.cursor = len(v.threads) - 1
-	}
-	if v.cursor < 0 {
-		v.cursor = 0
-	}
-	v.offset = v.cursor
+	v.cursor += v.pageSize()
+	v.selectionHidden = false
+	v.clampScroll()
 }
 
 // GoToTop jumps to the first thread.
 func (v *InboxView) GoToTop() {
 	v.cursor = 0
-	v.offset = 0
+	v.selectionHidden = false
+	v.clampScroll()
 }
 
 // GoToBottom jumps to the last thread.
@@ -201,15 +316,8 @@ func (v *InboxView) GoToBottom() {
 		return
 	}
 	v.cursor = len(v.threads) - 1
-	rowsPerThread := 2
-	visibleThreads := v.height / rowsPerThread
-	if visibleThreads < 1 {
-		visibleThreads = 1
-	}
-	v.offset = v.cursor - visibleThreads + 1
-	if v.offset < 0 {
-		v.offset = 0
-	}
+	v.selectionHidden = false
+	v.clampScroll()
 }
 
 // selRange returns the inclusive [lo, hi] index range of the current selection.
@@ -267,6 +375,10 @@ func (v *InboxView) View() string {
 		return v.emptyState()
 	}
 
+	// Always render with the cursor inside the window, regardless of how the
+	// thread list or viewport changed since the last interaction.
+	v.clampScroll()
+
 	rowsPerThread := 2
 	visibleThreads := v.height / rowsPerThread
 	if visibleThreads < 1 {
@@ -284,7 +396,7 @@ func (v *InboxView) View() string {
 	var rows []string
 	for i := v.offset; i < end; i++ {
 		t := v.threads[i]
-		isSelected := i == v.cursor
+		isSelected := !v.selectionHidden && i == v.cursor
 		inMultiSel := v.selectionAnchor >= 0 && i >= lo && i <= hi && !isSelected
 		showQuickIcon := i == center
 		rows = append(rows, v.renderThread(t, isSelected, i, inMultiSel, showQuickIcon)...)
@@ -474,7 +586,13 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool, index int, inMul
 	}
 	subjectTrunc := util.TruncateText(subject, textW)
 	indent := strings.Repeat(" ", prefixW)
-	subjectRendered := sel(lipgloss.NewStyle().Foreground(fgMuted).Width(prefixW + textW)).Render(indent + subjectTrunc)
+	// Brighten the subject for unread threads so the eye can scan unread mail by
+	// subject, not just by the sender/dot. Read threads stay muted.
+	subjectFg := fgMuted
+	if t.HasUnread && !selected {
+		subjectFg = theme.Text
+	}
+	subjectRendered := sel(lipgloss.NewStyle().Foreground(subjectFg).Width(prefixW + textW)).Render(indent + subjectTrunc)
 
 	row2Content := sel(lipgloss.NewStyle().Width(contentW)).Render(
 		subjectRendered + countStr + sel(lipgloss.NewStyle()).Render(" "),
@@ -667,12 +785,37 @@ func folderShortName(name string, maxCols int) string {
 
 func (v *InboxView) emptyState() string {
 	theme := v.theme
-	msg := lipgloss.NewStyle().
-		Foreground(theme.TextMuted).
-		Render(icons.Inbox + " No messages")
-	hint := lipgloss.NewStyle().
-		Foreground(theme.TextFaint).
-		Render(fmt.Sprintf("%s Press ctrl+r to sync", icons.Refresh))
-	body := lipgloss.JoinVertical(lipgloss.Center, msg, hint)
+
+	var icon, title string
+	var hints []string
+	titleColor := theme.TextMuted
+
+	switch v.state {
+	case inboxLoading:
+		icon, title = icons.Syncing, "Syncing your mail"
+		hints = []string{"This only takes a moment…"}
+	case inboxError:
+		icon, title, titleColor = icons.Error, "Couldn't load mail", theme.Error
+		if v.errMsg != "" {
+			hints = append(hints, v.errMsg)
+		}
+		hints = append(hints, "Press ctrl+r to retry")
+	default:
+		if v.filtered {
+			icon, title = icons.Check, "No unread messages"
+			hints = []string{"Press u to show all mail"}
+		} else {
+			icon, title = icons.Inbox, "Inbox zero"
+			hints = []string{"You're all caught up"}
+		}
+	}
+
+	lines := []string{
+		lipgloss.NewStyle().Foreground(titleColor).Bold(true).Render(icon + "  " + title),
+	}
+	for _, h := range hints {
+		lines = append(lines, lipgloss.NewStyle().Foreground(theme.TextFaint).Render(h))
+	}
+	body := lipgloss.JoinVertical(lipgloss.Center, lines...)
 	return lipgloss.Place(v.width, v.height, lipgloss.Center, lipgloss.Center, body)
 }

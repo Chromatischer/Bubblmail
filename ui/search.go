@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/data"
 	"github.com/bubblmail/bubblmail/ui/components"
 	"github.com/bubblmail/bubblmail/ui/icons"
@@ -41,11 +42,11 @@ type SearchOverlay struct {
 	spinnerFrame int
 
 	// filter chips
-	chips         []SearchChip
-	chipKey       string   // chip type being built ("from","to","subject","has"), "" = normal
-	chipInput     string   // value being typed for the active chip
-	autocomplete  []string // filtered suggestions shown during chip entry
-	acCursor      int      // cursor within autocomplete list
+	chips          []SearchChip
+	chipKey        string   // chip type being built ("from","to","subject","has"), "" = normal
+	chipInput      string   // value being typed for the active chip
+	autocomplete   []string // filtered suggestions shown during chip entry
+	acCursor       int      // cursor within autocomplete list
 	knownAddresses []string // address list mined from cache on open
 }
 
@@ -517,8 +518,32 @@ func (s *SearchOverlay) View() string {
 			resultLines = append(resultLines, blankLine)
 		}
 	} else {
+		// Reserve a right-edge scrollbar column when results overflow the viewport.
+		scrolling := len(s.results) > vr
+		contentW := innerW
+		if scrolling {
+			contentW = innerW - 1
+		}
+		thumbStart, thumbEnd := 0, 0
+		if scrolling {
+			total := len(s.results)
+			thumb := vr * vr / total
+			if thumb < 1 {
+				thumb = 1
+			}
+			pos := 0
+			if maxOff := total - vr; maxOff > 0 {
+				pos = s.list.Offset * (vr - thumb) / maxOff
+			}
+			thumbStart, thumbEnd = pos, pos+thumb
+		}
 		for i := s.list.Offset; i < len(s.results) && i < s.list.Offset+vr; i++ {
-			resultLines = append(resultLines, s.renderRow(s.results[i], i == s.list.Cursor, innerW, sp))
+			row := s.renderRow(s.results[i], i == s.list.Cursor, contentW, sp)
+			if scrolling {
+				r := i - s.list.Offset
+				row += scrollbarCell(theme, r >= thumbStart && r < thumbEnd)
+			}
+			resultLines = append(resultLines, row)
 		}
 		for len(resultLines) < vr {
 			resultLines = append(resultLines, blankLine)
@@ -652,23 +677,51 @@ func (s *SearchOverlay) renderRow(res *SearchResult, selected bool, innerW int, 
 	const fromW = 18
 	fromCell := cell(fromW, rowFg, util.TruncateText(util.SingleLine(msg.FromString()), fromW))
 
-	// Subject fills remaining space
+	// Subject fills remaining space, with the free-text query highlighted.
 	subjectW := innerW - 1 - 1 - fromW - 1 - suffixW
 	if subjectW < 1 {
 		subjectW = 1
 	}
-	subjectCell := cell(subjectW, rowFg, util.TruncateText(util.SingleLine(msg.Subject), subjectW))
-
+	subjectFg := rowFg
 	if !selected && msg.IsRead() {
-		subjectCell = lipgloss.NewStyle().
-			Width(subjectW).
-			Background(bg).
-			Foreground(theme.TextMuted).
-			Render(util.TruncateText(util.SingleLine(msg.Subject), subjectW))
+		subjectFg = theme.TextMuted
 	}
+	subjectCell := highlightedCell(theme, bg, subjectFg, msg.Subject, s.query, subjectW, selected)
 
 	spc := sp(bg)
 	suffix := spc + indCell + spc + dateCell
 
 	return unreadCell + spc + fromCell + spc + subjectCell + suffix
+}
+
+// highlightedCell renders plain into an exact w-wide cell on background bg,
+// accenting the first case-insensitive occurrence of query. Width is measured
+// from plain strings only; segments each carry bg so it fills uniformly.
+func highlightedCell(theme *config.Theme, bg, fg lipgloss.Color, plain, query string, w int, selected bool) string {
+	plain = util.TruncateText(util.SingleLine(plain), w)
+	base := lipgloss.NewStyle().Background(bg).Foreground(fg)
+
+	ms, me := -1, -1
+	if query != "" {
+		ms, me = findMatchRange(plain, query)
+	}
+	if ms < 0 {
+		return base.Width(w).Render(plain)
+	}
+
+	match := lipgloss.NewStyle().Background(bg).Bold(true)
+	if selected {
+		match = match.Foreground(fg).Underline(true)
+	} else {
+		match = match.Foreground(theme.Accent)
+	}
+
+	var b strings.Builder
+	b.WriteString(base.Render(plain[:ms]))
+	b.WriteString(match.Render(plain[ms:me]))
+	b.WriteString(base.Render(plain[me:]))
+	if pad := w - util.VisibleWidth(plain); pad > 0 {
+		b.WriteString(base.Render(strings.Repeat(" ", pad)))
+	}
+	return b.String()
 }

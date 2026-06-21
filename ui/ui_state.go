@@ -8,6 +8,7 @@ import (
 
 type uiState struct {
 	CollapsedFolders []string `json:"collapsed_folders"`
+	TipSeen          bool     `json:"tip_seen"` // first-run hint has been shown
 }
 
 func uiStatePath() (string, error) {

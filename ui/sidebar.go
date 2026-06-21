@@ -637,6 +637,19 @@ func (sb *Sidebar) CollapsedKeys() []string {
 	return keys
 }
 
+// CollapsedFolders returns the set of folder names currently collapsed for the
+// given account. Used to mirror the sidebar's fold state in the folder picker.
+func (sb *Sidebar) CollapsedFolders(account string) map[string]bool {
+	out := make(map[string]bool)
+	prefix := account + "\x00"
+	for k, v := range sb.collapsed {
+		if v && strings.HasPrefix(k, prefix) {
+			out[strings.TrimPrefix(k, prefix)] = true
+		}
+	}
+	return out
+}
+
 // SetCollapsed initialises the collapsed map from a previously persisted key
 // list (as returned by CollapsedKeys).
 func (sb *Sidebar) SetCollapsed(keys []string) {

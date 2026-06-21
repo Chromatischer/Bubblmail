@@ -25,6 +25,11 @@ type StatusBar struct {
 	embedding embeddingStats
 	moveHint  string // suggested destination folder for quick-move
 	hitZones  []StatusHitZone
+
+	// Reader sub-state, used to build context-aware hints for the reader view.
+	readerHasAttach    bool
+	readerAttachActive bool
+	readerHasEvent     bool
 }
 
 var spinnerFrames = []string{
@@ -77,6 +82,14 @@ func (sb *StatusBar) SetMoveHint(hint string) {
 
 // MoveHint returns the current move hint value.
 func (sb *StatusBar) MoveHint() string { return sb.moveHint }
+
+// SetReaderState updates reader-specific flags so the "reader" context can show
+// hints that match what the user can actually do right now.
+func (sb *StatusBar) SetReaderState(hasAttach, attachActive, hasEvent bool) {
+	sb.readerHasAttach = hasAttach
+	sb.readerAttachActive = attachActive
+	sb.readerHasEvent = hasEvent
+}
 
 // HitTest returns the action key for the hint clicked at (x, y), where y is
 // relative to the top of the status bar (0 = divider, 1 = hints row).
@@ -156,17 +169,38 @@ func (sb *StatusBar) View(context string) string {
 			{icons.Close, "esc", "cancel"},
 		}
 	case "reader":
-		hints = []hint{
-			{icons.ArrowUpDown, "j/k", "scroll"},
-			{icons.ArrowLeftRight, "←/→", "event action"},
-			{icons.FloppyDisk, "enter", "copy event"},
-			{icons.Reply, "r", "reply"},
-			{icons.ReplyAll, "R", "reply all"},
-			{icons.Forward, "f", "forward"},
-			{icons.Star, "s", "star"},
-			{icons.Trash, "d", "delete"},
-			{icons.ArrowLeft, "esc/q/h", "back"},
-			{icons.Help, "?", "help"},
+		if sb.readerAttachActive {
+			// Inside the attachment section: show how to drive it.
+			hints = []hint{
+				{icons.Attachment, "tab", "cycle"},
+				{icons.ArrowLeftRight, "←/→", "action"},
+				{icons.Check, "enter", "run"},
+				{icons.ArrowLeft, "esc", "back"},
+				{icons.Help, "?", "help"},
+			}
+		} else {
+			hints = []hint{{icons.ArrowUpDown, "j/k", "scroll"}}
+			// Event hints only when the mail actually has a suggested event.
+			if sb.readerHasEvent {
+				hints = append(hints,
+					hint{icons.ArrowLeftRight, "←/→", "event action"},
+					hint{icons.FloppyDisk, "enter", "copy event"},
+				)
+			}
+			hints = append(hints,
+				hint{icons.Reply, "r", "reply"},
+				hint{icons.Forward, "f", "forward"},
+				hint{icons.FolderOpen, "v", "move"},
+				hint{icons.Trash, "d", "delete"},
+			)
+			// Attachment entry only when the mail has attachments.
+			if sb.readerHasAttach {
+				hints = append(hints, hint{icons.Attachment, "a", "attachments"})
+			}
+			hints = append(hints,
+				hint{icons.ArrowLeft, "esc/q/h", "back"},
+				hint{icons.Help, "?", "help"},
+			)
 		}
 	case "search":
 		hints = []hint{
@@ -187,6 +221,13 @@ func (sb *StatusBar) View(context string) string {
 			{"", "type", "folder name"},
 			{icons.Check, "enter", "create"},
 			{icons.Close, "esc", "cancel"},
+		}
+	case "palette":
+		hints = []hint{
+			{icons.Search, "type", "filter"},
+			{icons.ArrowUpDown, "↑/↓", "navigate"},
+			{icons.Check, "enter", "run"},
+			{icons.Close, "esc", "close"},
 		}
 	case "quick":
 		applyDesc := "apply"

@@ -34,8 +34,7 @@ const (
 	KeyInbox        = "i"
 	KeySidebar      = "b"
 	KeySidebarFocus = "\\"
-	KeyNextAcct     = "tab"
-	KeyPrevAcct     = "shift+tab"
+	KeyAttachments  = "a"
 	KeySync         = "ctrl+r"
 	KeyUnreadFilter = "u"
 	KeyHelp         = "?"
@@ -60,25 +59,27 @@ func AllHelpLines() []HelpLine {
 		{icons.ArrowLeftRight + " left/right", "Quick actions"},
 		{"Esc/q/h/" + icons.ArrowLeft, "Back to inbox"},
 		{"", ""},
+		{icons.Sparkle + " .", "Command palette (all actions)"},
 		{icons.Reply + "/" + icons.ReplyAll + " r/R", "Reply / Reply All"},
 		{icons.Forward + " f", "Forward"},
 		{icons.Compose + " c", "Compose new"},
 		{icons.Trash + " d", "Delete (move to Trash)"},
 		{icons.FolderOpen + " v", "Move to folder"},
 		{icons.Archive + " e", "Archive"},
+		{icons.Refresh + " ctrl+z", "Undo last move/delete"},
 		{icons.Star + " s", "Toggle starred"},
 		{icons.Read + " m", "Toggle read/unread"},
 		{"u", "Toggle unread-only filter"},
 		{icons.Tag + " t", "Tag picker"},
+		{icons.Attachment + " a", "Attachments (Tab/Esc to cycle/exit)"},
 		{"", ""},
 		{"z", "Toggle quote folding / fold sidebar folder"},
 		{icons.Search + " /", "Local search"},
 		{"ctrl+f", "IMAP server search"},
 		{icons.Inbox + " i", "Jump to INBOX"},
 		{icons.FolderTree + " b", "Toggle sidebar"},
-		{"\\", "Focus sidebar"},
+		{"Tab or \\", "Focus sidebar"},
 		{icons.FolderNew + " n", "New folder (sidebar)"},
-		{"Tab/Shift+Tab", "Next/prev account"},
 		{icons.Refresh + " ctrl+r", "Force sync"},
 		{icons.Help + " ?", "Help"},
 		{icons.Quit + " q q", "Quit"},

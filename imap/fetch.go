@@ -71,6 +71,8 @@ type MoveToTrashResultMsg struct {
 	Account string
 	Folder  string
 	UID     uint32
+	Dest    string // trash folder the message was moved to
+	DestUID uint32 // new UID in the trash folder (0 if server lacks UIDPLUS)
 	Err     error
 }
 
@@ -178,8 +180,8 @@ func (c *Client) MoveToTrash(sourceFolder string, uid uint32, trashFolder string
 	return func() tea.Msg {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		_, err := c.moveToTrash(sourceFolder, uid, trashFolder)
-		return MoveToTrashResultMsg{Account: c.cfg.Name, Folder: sourceFolder, UID: uid, Err: err}
+		destUID, err := c.moveToTrash(sourceFolder, uid, trashFolder)
+		return MoveToTrashResultMsg{Account: c.cfg.Name, Folder: sourceFolder, UID: uid, Dest: trashFolder, DestUID: destUID, Err: err}
 	}
 }
 

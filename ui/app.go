@@ -119,13 +119,14 @@ type App struct {
 	imapClients map[string]*imaplib.Client
 
 	// UI components
-	header        *Header
-	sidebar       *Sidebar
-	statusbar     *StatusBar
-	helpOverlay   *HelpOverlay
-	searchOverlay *SearchOverlay
-	folderPicker  *FolderPickerOverlay
-	newFolder     *NewFolderOverlay
+	header         *Header
+	sidebar        *Sidebar
+	statusbar      *StatusBar
+	helpOverlay    *HelpOverlay
+	searchOverlay  *SearchOverlay
+	folderPicker   *FolderPickerOverlay
+	newFolder      *NewFolderOverlay
+	commandPalette *CommandPaletteOverlay
 
 	// Main views
 	viewID     ViewID
@@ -157,6 +158,8 @@ type App struct {
 	searchState    *searchState
 	prefetchSkip   map[int64]bool
 	quickMenu      *quickMenuState
+	lastUndo       *undoMove // last reversible move/delete/archive (nil if none)
+	persisted      *uiState  // on-disk UI state (collapsed folders, first-run tip)
 
 	accounts []*data.Account
 
@@ -210,6 +213,7 @@ func (a *App) canQuitNow() bool {
 		!a.searchOverlay.IsActive() &&
 		!a.folderPicker.IsActive() &&
 		!a.newFolder.IsActive() &&
+		!a.commandPalette.IsActive() &&
 		!a.showHelp &&
 		!a.comp.IsActive()
 }
@@ -266,6 +270,7 @@ func NewApp(cfg *config.Config, store *cache.Store) *App {
 	app.searchOverlay = NewSearchOverlay(styles)
 	app.folderPicker = NewFolderPickerOverlay(styles)
 	app.newFolder = NewNewFolderOverlay(styles)
+	app.commandPalette = NewCommandPaletteOverlay(styles)
 	app.inboxView = views.NewInboxView(theme)
 	app.readerView = views.NewReaderView(theme)
 	app.folderView = views.NewFolderView(theme)
@@ -293,8 +298,12 @@ func NewApp(cfg *config.Config, store *cache.Store) *App {
 	app.sidebar.SetActive(app.activeAccount, app.activeFolder)
 
 	if state, err := loadUIState(); err == nil {
-		app.sidebar.SetCollapsed(state.CollapsedFolders)
+		app.persisted = state
 	}
+	if app.persisted == nil {
+		app.persisted = &uiState{}
+	}
+	app.sidebar.SetCollapsed(app.persisted.CollapsedFolders)
 
 	return app
 }
@@ -303,6 +312,12 @@ func NewApp(cfg *config.Config, store *cache.Store) *App {
 func (a *App) Init() tea.Cmd {
 	cmds := []tea.Cmd{
 		tea.SetWindowTitle("bubblmail"),
+	}
+	// One-time onboarding hint, shown a beat after the first render settles.
+	if a.persisted != nil && !a.persisted.TipSeen {
+		cmds = append(cmds, tea.Tick(1500*time.Millisecond, func(time.Time) tea.Msg {
+			return firstRunTipMsg{}
+		}))
 	}
 	if a.embQueue != nil {
 		a.statusbar.SetEmbeddingStats(a.embQueue.Stats())
@@ -516,6 +531,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Err != nil {
 			a.flash("Fetch error: "+msg.Err.Error(), "err")
 			a.statusbar.SetLoading(false)
+			a.inboxView.SetError(msg.Err.Error())
 			return a, nil
 		}
 		a.loadedMessages = msg.Messages
@@ -658,7 +674,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.flash("Move failed: "+msg.Err.Error(), "err")
 			return a, nil
 		}
-		a.flash("Moved to Trash", "ok")
+		a.flash("Moved to Trash"+a.registerUndo(msg.Account, msg.Folder, msg.Dest, msg.DestUID, "Trash"), "ok")
 		// Remove the message from local state and refresh the inbox view.
 		// Preserve cursor: keep it at the same index so the next thread is selected.
 		cursor := a.inboxView.CursorPos()
@@ -698,7 +714,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.flash("Move failed: "+msg.Err.Error(), "err")
 			return a, nil
 		}
-		a.flash("Moved to "+msg.Dest, "ok")
+		a.flash("Moved to "+msg.Dest+a.registerUndo(msg.Account, msg.Folder, msg.Dest, msg.DestUID, msg.Dest), "ok")
 		cursor := a.inboxView.CursorPos()
 		a.loadedMessages = removeByUID(a.loadedMessages, msg.UID)
 		a.fetchedCount = len(a.loadedMessages)
@@ -918,12 +934,34 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case clearStatusMsg:
 		a.statusbar.ClearMessage()
+		a.lastUndo = nil // undo is offered only while its flash is visible
 		a.updateLayout() // message gone; reclaim the extra line
 		return a, nil
+
+	case undoResultMsg:
+		if msg.err != nil {
+			a.flash("Undo failed: "+msg.err.Error(), "err")
+			return a, nil
+		}
+		// Re-sync the folder the message returned to so it reappears in the list.
+		if msg.account == a.activeAccount && msg.folder == a.activeFolder {
+			return a, tea.Batch(a.flash("Undone", "ok"), a.fetchMessages())
+		}
+		return a, a.flash("Undone", "ok")
 
 	case quitTimeoutMsg:
 		a.quitPending = false
 		return a, nil
+
+	case firstRunTipMsg:
+		if a.persisted != nil && a.persisted.TipSeen {
+			return a, nil
+		}
+		if a.persisted != nil {
+			a.persisted.TipSeen = true
+			a.persistUI()
+		}
+		return a, a.flash(fmt.Sprintf("%s Tip: press . for all commands · ? for keys · ctrl+z to undo", icons.Sparkle), "info")
 
 	case tea.MouseMsg:
 		if a.comp.IsActive() {
@@ -1057,6 +1095,19 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
+	// 4b. Command palette
+	if a.commandPalette.IsActive() {
+		closed := a.commandPalette.HandleKey(key)
+		if closed {
+			result := a.commandPalette.Result()
+			a.commandPalette.Close()
+			if result != nil {
+				return a.dispatchGlobalKey(result.Key)
+			}
+		}
+		return a, nil
+	}
+
 	// 5. Help overlay — any key closes it
 	if a.showHelp {
 		a.showHelp = false
@@ -1100,9 +1151,9 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "z":
 			if acct, folder, ok := a.sidebar.Selected(); ok {
 				a.sidebar.Toggle(acct, folder)
-				_ = saveUIState(&uiState{CollapsedFolders: a.sidebar.CollapsedKeys()})
+				a.persistUI()
 			}
-		case "esc", "h", "left", "tab", "q":
+		case "esc", "h", "left", "tab", "q", KeySidebarFocus:
 			a.sidebarFocused = false
 			a.sidebar.SetFocused(false)
 		case "ctrl+c":
@@ -1112,6 +1163,12 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// 7. Global keys
+	return a.dispatchGlobalKey(key)
+}
+
+// dispatchGlobalKey handles top-level (non-overlay) key actions. It is also the
+// entry point used by the command palette to run a chosen action by its key.
+func (a *App) dispatchGlobalKey(key string) (tea.Model, tea.Cmd) {
 	switch key {
 	case "ctrl+c":
 		return a, tea.Quit
@@ -1140,20 +1197,29 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.wantSidebar = !a.wantSidebar
 		a.updateLayout()
 
-	case "tab":
+	case KeyAttachments:
+		// Enter/leave the attachment section in the reader. Dedicated key so Tab
+		// stays free to focus the sidebar.
 		if a.viewID == ViewReader && a.readerView.HasAttachments() {
+			if a.readerView.AttachFocusActive() {
+				a.readerView.ExitAttachments()
+			} else {
+				a.readerView.EnterAttachments()
+			}
+			return a, nil
+		}
+
+	case "tab":
+		// Within the attachment section, Tab cycles attachments; otherwise it
+		// focuses the sidebar (consistent across views).
+		if a.viewID == ViewReader && a.readerView.AttachFocusActive() {
 			a.readerView.FocusNextAttachment(1)
 			return a, nil
 		}
-		if a.showSidebar {
-			a.sidebarFocused = true
-			a.sidebar.SetFocused(true)
-			if a.viewID == ViewSmartFolder {
-				a.sidebar.FocusAt("", a.smartFolder)
-			} else {
-				a.sidebar.FocusAt(a.activeAccount, a.activeFolder)
-			}
-		}
+		a.focusSidebar()
+
+	case KeySidebarFocus: // "\" — dedicated, never-overloaded sidebar focus
+		a.focusSidebar()
 
 	case "i":
 		a.activeFolder = "INBOX"
@@ -1167,8 +1233,14 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.statusbar.SetLoading(true)
 		return a, tea.Batch(a.fetchMessages(), spinnerTick())
 
+	case "ctrl+z":
+		return a, a.performUndo()
+
+	case ".":
+		a.openCommandPalette()
+
 	case "shift+tab":
-		if a.viewID == ViewReader && a.readerView.HasAttachments() {
+		if a.viewID == ViewReader && a.readerView.AttachFocusActive() {
 			a.readerView.FocusNextAttachment(-1)
 			return a, nil
 		}
@@ -1222,6 +1294,27 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.inboxView.ClearSelection()
 		}
 		a.moveUp()
+		return a, nil
+
+	case "ctrl+down":
+		// Fast keyboard scroll, matching the mouse-wheel step (selection stays).
+		a.closeQuickMenu()
+		if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
+			a.inboxView.ClearSelection()
+		}
+		for i := 0; i < wheelScrollStep; i++ {
+			a.moveDown()
+		}
+		return a, a.maybeLoadMore()
+
+	case "ctrl+up":
+		a.closeQuickMenu()
+		if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
+			a.inboxView.ClearSelection()
+		}
+		for i := 0; i < wheelScrollStep; i++ {
+			a.moveUp()
+		}
 		return a, nil
 
 	case "ctrl+d":
@@ -1297,6 +1390,11 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		fallthrough
 	case "esc", "h":
+		// In the attachment section, leave the section first rather than the reader.
+		if a.viewID == ViewReader && a.readerView.AttachFocusActive() {
+			a.readerView.ExitAttachments()
+			return a, nil
+		}
 		if a.viewID == ViewReader {
 			a.viewID = a.prevViewID
 		} else if a.viewID == ViewFolder {
@@ -1366,6 +1464,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.unreadOnly = !a.unreadOnly
 		threads := thread.BuildThreads(a.visibleMessages())
 		a.inboxView.SetThreads(threads)
+		a.inboxView.SetFiltered(a.unreadOnly)
 		a.header.SetUnreadFilter(a.unreadOnly, len(threads))
 	}
 
@@ -1373,13 +1472,28 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (a *App) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	// Mouse wheel scrolling for content views.
+	// Mouse wheel scrolling for content views — several steps per notch so the
+	// wheel moves faster than single-step keyboard navigation. In the inbox the
+	// wheel scrolls without a selection highlight (pointer-driven, no keyboard
+	// focus); other views just step their cursor/scroll.
 	if msg.Button == tea.MouseButtonWheelDown {
-		a.moveDown()
+		if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
+			a.inboxView.WheelScroll(wheelScrollStep)
+		} else {
+			for i := 0; i < wheelScrollStep; i++ {
+				a.moveDown()
+			}
+		}
 		return a, a.maybeLoadMore()
 	}
 	if msg.Button == tea.MouseButtonWheelUp {
-		a.moveUp()
+		if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
+			a.inboxView.WheelScroll(-wheelScrollStep)
+		} else {
+			for i := 0; i < wheelScrollStep; i++ {
+				a.moveUp()
+			}
+		}
 		return a, nil
 	}
 
@@ -1478,7 +1592,7 @@ func (a *App) handleLeftPress(x, y int) (tea.Model, tea.Cmd) {
 	}
 
 	// Sidebar click — skip when any overlay is active (sidebar is not rendered then).
-	overlayActive := a.comp.IsActive() || a.searchOverlay.IsActive() || a.folderPicker.IsActive() || a.newFolder.IsActive()
+	overlayActive := a.comp.IsActive() || a.searchOverlay.IsActive() || a.folderPicker.IsActive() || a.newFolder.IsActive() || a.commandPalette.IsActive()
 	if !overlayActive && a.showSidebar && x < sidebarRenderedWidth() {
 		contentY := y - headerH
 		acct, folder, ok := a.sidebar.HitTest(x, contentY)
@@ -1790,7 +1904,7 @@ func (a *App) openThread(t *data.Thread) tea.Cmd {
 		}
 	}
 	t.HasUnread = false
-	
+
 	// Fetch body for every message in the thread that doesn't have one yet.
 	// Use each message's own account and folder — threads can span folders (e.g. INBOX + Sent).
 	for _, msg := range t.Messages {
@@ -1811,7 +1925,6 @@ func (a *App) openThread(t *data.Thread) tea.Cmd {
 		}
 	}
 
-	
 	// Trigger suggested event extraction for every message in the thread
 	for _, msg := range t.Messages {
 		a.debugLog("loadSuggestedEvent for thread %s: msg.ID=%d", t.ID, msg.ID)
@@ -1881,6 +1994,7 @@ func (a *App) fetchMessages() tea.Cmd {
 	a.allLoaded = false
 	a.unreadOnly = false
 	a.header.SetUnreadFilter(false, 0)
+	a.inboxView.SetFiltered(false)
 
 	client, ok := a.imapClients[a.activeAccount]
 	if !ok {
@@ -1896,6 +2010,7 @@ func (a *App) fetchMessages() tea.Cmd {
 		return nil
 	}
 	a.statusbar.SetLoading(true)
+	a.inboxView.SetLoading() // shown only while the list is empty
 	return tea.Batch(
 		client.FetchMessages(a.activeFolder, a.cfg.General.PageSize),
 		spinnerTick(),
@@ -2330,6 +2445,86 @@ func (a *App) deleteMessage() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
+// persistUI writes the current UI state (collapsed folders + flags) to disk,
+// preserving all fields rather than overwriting the file with a partial struct.
+func (a *App) persistUI() {
+	if a.persisted == nil {
+		a.persisted = &uiState{}
+	}
+	a.persisted.CollapsedFolders = a.sidebar.CollapsedKeys()
+	_ = saveUIState(a.persisted)
+}
+
+// firstRunTipMsg triggers the one-time onboarding hint.
+type firstRunTipMsg struct{}
+
+// undoMove records the last reversible move so Ctrl+Z can put the message back.
+type undoMove struct {
+	account string
+	src     string // folder the message should return to
+	dest    string // folder it currently lives in
+	destUID uint32 // its UID in dest
+	label   string // human label of where it went, for the flash
+}
+
+// undoResultMsg is returned when an undo move completes.
+type undoResultMsg struct {
+	account string
+	folder  string // folder the message was restored to
+	err     error
+}
+
+// registerUndo stores a reversible move and returns the flash suffix advertising
+// it. Returns "" (and clears any pending undo) when the server gave no
+// destination UID, since we cannot then move the message back.
+func (a *App) registerUndo(account, src, dest string, destUID uint32, label string) string {
+	if destUID == 0 || dest == "" {
+		a.lastUndo = nil
+		return ""
+	}
+	a.lastUndo = &undoMove{account: account, src: src, dest: dest, destUID: destUID, label: label}
+	return " · ctrl+z to undo"
+}
+
+// performUndo reverses the last move, restoring the message to its origin.
+func (a *App) performUndo() tea.Cmd {
+	u := a.lastUndo
+	if u == nil {
+		return a.flash("Nothing to undo", "info")
+	}
+	a.lastUndo = nil
+	client, ok := a.imapClients[u.account]
+	if !ok {
+		return a.flash(fmt.Sprintf("%s Cannot undo: not connected", icons.Error), "err")
+	}
+	return tea.Batch(
+		a.flash(fmt.Sprintf("%s Undoing…", icons.Refresh), "info"),
+		func() tea.Msg {
+			_, err := client.MoveMessageSync(u.dest, u.destUID, u.src)
+			return undoResultMsg{account: u.account, folder: u.src, err: err}
+		},
+	)
+}
+
+// focusSidebar moves keyboard focus into the sidebar (bound to both Tab and \).
+func (a *App) focusSidebar() {
+	if !a.showSidebar {
+		return
+	}
+	a.sidebarFocused = true
+	a.sidebar.SetFocused(true)
+	if a.viewID == ViewSmartFolder {
+		a.sidebar.FocusAt("", a.smartFolder)
+	} else {
+		a.sidebar.FocusAt(a.activeAccount, a.activeFolder)
+	}
+}
+
+func (a *App) openCommandPalette() {
+	a.commandPalette.SetSize(a.width, a.height-a.headerHeight()-a.statusHeight())
+	a.commandPalette.Open()
+}
+
 func (a *App) openFolderPicker() {
 	var folders []*data.Folder
 	for _, acct := range a.accounts {
@@ -2343,7 +2538,7 @@ func (a *App) openFolderPicker() {
 		return
 	}
 	a.folderPicker.SetSize(a.width, a.height-a.headerHeight()-a.statusHeight())
-	a.folderPicker.Open(folders, a.activeFolder)
+	a.folderPicker.Open(folders, a.activeFolder, a.sidebar.CollapsedFolders(a.activeAccount))
 }
 
 func (a *App) openNewFolderDialog() {
@@ -2888,11 +3083,14 @@ func writeAttachmentTemp(att data.Attachment) (string, error) {
 	return f.Name(), nil
 }
 
-
 // --- layout ---
 
 const sidebarWidth = 26 // content width
 const sidebarBorderWidth = 1
+
+// wheelScrollStep is how many navigation steps one mouse-wheel notch moves, so
+// the wheel scrolls faster than single-step keyboard navigation.
+const wheelScrollStep = 3
 
 func sidebarRenderedWidth() int {
 	return sidebarWidth + sidebarBorderWidth
@@ -2907,6 +3105,11 @@ func (a *App) currentSbContext() string {
 	switch a.viewID {
 	case ViewReader:
 		ctx = "reader"
+		a.statusbar.SetReaderState(
+			a.readerView.HasAttachments(),
+			a.readerView.AttachFocusActive(),
+			a.readerView.HasFocusableEvent(),
+		)
 	case ViewFolder:
 		ctx = "folder"
 	case ViewSmartFolder:
@@ -2923,6 +3126,9 @@ func (a *App) currentSbContext() string {
 	}
 	if a.newFolder.IsActive() {
 		ctx = "new-folder"
+	}
+	if a.commandPalette.IsActive() {
+		ctx = "palette"
 	}
 	if a.sidebarFocused {
 		ctx = "sidebar"
@@ -3044,6 +3250,9 @@ func (a *App) View() string {
 	if a.newFolder.IsActive() {
 		mainContent = a.newFolder.View()
 	}
+	if a.commandPalette.IsActive() {
+		mainContent = a.commandPalette.View()
+	}
 	if a.showHelp {
 		mainContent = a.helpOverlay.View(a.width, contentH)
 	}
@@ -3073,9 +3282,11 @@ func (a *App) maybeLoadMore() tea.Cmd {
 	if !ok {
 		return nil
 	}
+	// Trigger off the bottom of the viewport rather than the cursor, so wheel
+	// scrolling (offset-driven, cursor parked mid-view) prefetches just like
+	// keyboard navigation does as the cursor nears the end.
 	n := a.inboxView.Len()
-	cursor := a.inboxView.CursorPos()
-	if n == 0 || cursor < n-10 {
+	if n == 0 || a.inboxView.LastVisibleIndex() < n-10 {
 		return nil
 	}
 	a.loadingMore = true

@@ -213,6 +213,27 @@ func (v *ReaderView) FocusNextAttachment(delta int) {
 	v.rebuildLines()
 }
 
+// EnterAttachments focuses the first attachment, entering the attachment
+// section and scrolling it into view. No-op when there are no attachments.
+func (v *ReaderView) EnterAttachments() {
+	if len(v.messageAttachments()) == 0 {
+		return
+	}
+	v.attachFocus = 0
+	v.attachActionFocus = 0
+	v.GoToBottom()
+	v.rebuildLines()
+}
+
+// ExitAttachments clears attachment focus, leaving the attachment section.
+func (v *ReaderView) ExitAttachments() {
+	if v.attachFocus < 0 {
+		return
+	}
+	v.attachFocus = -1
+	v.rebuildLines()
+}
+
 // FocusNextAttachmentAction cycles the action (Open/Download/Editor) for the focused attachment.
 func (v *ReaderView) FocusNextAttachmentAction(delta int) {
 	if !v.AttachFocusActive() {
