@@ -60,6 +60,18 @@ func toMessageJSONList(msgs []*data.Message) []messageJSON {
 	return out
 }
 
+// messageListResult wraps a message slice in an object. The MCP spec requires a
+// tool's structuredContent to be a JSON object, so list-style handlers must not
+// return a bare array (clients reject it with "expected record, received array").
+type messageListResult struct {
+	Messages []messageJSON `json:"messages"`
+	Count    int           `json:"count"`
+}
+
+func toMessageListResult(msgs []messageJSON) (*mcp.CallToolResult, error) {
+	return mcp.NewToolResultJSON(messageListResult{Messages: msgs, Count: len(msgs)})
+}
+
 func addressStrings(addrs []data.Address) []string {
 	out := make([]string, 0, len(addrs))
 	for _, a := range addrs {
@@ -89,7 +101,10 @@ func (s *Server) handleListAccounts(_ context.Context, _ mcp.CallToolRequest) (*
 		a := &s.cfg.Accounts[i]
 		out = append(out, acctJSON{Name: a.Name, Username: a.Username, IMAPHost: a.IMAPHost})
 	}
-	return mcp.NewToolResultJSON(out)
+	return mcp.NewToolResultJSON(struct {
+		Accounts []acctJSON `json:"accounts"`
+		Count    int        `json:"count"`
+	}{Accounts: out, Count: len(out)})
 }
 
 func (s *Server) handleListFolders(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -123,7 +138,10 @@ func (s *Server) handleListFolders(_ context.Context, req mcp.CallToolRequest) (
 			Total:   f.Total,
 		})
 	}
-	return mcp.NewToolResultJSON(out)
+	return mcp.NewToolResultJSON(struct {
+		Folders []folderJSON `json:"folders"`
+		Count   int          `json:"count"`
+	}{Folders: out, Count: len(out)})
 }
 
 func (s *Server) handleListMessages(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -140,7 +158,7 @@ func (s *Server) handleListMessages(_ context.Context, req mcp.CallToolRequest) 
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("listing messages", err), nil
 	}
-	return mcp.NewToolResultJSON(toMessageJSONList(msgs))
+	return toMessageListResult(toMessageJSONList(msgs))
 }
 
 func (s *Server) handleSearchMessages(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -172,7 +190,7 @@ func (s *Server) handleSearchMessages(_ context.Context, req mcp.CallToolRequest
 			break
 		}
 	}
-	return mcp.NewToolResultJSON(toMessageJSONList(filtered))
+	return toMessageListResult(toMessageJSONList(filtered))
 }
 
 func (s *Server) handleSemanticSearch(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -226,7 +244,7 @@ func (s *Server) handleSemanticSearch(ctx context.Context, req mcp.CallToolReque
 		mj.Score = hit.Score
 		out = append(out, mj)
 	}
-	return mcp.NewToolResultJSON(out)
+	return toMessageListResult(out)
 }
 
 func (s *Server) handleReadMessage(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -293,7 +311,7 @@ func (s *Server) handleListByCategory(_ context.Context, req mcp.CallToolRequest
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("listing by category", err), nil
 	}
-	return mcp.NewToolResultJSON(toMessageJSONList(msgs))
+	return toMessageListResult(toMessageJSONList(msgs))
 }
 
 // --- write handlers ---
