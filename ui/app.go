@@ -71,8 +71,9 @@ type quickMoveResultMsg struct {
 // moveHintMsg carries a precomputed folder suggestion for the quick-move hint.
 type moveHintMsg struct{ dest string }
 
-// clearStatusMsg clears the flash message.
-type clearStatusMsg struct{}
+// clearStatusMsg clears the flash message. seq identifies which flash generation
+// this timer belongs to, so a stale timer cannot clear a newer message.
+type clearStatusMsg struct{ seq int }
 
 // quitTimeoutMsg clears the pending quit state.
 type quitTimeoutMsg struct{}
@@ -522,8 +523,30 @@ func (a *App) applySuggestResult(r suggest.ResultMsg) {
 	}
 }
 
-// Update implements tea.Model.
+// flashTimeout is how long a status flash stays visible before it auto-clears.
+const flashTimeout = 3 * time.Second
+
+// Update implements tea.Model. It wraps the real handler so that any flash
+// raised during the update — including by background result handlers that
+// discard flash()'s return value — is given an auto-clear timer exactly once.
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	before := a.statusbar.MessageSeq()
+	model, cmd := a.update(msg)
+	if a.statusbar.MessageSeq() != before && a.statusbar.HasMessage() {
+		seq := a.statusbar.MessageSeq()
+		clear := tea.Tick(flashTimeout, func(time.Time) tea.Msg {
+			return clearStatusMsg{seq: seq}
+		})
+		if cmd == nil {
+			cmd = clear
+		} else {
+			cmd = tea.Batch(cmd, clear)
+		}
+	}
+	return model, cmd
+}
+
+func (a *App) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
 	case tea.WindowSizeMsg:
@@ -964,6 +987,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case clearStatusMsg:
+		if msg.seq != a.statusbar.MessageSeq() {
+			return a, nil // a newer flash replaced this one; its own timer will clear it
+		}
 		a.statusbar.ClearMessage()
 		a.lastUndo = nil // undo is offered only while its flash is visible
 		a.updateLayout() // message gone; reclaim the extra line
@@ -1222,6 +1248,16 @@ func (a *App) dispatchGlobalKey(key string) (tea.Model, tea.Cmd) {
 	case "z":
 		if a.viewID == ViewReader {
 			a.readerView.ToggleQuoteFolds()
+		}
+
+	case "]":
+		if a.viewID == ViewReader {
+			a.readerView.JumpToMessage(1)
+		}
+
+	case "[":
+		if a.viewID == ViewReader {
+			a.readerView.JumpToMessage(-1)
 		}
 
 	case "b":
@@ -3140,6 +3176,7 @@ func (a *App) currentSbContext() string {
 			a.readerView.HasAttachments(),
 			a.readerView.AttachFocusActive(),
 			a.readerView.HasFocusableEvent(),
+			a.readerView.CanJumpMessages(),
 		)
 	case ViewFolder:
 		ctx = "folder"
@@ -3292,6 +3329,11 @@ func (a *App) View() string {
 		mainContent = a.helpOverlay.View(a.width, contentH)
 	}
 
+	if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
+		a.statusbar.SetSelectionCount(a.inboxView.SelectionCount())
+	} else {
+		a.statusbar.SetSelectionCount(0)
+	}
 	statusbar := a.statusbar.View(a.currentSbContext())
 
 	output := lipgloss.JoinVertical(lipgloss.Left, header, mainContent, statusbar)
@@ -3338,12 +3380,12 @@ func (a *App) maybeLoadMore() tea.Cmd {
 
 // --- utility ---
 
+// flash sets a temporary status message. The auto-clear timer is scheduled
+// centrally in Update, so callers may use or discard the (nil) return freely.
 func (a *App) flash(msg, kind string) tea.Cmd {
 	a.statusbar.SetMessage(msg, kind)
 	a.updateLayout() // flash message adds a line; recalculate content height
-	return tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
-		return clearStatusMsg{}
-	})
+	return nil
 }
 
 // updateLineBuffers splits the rendered output into per-line buffers used for

@@ -40,6 +40,28 @@ func TestInboxEmptyStates(t *testing.T) {
 	}
 }
 
+func TestInboxSelectionCount(t *testing.T) {
+	v := NewInboxView(&config.Theme{})
+	v.SetSize(60, 20)
+	v.SetThreads(makeThreads(10))
+
+	if v.SelectionCount() != 0 {
+		t.Errorf("no multi-selection should report 0, got %d", v.SelectionCount())
+	}
+	v.ShiftMoveDown() // anchor at 0, cursor at 1 → 2 selected
+	if v.SelectionCount() != 2 {
+		t.Errorf("after one shift-move: count=%d, want 2", v.SelectionCount())
+	}
+	v.ShiftMoveDown()
+	if v.SelectionCount() != 3 {
+		t.Errorf("after two shift-moves: count=%d, want 3", v.SelectionCount())
+	}
+	v.ClearSelection()
+	if v.SelectionCount() != 0 {
+		t.Errorf("after ClearSelection: count=%d, want 0", v.SelectionCount())
+	}
+}
+
 func TestInboxSetThreadsResetsState(t *testing.T) {
 	v := NewInboxView(&config.Theme{})
 	v.SetSize(60, 8)

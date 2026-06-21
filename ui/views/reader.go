@@ -751,6 +751,73 @@ func (v *ReaderView) View() string {
 	return v.viewSingle()
 }
 
+// overlayScrollIndicator right-aligns a "NN%" scroll position indicator onto the
+// last row of padded when the content overflows the viewport. bh is the number
+// of body rows. Shared by thread and single-message modes so both show progress.
+func (v *ReaderView) overlayScrollIndicator(padded []string, bh int) {
+	if bh < 1 || len(v.lines) <= bh {
+		return
+	}
+	pct := (v.scrollY + bh) * 100 / len(v.lines)
+	if pct > 100 {
+		pct = 100
+	}
+	indicator := lipgloss.NewStyle().
+		Foreground(v.theme.TextFaint).
+		Render(fmt.Sprintf(" %d%%", pct))
+	indW := lipgloss.Width(indicator)
+	last := padded[bh-1]
+	lastW := lipgloss.Width(last)
+	gap := v.width - lastW - indW
+	if gap >= 0 {
+		// There is room: right-align the indicator without overflowing the line.
+		padded[bh-1] = last + strings.Repeat(" ", gap) + indicator
+	}
+	// If gap < 0 the line already fills the width — skip the indicator rather than
+	// wrapping the line and pushing content off screen.
+}
+
+// CanJumpMessages reports whether the reader is showing a thread with more than
+// one message, so the per-message jump keys are meaningful.
+func (v *ReaderView) CanJumpMessages() bool {
+	return v.thread != nil && len(v.msgLineOffsets) > 1
+}
+
+// JumpToMessage scrolls to the next (delta>0) or previous (delta<0) message
+// boundary in thread mode. When part-way into a message, a previous-jump first
+// snaps to the top of the current message. No-op in single-message mode.
+func (v *ReaderView) JumpToMessage(delta int) {
+	if v.thread == nil || len(v.msgLineOffsets) == 0 {
+		return
+	}
+	// Current message = the last one whose start is at or above the scroll line.
+	cur := 0
+	for i, off := range v.msgLineOffsets {
+		if v.scrollY >= off {
+			cur = i
+		}
+	}
+	target := cur + delta
+	if delta < 0 && v.scrollY > v.msgLineOffsets[cur] {
+		// We're below the current message's header: first jump snaps to its top.
+		target = cur
+	}
+	if target < 0 {
+		target = 0
+	}
+	if target > len(v.msgLineOffsets)-1 {
+		target = len(v.msgLineOffsets) - 1
+	}
+	v.scrollY = v.msgLineOffsets[target]
+	max := len(v.lines) - v.bodyHeight()
+	if max < 0 {
+		max = 0
+	}
+	if v.scrollY > max {
+		v.scrollY = max
+	}
+}
+
 // viewThread renders the thread as a scrollable full-height block.
 func (v *ReaderView) viewThread() string {
 	bh := v.bodyHeight()
@@ -767,33 +834,13 @@ func (v *ReaderView) viewThread() string {
 	copy(padded, v.lines[start:end])
 	// empty strings already in padded from make
 
-	// Scroll percentage in bottom-right of the last row (only when there is room).
-	if len(v.lines) > bh && bh > 0 {
-		pct := (v.scrollY + bh) * 100 / len(v.lines)
-		if pct > 100 {
-			pct = 100
-		}
-		indicator := lipgloss.NewStyle().
-			Foreground(v.theme.TextFaint).
-			Render(fmt.Sprintf(" %d%%", pct))
-		indW := lipgloss.Width(indicator)
-		last := padded[bh-1]
-		lastW := lipgloss.Width(last)
-		gap := v.width - lastW - indW
-		if gap >= 0 {
-			// There is room: right-align indicator without overflowing the line.
-			padded[bh-1] = last + strings.Repeat(" ", gap) + indicator
-		}
-		// If gap < 0 the line is already wide enough to overflow — skip the
-		// indicator rather than wrapping the line and pushing the header off screen.
-	}
+	v.overlayScrollIndicator(padded, bh)
 
 	return lipgloss.NewStyle().Width(v.width).Render(strings.Join(padded, "\n"))
 }
 
 // viewSingle renders the classic static-header + scrollable-body layout.
 func (v *ReaderView) viewSingle() string {
-	theme := v.theme
 	headerStr := strings.Join(v.singleHeaderLines(), "\n")
 
 	bh := v.bodyHeight()
@@ -809,19 +856,7 @@ func (v *ReaderView) viewSingle() string {
 	padded := make([]string, bh)
 	copy(padded, v.lines[start:end])
 
-	if len(v.lines) > bh {
-		pct := 0
-		if len(v.lines) > 0 {
-			pct = (v.scrollY + bh) * 100 / len(v.lines)
-			if pct > 100 {
-				pct = 100
-			}
-		}
-		scrollIndicator := lipgloss.NewStyle().
-			Foreground(theme.TextFaint).
-			Render(fmt.Sprintf(" %d%%", pct))
-		_ = scrollIndicator // retained for future: show in divider row
-	}
+	v.overlayScrollIndicator(padded, bh)
 
 	bodyStr := lipgloss.NewStyle().
 		Width(v.width).

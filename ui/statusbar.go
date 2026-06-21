@@ -25,11 +25,14 @@ type StatusBar struct {
 	embedding embeddingStats
 	moveHint  string // suggested destination folder for quick-move
 	hitZones  []StatusHitZone
+	msgSeq    int // bumps on every SetMessage; used to expire stale flashes
+	selCount  int // active inbox multi-selection size (0 = none)
 
 	// Reader sub-state, used to build context-aware hints for the reader view.
 	readerHasAttach    bool
 	readerAttachActive bool
 	readerHasEvent     bool
+	readerThreadNav    bool // thread mode with >1 message: per-message jump available
 }
 
 var spinnerFrames = []string{
@@ -51,11 +54,23 @@ func (sb *StatusBar) SetWidth(w int) {
 	sb.width = w
 }
 
-// SetMessage sets a temporary flash message.
+// SetMessage sets a temporary flash message. Each call bumps msgSeq so a stale
+// auto-clear timer can tell whether it still owns the visible message.
 func (sb *StatusBar) SetMessage(msg, kind string) {
 	sb.message = msg
 	sb.msgKind = kind
+	sb.msgSeq++
 }
+
+// MessageSeq returns the current flash generation.
+func (sb *StatusBar) MessageSeq() int { return sb.msgSeq }
+
+// HasMessage reports whether a flash message is currently shown.
+func (sb *StatusBar) HasMessage() bool { return sb.message != "" }
+
+// SetSelectionCount records the active inbox multi-selection size so it can be
+// surfaced in the hints row. Pass 0 to clear.
+func (sb *StatusBar) SetSelectionCount(n int) { sb.selCount = n }
 
 // ClearMessage clears the flash message.
 func (sb *StatusBar) ClearMessage() {
@@ -85,10 +100,11 @@ func (sb *StatusBar) MoveHint() string { return sb.moveHint }
 
 // SetReaderState updates reader-specific flags so the "reader" context can show
 // hints that match what the user can actually do right now.
-func (sb *StatusBar) SetReaderState(hasAttach, attachActive, hasEvent bool) {
+func (sb *StatusBar) SetReaderState(hasAttach, attachActive, hasEvent, threadNav bool) {
 	sb.readerHasAttach = hasAttach
 	sb.readerAttachActive = attachActive
 	sb.readerHasEvent = hasEvent
+	sb.readerThreadNav = threadNav
 }
 
 // HitTest returns the action key for the hint clicked at (x, y), where y is
@@ -180,6 +196,10 @@ func (sb *StatusBar) View(context string) string {
 			}
 		} else {
 			hints = []hint{{icons.ArrowUpDown, "j/k", "scroll"}}
+			// Per-message jump only when reading a multi-message thread.
+			if sb.readerThreadNav {
+				hints = append(hints, hint{icons.ChevronDown, "[/]", "prev/next msg"})
+			}
 			// Event hints only when the mail actually has a suggested event.
 			if sb.readerHasEvent {
 				hints = append(hints,
@@ -311,8 +331,14 @@ func (sb *StatusBar) View(context string) string {
 	}
 	sb.hitZones = newHitZones
 
-	// Inline right side: loading + embedding stats (short, predictable width).
+	// Inline right side: selection count + loading + embedding stats.
 	var inlineParts []string
+	if sb.selCount > 1 {
+		inlineParts = append(inlineParts, lipgloss.NewStyle().
+			Foreground(theme.Accent).
+			Bold(true).
+			Render(fmt.Sprintf("%s %d selected", icons.Check, sb.selCount)))
+	}
 	if sb.loading {
 		inlineParts = append(inlineParts, lipgloss.NewStyle().
 			Foreground(theme.TextMuted).

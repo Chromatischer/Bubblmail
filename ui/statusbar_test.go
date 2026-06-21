@@ -10,7 +10,7 @@ func TestReaderHintsAreStateAware(t *testing.T) {
 	sb.SetWidth(160)
 
 	render := func(hasAttach, attachActive, hasEvent bool) string {
-		sb.SetReaderState(hasAttach, attachActive, hasEvent)
+		sb.SetReaderState(hasAttach, attachActive, hasEvent, false)
 		return sb.View("reader")
 	}
 
@@ -41,5 +41,53 @@ func TestReaderHintsAreStateAware(t *testing.T) {
 	}
 	if strings.Contains(inSection, "reply") {
 		t.Error("attachment section should not show message-level actions like reply")
+	}
+}
+
+func TestReaderThreadJumpHint(t *testing.T) {
+	sb := NewStatusBar(NewStyles(testTheme()))
+	sb.SetWidth(160)
+
+	sb.SetReaderState(false, false, false, true)
+	if !strings.Contains(sb.View("reader"), "prev/next msg") {
+		t.Error("multi-message thread should advertise the [/] jump keys")
+	}
+	sb.SetReaderState(false, false, false, false)
+	if strings.Contains(sb.View("reader"), "prev/next msg") {
+		t.Error("single message should not advertise per-message jumps")
+	}
+}
+
+func TestStatusBarSelectionChip(t *testing.T) {
+	sb := NewStatusBar(NewStyles(testTheme()))
+	sb.SetWidth(160)
+
+	sb.SetSelectionCount(3)
+	if !strings.Contains(sb.View("inbox"), "3 selected") {
+		t.Error("multi-selection should surface a '3 selected' chip")
+	}
+	sb.SetSelectionCount(1)
+	if strings.Contains(sb.View("inbox"), "selected") {
+		t.Error("a single selected thread is not a multi-selection; no chip")
+	}
+	sb.SetSelectionCount(0)
+	if strings.Contains(sb.View("inbox"), "selected") {
+		t.Error("no selection should show no chip")
+	}
+}
+
+func TestStatusBarFlashSeq(t *testing.T) {
+	sb := NewStatusBar(NewStyles(testTheme()))
+	s0 := sb.MessageSeq()
+	sb.SetMessage("hello", "ok")
+	if sb.MessageSeq() == s0 {
+		t.Error("SetMessage should bump the flash generation")
+	}
+	if !sb.HasMessage() {
+		t.Error("HasMessage should be true after SetMessage")
+	}
+	sb.ClearMessage()
+	if sb.HasMessage() {
+		t.Error("HasMessage should be false after ClearMessage")
 	}
 }

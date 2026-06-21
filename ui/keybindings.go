@@ -74,6 +74,7 @@ func AllHelpLines() []HelpLine {
 		{icons.Attachment + " a", "Attachments (Tab/Esc to cycle/exit)"},
 		{"", ""},
 		{"z", "Toggle quote folding / fold sidebar folder"},
+		{"[ / ]", "Prev/next message in thread"},
 		{icons.Search + " /", "Local search"},
 		{"ctrl+f", "IMAP server search"},
 		{icons.Inbox + " i", "Jump to INBOX"},

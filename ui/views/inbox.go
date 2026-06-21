@@ -336,6 +336,16 @@ func (v *InboxView) HasMultiSelection() bool {
 	return v.selectionAnchor >= 0 && v.selectionAnchor != v.cursor
 }
 
+// SelectionCount returns the number of threads in the active shift-selection,
+// or 0 when there is no multi-selection.
+func (v *InboxView) SelectionCount() int {
+	if v.selectionAnchor < 0 {
+		return 0
+	}
+	lo, hi := v.selRange()
+	return hi - lo + 1
+}
+
 // SelectedThreads returns all threads in the current selection range.
 func (v *InboxView) SelectedThreads() []*data.Thread {
 	lo, hi := v.selRange()
