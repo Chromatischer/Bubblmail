@@ -57,7 +57,6 @@ type embeddingStartedMsg struct {
 }
 
 type prefetchTickMsg struct{}
-type suggestPollMsg struct{}
 
 type quickMoveResultMsg struct {
 	msgID   int64
@@ -331,10 +330,10 @@ func (a *App) Init() tea.Cmd {
 		cmds = append(cmds, prefetchTick(interval))
 	}
 	if a.classifyQueue != nil {
-		cmds = append(cmds, classifyResultsTick())
+		cmds = append(cmds, a.waitForClassifyResult())
 	}
 	if a.suggestQueue != nil {
-		cmds = append(cmds, suggestResultsTick())
+		cmds = append(cmds, a.waitForSuggestResult())
 	}
 	// Load any previously cached classification counts immediately so the
 	// sidebar is populated on first render without waiting for new messages.
@@ -460,21 +459,68 @@ func embeddingTick() tea.Cmd {
 	})
 }
 
-// classifyResultsTick polls the classification results channel.
-func classifyResultsTick() tea.Cmd {
-	return tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg {
-		return classifyPollMsg{}
-	})
+// waitForClassifyResult blocks on the classification results channel and wakes
+// the Update loop only when a result actually arrives — no idle polling.
+func (a *App) waitForClassifyResult() tea.Cmd {
+	return func() tea.Msg {
+		r, ok := <-a.classifyResults
+		return classifyResultReadyMsg{result: r, ok: ok}
+	}
 }
 
-func suggestResultsTick() tea.Cmd {
-	return tea.Tick(300*time.Millisecond, func(t time.Time) tea.Msg {
-		return suggestPollMsg{}
-	})
+// waitForSuggestResult blocks on the suggested-event results channel, waking the
+// Update loop only when a result arrives.
+func (a *App) waitForSuggestResult() tea.Cmd {
+	return func() tea.Msg {
+		r, ok := <-a.suggestResults
+		return suggestResultReadyMsg{result: r, ok: ok}
+	}
 }
 
-// classifyPollMsg is the tick that drains the classify results channel.
-type classifyPollMsg struct{}
+// classifyResultReadyMsg delivers one classification result from the channel.
+type classifyResultReadyMsg struct {
+	result classifylib.ResultMsg
+	ok     bool // false once the channel is closed
+}
+
+// suggestResultReadyMsg delivers one suggested-event result from the channel.
+type suggestResultReadyMsg struct {
+	result suggest.ResultMsg
+	ok     bool
+}
+
+// applyClassifyResult folds one classification result into the smart-folder
+// counts, reporting whether it changed anything.
+func (a *App) applyClassifyResult(r classifylib.ResultMsg) bool {
+	if r.Err == nil && r.Category != "" {
+		a.smartCounts[r.Category]++
+		return true
+	}
+	return false
+}
+
+// applySuggestResult delivers one suggested-event result to the reader if it is
+// still showing the matching message.
+func (a *App) applySuggestResult(r suggest.ResultMsg) {
+	if r.Err != nil && r.Event == nil {
+		a.flash("Suggested event error: "+r.Err.Error(), "err")
+		r.Event = &data.SuggestedEvent{
+			MessageID:    r.MessageID,
+			GenerationOK: false,
+			ParseError:   r.Err.Error(),
+		}
+	}
+	if cur := a.readerView.CurrentMessage(); cur != nil && cur.ID == r.MessageID {
+		a.readerView.SetSuggestedEvent(r.Event)
+	} else if t := a.readerView.CurrentThread(); t != nil {
+		if latest := t.Latest(); latest != nil && latest.ID == r.MessageID {
+			a.readerView.SetSuggestedEvent(r.Event)
+		}
+	}
+	if r.Event != nil && !r.Event.GenerationOK && r.Err != nil {
+		a.flash("Suggested event parse error: "+r.Err.Error(), "err")
+	}
+}
 
 // Update implements tea.Model.
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -830,62 +876,47 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.inboxView.SetThreads(threads)
 		return a, nil
 
-	case classifyPollMsg:
-		if a.classifyQueue == nil {
-			return a, nil
+	case classifyResultReadyMsg:
+		if a.classifyQueue == nil || !msg.ok {
+			return a, nil // channel closed: stop waiting
 		}
-		// Drain all pending results without blocking
-		changed := false
-		for {
+		// Apply the delivered result, then drain any others already queued so a
+		// burst is handled in one Update rather than one frame each.
+		changed := a.applyClassifyResult(msg.result)
+		for drained := false; !drained; {
 			select {
 			case r := <-a.classifyResults:
-				if r.Err == nil && r.Category != "" {
-					a.smartCounts[r.Category]++
+				if a.applyClassifyResult(r) {
 					changed = true
 				}
 			default:
-				goto drained
+				drained = true
 			}
 		}
-	drained:
+		cmds := []tea.Cmd{a.waitForClassifyResult()} // re-arm the blocking read
 		if changed {
 			a.refreshSmartCounts()
-			// If viewing a smart folder, refresh its thread list
+			// If viewing a smart folder, refresh its thread list.
 			if a.viewID == ViewSmartFolder && a.smartFolder != "" {
-				return a, tea.Batch(classifyResultsTick(), a.fetchSmartFolder(a.smartFolder))
+				cmds = append(cmds, a.fetchSmartFolder(a.smartFolder))
 			}
 		}
-		return a, classifyResultsTick()
+		return a, tea.Batch(cmds...)
 
-	case suggestPollMsg:
-		if a.suggestQueue == nil {
-			return a, nil
+	case suggestResultReadyMsg:
+		if a.suggestQueue == nil || !msg.ok {
+			return a, nil // channel closed: stop waiting
 		}
-		for {
+		a.applySuggestResult(msg.result)
+		for drained := false; !drained; {
 			select {
 			case r := <-a.suggestResults:
-				if r.Err != nil && r.Event == nil {
-					a.flash("Suggested event error: "+r.Err.Error(), "err")
-					r.Event = &data.SuggestedEvent{
-						MessageID:    r.MessageID,
-						GenerationOK: false,
-						ParseError:   r.Err.Error(),
-					}
-				}
-				if cur := a.readerView.CurrentMessage(); cur != nil && cur.ID == r.MessageID {
-					a.readerView.SetSuggestedEvent(r.Event)
-				} else if t := a.readerView.CurrentThread(); t != nil {
-					if latest := t.Latest(); latest != nil && latest.ID == r.MessageID {
-						a.readerView.SetSuggestedEvent(r.Event)
-					}
-				}
-				if r.Event != nil && !r.Event.GenerationOK && r.Err != nil {
-					a.flash("Suggested event parse error: "+r.Err.Error(), "err")
-				}
+				a.applySuggestResult(r)
 			default:
-				return a, suggestResultsTick()
+				drained = true
 			}
 		}
+		return a, a.waitForSuggestResult() // re-arm the blocking read
 
 	case prefetchTickMsg:
 		if !a.cfg.Embeddings.PrefetchBodies {
@@ -3208,11 +3239,15 @@ func (a *App) View() string {
 	if a.comp.IsActive() {
 		mainContent = a.comp.View()
 		output := lipgloss.JoinVertical(lipgloss.Left, header, mainContent, a.statusbar.View("composer"))
-		lines := a.updateLineBuffers(output)
-		if a.drag != nil && a.drag.isDrag && a.drag.canCopy {
-			output = applySelectionHighlight(lines,
-				a.drag.startX, a.drag.startY, a.drag.endX, a.drag.endY,
-				a.drag.zoneX0, a.drag.zoneY0, a.drag.zoneX1, a.drag.zoneY1)
+		// Line buffers are only consumed by drag-to-copy, so build them only while
+		// a drag is in progress instead of ANSI-stripping the whole screen every frame.
+		if a.drag != nil {
+			lines := a.updateLineBuffers(output)
+			if a.drag.isDrag && a.drag.canCopy {
+				output = applySelectionHighlight(lines,
+					a.drag.startX, a.drag.startY, a.drag.endX, a.drag.endY,
+					a.drag.zoneX0, a.drag.zoneY0, a.drag.zoneX1, a.drag.zoneY1)
+			}
 		}
 		return output
 	}
@@ -3261,14 +3296,18 @@ func (a *App) View() string {
 
 	output := lipgloss.JoinVertical(lipgloss.Left, header, mainContent, statusbar)
 
-	// Update line buffers for drag-selection text extraction.
-	lines := a.updateLineBuffers(output)
-
-	// Apply visual selection highlight during an active drag (reader only).
-	if a.drag != nil && a.drag.isDrag && a.drag.canCopy {
-		output = applySelectionHighlight(lines,
-			a.drag.startX, a.drag.startY, a.drag.endX, a.drag.endY,
-			a.drag.zoneX0, a.drag.zoneY0, a.drag.zoneX1, a.drag.zoneY1)
+	// Line buffers feed drag-selection text extraction, which can only run while a
+	// drag is active. Building them every frame would ANSI-strip the entire screen
+	// on each keystroke, scroll notch, and idle timer tick for nothing — so only
+	// refresh them when a drag is in progress.
+	if a.drag != nil {
+		lines := a.updateLineBuffers(output)
+		// Apply visual selection highlight during an active drag (reader only).
+		if a.drag.isDrag && a.drag.canCopy {
+			output = applySelectionHighlight(lines,
+				a.drag.startX, a.drag.startY, a.drag.endX, a.drag.endY,
+				a.drag.zoneX0, a.drag.zoneY0, a.drag.zoneX1, a.drag.zoneY1)
+		}
 	}
 
 	return output
