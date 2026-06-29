@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bubblmail/bubblmail/cache"
 	"github.com/bubblmail/bubblmail/config"
@@ -98,7 +99,8 @@ func (q *embeddingQueue) embed(msg *data.Message, content string) {
 		q.clearSeen(msg.ID, hash)
 		return
 	}
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
 	vecs, err := q.client.EmbedTexts(ctx, []string{content})
 	if err != nil || len(vecs) == 0 {
 		q.clearSeen(msg.ID, hash)

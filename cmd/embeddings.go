@@ -75,10 +75,10 @@ var embeddingsStatusCmd = &cobra.Command{
 }
 
 var embeddingsEmbedCmd = &cobra.Command{
-	Use:   "embedd",
+	Use:   "embed",
 	Short: "Backfill embeddings for cached bodies",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runEmbeddingsBackfill(false)
+		return runEmbeddingsBackfill(cmd.Context(), false)
 	},
 }
 
@@ -86,11 +86,11 @@ var embeddingsEmbedForceCmd = &cobra.Command{
 	Use:   "force",
 	Short: "Re-embed all cached bodies",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runEmbeddingsBackfill(true)
+		return runEmbeddingsBackfill(cmd.Context(), true)
 	},
 }
 
-func runEmbeddingsBackfill(force bool) error {
+func runEmbeddingsBackfill(ctx context.Context, force bool) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
@@ -150,7 +150,10 @@ func runEmbeddingsBackfill(force bool) error {
 			if len(batchTexts) == 0 {
 				return nil
 			}
-			vecs, err := client.EmbedTexts(context.Background(), batchTexts)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			vecs, err := client.EmbedTexts(ctx, batchTexts)
 			if err != nil {
 				return err
 			}
@@ -174,6 +177,9 @@ func runEmbeddingsBackfill(force bool) error {
 		}
 
 		for i, msg := range msgs {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if msg == nil {
 				continue
 			}

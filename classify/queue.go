@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bubblmail/bubblmail/cache"
 	"github.com/bubblmail/bubblmail/data"
@@ -109,7 +110,8 @@ func (q *Queue) process(msg *data.Message) {
 		}
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	category, confidence, err := q.client.Classify(ctx, from, msg.Subject, msg.Snippet)
 	if err != nil {
 		select {

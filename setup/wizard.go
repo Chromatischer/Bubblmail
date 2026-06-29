@@ -56,11 +56,13 @@ func RunWizard(cfg *config.Config) error {
 	// -- Authentication --
 	fmt.Println("-- Authentication --")
 	fmt.Println()
+	fmt.Println("Password commands are preferred so secrets are not stored in the config file.")
 
 	var password, passwordCmd string
-	if PromptYesNo(reader, "Use a command for password (e.g. pass, secret-tool)?", false) {
+	if PromptYesNo(reader, "Use a command for password (e.g. pass, secret-tool)?", true) {
 		passwordCmd = Prompt(reader, "Password command", "")
 	} else {
+		fmt.Println("  Warning: this stores the password directly in config.toml.")
 		password = PromptPassword(reader)
 	}
 

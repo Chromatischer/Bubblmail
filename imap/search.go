@@ -1,9 +1,9 @@
 package imap
 
 import (
+	"github.com/bubblmail/bubblmail/data"
 	tea "github.com/charmbracelet/bubbletea"
 	imaplib "github.com/emersion/go-imap/v2"
-	"github.com/bubblmail/bubblmail/data"
 )
 
 // SearchResultMsg carries the result of an IMAP SEARCH.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bubblmail/bubblmail/cache"
 	"github.com/bubblmail/bubblmail/data"
@@ -80,7 +81,9 @@ func (q *Queue) process(msg *data.Message) {
 		q.emit(ResultMsg{MessageID: msg.ID, Account: msg.AccountName, Err: err})
 		return
 	}
-	ev, err := q.client.Extract(context.Background(), msg, bodyText, bodyHTML)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	ev, err := q.client.Extract(ctx, msg, bodyText, bodyHTML)
 	if ev != nil {
 		_ = q.store.UpsertSuggestedEvent(ev)
 	}

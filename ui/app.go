@@ -2270,7 +2270,9 @@ func (a *App) quickMoveSingleMessage(msg *data.Message) tea.Cmd {
 				content = content[:maxChars]
 			}
 			if content != "" {
-				vecs, err := a.embClient.EmbedTexts(context.Background(), []string{content})
+				ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+				vecs, err := a.embClient.EmbedTexts(ctx, []string{content})
+				cancel()
 				if err == nil && len(vecs) > 0 {
 					vec = vecs[0]
 					norm = embeddings.VectorNorm(vec)
@@ -2439,81 +2441,6 @@ func (a *App) openQuickMenu(side quickMenuSide) tea.Cmd {
 	return nil
 }
 
-func (a *App) handleQuickMenuEnter() tea.Cmd {
-	if a.quickMenu == nil || a.quickMenu.side == quickMenuNone {
-		return nil
-	}
-	side := a.quickMenu.side
-	step := a.quickMenu.step
-	a.closeQuickMenu()
-	if side == quickMenuLeft {
-		switch step {
-		case 0:
-			return a.toggleRead()
-		case 1:
-			return a.quickMoveMessage()
-		}
-	}
-	if side == quickMenuRight {
-		switch step {
-		case 0:
-			return a.toggleStar()
-		case 1:
-			return a.deleteMessage()
-		}
-	}
-	return nil
-}
-
-func (a *App) deleteMessage() tea.Cmd {
-	if a.viewID != ViewInbox && a.viewID != ViewSmartFolder {
-		// Outside inbox — single-message mode (e.g. reader).
-		msg := a.currentMessage()
-		if msg == nil {
-			return nil
-		}
-		client, ok := a.imapClients[a.activeAccount]
-		if !ok {
-			return nil
-		}
-		trash := a.findTrashFolder(a.activeAccount)
-		if trash == "" {
-			a.flash("No Trash folder found", "err")
-			return nil
-		}
-		a.flash(fmt.Sprintf("%s Moving to Trash…", icons.Trash), "info")
-		return client.MoveToTrash(a.activeFolder, msg.UID, trash)
-	}
-	threads := a.inboxView.SelectedThreads()
-	if len(threads) == 0 {
-		return nil
-	}
-	client, ok := a.imapClients[a.activeAccount]
-	if !ok {
-		return nil
-	}
-	trash := a.findTrashFolder(a.activeAccount)
-	if trash == "" {
-		a.flash("No Trash folder found", "err")
-		return nil
-	}
-	var cmds []tea.Cmd
-	for _, t := range threads {
-		msg := t.Latest()
-		if msg == nil {
-			continue
-		}
-		cmds = append(cmds, client.MoveToTrash(msg.FolderName, msg.UID, trash))
-	}
-	if len(cmds) == 1 {
-		a.flash(fmt.Sprintf("%s Moving to Trash…", icons.Trash), "info")
-	} else {
-		a.flash(fmt.Sprintf("%s Moving %d to Trash…", icons.Trash, len(cmds)), "info")
-	}
-	a.inboxView.ClearSelection()
-	return tea.Batch(cmds...)
-}
-
 // persistUI writes the current UI state (collapsed folders + flags) to disk,
 // preserving all fields rather than overwriting the file with a partial struct.
 func (a *App) persistUI() {
@@ -2526,54 +2453,6 @@ func (a *App) persistUI() {
 
 // firstRunTipMsg triggers the one-time onboarding hint.
 type firstRunTipMsg struct{}
-
-// undoMove records the last reversible move so Ctrl+Z can put the message back.
-type undoMove struct {
-	account string
-	src     string // folder the message should return to
-	dest    string // folder it currently lives in
-	destUID uint32 // its UID in dest
-	label   string // human label of where it went, for the flash
-}
-
-// undoResultMsg is returned when an undo move completes.
-type undoResultMsg struct {
-	account string
-	folder  string // folder the message was restored to
-	err     error
-}
-
-// registerUndo stores a reversible move and returns the flash suffix advertising
-// it. Returns "" (and clears any pending undo) when the server gave no
-// destination UID, since we cannot then move the message back.
-func (a *App) registerUndo(account, src, dest string, destUID uint32, label string) string {
-	if destUID == 0 || dest == "" {
-		a.lastUndo = nil
-		return ""
-	}
-	a.lastUndo = &undoMove{account: account, src: src, dest: dest, destUID: destUID, label: label}
-	return " · ctrl+z to undo"
-}
-
-// performUndo reverses the last move, restoring the message to its origin.
-func (a *App) performUndo() tea.Cmd {
-	u := a.lastUndo
-	if u == nil {
-		return a.flash("Nothing to undo", "info")
-	}
-	a.lastUndo = nil
-	client, ok := a.imapClients[u.account]
-	if !ok {
-		return a.flash(fmt.Sprintf("%s Cannot undo: not connected", icons.Error), "err")
-	}
-	return tea.Batch(
-		a.flash(fmt.Sprintf("%s Undoing…", icons.Refresh), "info"),
-		func() tea.Msg {
-			_, err := client.MoveMessageSync(u.dest, u.destUID, u.src)
-			return undoResultMsg{account: u.account, folder: u.src, err: err}
-		},
-	)
-}
 
 // focusSidebar moves keyboard focus into the sidebar (bound to both Tab and \).
 func (a *App) focusSidebar() {
@@ -2626,123 +2505,6 @@ func (a *App) createFolder(name string) tea.Cmd {
 	}
 	a.flash(fmt.Sprintf("%s Creating folder '%s'…", icons.FolderNew, name), "info")
 	return client.CreateFolder(name)
-}
-
-func (a *App) moveMessageToFolder(destFolder string) tea.Cmd {
-	if a.viewID != ViewInbox && a.viewID != ViewSmartFolder {
-		// Outside inbox — single-message mode (e.g. reader).
-		msg := a.currentMessage()
-		if msg == nil {
-			return nil
-		}
-		client, ok := a.imapClients[a.activeAccount]
-		if !ok {
-			return nil
-		}
-		a.flash(fmt.Sprintf("%s Moving…", icons.FolderOpen), "info")
-		return client.MoveMessage(a.activeFolder, msg.UID, destFolder)
-	}
-	threads := a.inboxView.SelectedThreads()
-	if len(threads) == 0 {
-		return nil
-	}
-	client, ok := a.imapClients[a.activeAccount]
-	if !ok {
-		return nil
-	}
-	var cmds []tea.Cmd
-	for _, t := range threads {
-		msg := t.Latest()
-		if msg == nil {
-			continue
-		}
-		cmds = append(cmds, client.MoveMessage(msg.FolderName, msg.UID, destFolder))
-	}
-	if len(cmds) == 0 {
-		return nil
-	}
-	a.flash(fmt.Sprintf("%s Moving…", icons.FolderOpen), "info")
-	a.inboxView.ClearSelection()
-	return tea.Batch(cmds...)
-}
-
-// findTrashFolder returns the IMAP name of the Trash folder for the given account.
-// It looks for a folder with the \Trash attribute, then falls back to common names.
-func (a *App) findTrashFolder(account string) string {
-	for _, acct := range a.accounts {
-		if acct.Name != account {
-			continue
-		}
-		// First pass: look for \Trash attribute
-		for _, f := range acct.Folders {
-			for _, attr := range f.Attributes {
-				if attr == `\Trash` {
-					return f.Name
-				}
-			}
-		}
-		// Second pass: common names
-		for _, f := range acct.Folders {
-			switch f.DisplayName {
-			case "Trash", "Deleted", "Deleted Items", "Deleted Messages", "Bin":
-				return f.Name
-			}
-		}
-	}
-	return ""
-}
-
-// findSentFolder returns the IMAP name of the Sent folder for the given account.
-// It checks for the \Sent attribute first, then falls back to common names.
-func (a *App) findSentFolder(account string) string {
-	for _, acct := range a.accounts {
-		if acct.Name != account {
-			continue
-		}
-		for _, f := range acct.Folders {
-			for _, attr := range f.Attributes {
-				if attr == `\Sent` {
-					return f.Name
-				}
-			}
-		}
-		for _, f := range acct.Folders {
-			switch f.DisplayName {
-			case "Sent", "Sent Items", "Sent Mail", "Sent Messages":
-				return f.Name
-			}
-		}
-	}
-	return ""
-}
-
-// findDraftsFolder returns the IMAP name of the Drafts folder for the given account.
-// It checks for the \Drafts attribute first, then falls back to common names.
-func (a *App) findDraftsFolder(account string) string {
-	for _, acct := range a.accounts {
-		if acct.Name != account {
-			continue
-		}
-		for _, f := range acct.Folders {
-			for _, attr := range f.Attributes {
-				if attr == `\Drafts` || attr == `\Draft` {
-					return f.Name
-				}
-			}
-		}
-		for _, f := range acct.Folders {
-			switch f.DisplayName {
-			case "Drafts", "Draft":
-				return f.Name
-			}
-		}
-	}
-	return ""
-}
-
-func (a *App) archiveMessage() tea.Cmd {
-	a.flash(fmt.Sprintf("%s Archive not yet implemented", icons.Archive), "info")
-	return nil
 }
 
 func (a *App) doLocalSearch(q string) tea.Cmd {
@@ -2802,7 +2564,8 @@ func (a *App) doStreamingSearch(q string, seq int) tea.Cmd {
 			}
 			return embeddings.StreamSearchMsg{Seq: seq, Results: mergeSearchHits(semItems, nil), Loading: false}
 		}
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
 		vecs, err := a.embClient.EmbedTexts(ctx, []string{query})
 		if err != nil || len(vecs) == 0 {
 			if semErr != nil {

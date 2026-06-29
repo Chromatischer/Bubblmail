@@ -1,8 +1,8 @@
 package ui
 
 import (
-	"github.com/charmbracelet/lipgloss"
 	"github.com/bubblmail/bubblmail/config"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // Styles holds all shared lipgloss styles.

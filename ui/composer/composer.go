@@ -296,6 +296,8 @@ func (c *Composer) HandleKey(msg tea.KeyMsg) {
 		}
 	case "backspace", "ctrl+h":
 		f.backspace()
+	case "delete":
+		f.deleteForward()
 	case "left":
 		f.cursorLeft()
 	case "right":
@@ -382,8 +384,9 @@ func (c *Composer) IsPrompting() bool { return c.prompting }
 // content-area to screen coordinates.
 //
 // Geometry (all in screen coords, y=0 is terminal top):
-//   x: skip left-border(1) + left-pad(2) + label(10) + sep(3) = 16 cols from box left
-//   y: border(1)+pad(1)+title(1)+from(1)+divider(1)+3fields(3)+sectionDiv(1) = 9 rows down
+//
+//	x: skip left-border(1) + left-pad(2) + label(10) + sep(3) = 16 cols from box left
+//	y: border(1)+pad(1)+title(1)+from(1)+divider(1)+3fields(3)+sectionDiv(1) = 9 rows down
 func (c *Composer) BodyDragZone(headerH int) (x0, y0, x1, y1 int) {
 	if !c.active || c.prompting {
 		return

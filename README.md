@@ -75,9 +75,10 @@ The wizard will prompt for:
 - Account name (e.g. `work`, `personal`)
 - IMAP host and port (default 993)
 - SMTP host and port (default 587)
-- Username and password (or a shell command to retrieve it)
+- Username and a password command, with plaintext password entry available as an explicit fallback
 
 Config is written to `~/.config/bubblmail/config.toml`.
+The config file is saved with user-only permissions. Prefer `password_cmd` over storing a plaintext password.
 
 The local cache is stored in `~/.cache/bubblmail` by default.
 
@@ -128,8 +129,8 @@ bubblmail auth status             Test IMAP connections
 bubblmail auth remove <name>      Remove an account
 
 bubblmail embeddings status       Show embedding coverage per account
-bubblmail embeddings embedd       Backfill embeddings for cached bodies
-bubblmail embeddings embedd force Re-embed all cached bodies
+bubblmail embeddings embed        Backfill embeddings for cached bodies
+bubblmail embeddings embed force  Re-embed all cached bodies
 
 bubblmail list unread             List unread messages
 bubblmail list mailbox <name>     List messages in a mailbox

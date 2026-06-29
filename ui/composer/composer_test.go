@@ -58,13 +58,65 @@ func TestComposerPasteFlattensNewlinesInSingleLineField(t *testing.T) {
 	}
 }
 
+// Pasting multi-line text into the body keeps newlines and tabs intact.
+func TestComposerPastePreservesBodyWhitespace(t *testing.T) {
+	c := NewComposer(&config.Theme{})
+	c.OpenNew(data.Address{})
+	c.SetFocus(3) // Body
+
+	paste := "hello\n\twörld\r\n漢字"
+	c.HandleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(paste), Paste: true})
+
+	if got := c.fields[3].Value; got != "hello\n\twörld\n漢字" {
+		t.Fatalf("body = %q, want %q", got, "hello\n\twörld\n漢字")
+	}
+}
+
+func TestComposerDeleteRemovesRuneAtCursor(t *testing.T) {
+	c := NewComposer(&config.Theme{})
+	c.OpenNew(data.Address{})
+	c.SetFocus(2)
+	typeRunes(c, "café")
+
+	c.HandleKey(tea.KeyMsg{Type: tea.KeyLeft})
+	c.HandleKey(tea.KeyMsg{Type: tea.KeyDelete})
+
+	if got := c.fields[2].Value; got != "caf" {
+		t.Fatalf("subject = %q, want %q", got, "caf")
+	}
+}
+
+func TestComposerBackspaceRemovesPreviousRune(t *testing.T) {
+	c := NewComposer(&config.Theme{})
+	c.OpenNew(data.Address{})
+	c.SetFocus(2)
+	typeRunes(c, "café")
+
+	c.HandleKey(tea.KeyMsg{Type: tea.KeyBackspace})
+
+	if got := c.fields[2].Value; got != "caf" {
+		t.Fatalf("subject = %q, want %q", got, "caf")
+	}
+}
+
+func TestComposerIgnoresAltRuneCommands(t *testing.T) {
+	c := NewComposer(&config.Theme{})
+	c.OpenNew(data.Address{})
+	c.SetFocus(2)
+
+	c.HandleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}, Alt: true})
+
+	if got := c.fields[2].Value; got != "" {
+		t.Fatalf("subject = %q, want empty", got)
+	}
+}
+
 // Named special keys must not be inserted as literal text.
 func TestComposerIgnoresNamedKeys(t *testing.T) {
 	c := NewComposer(&config.Theme{})
 	c.OpenNew(data.Address{})
 	c.SetFocus(2)
 
-	c.HandleKey(tea.KeyMsg{Type: tea.KeyDelete})
 	c.HandleKey(tea.KeyMsg{Type: tea.KeyF1})
 
 	if got := c.fields[2].Value; got != "" {
