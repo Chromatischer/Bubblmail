@@ -1045,7 +1045,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// 1. Composer captures all keys when active
 	if a.comp.IsActive() {
-		a.comp.HandleKey(key)
+		a.comp.HandleKey(msg)
 		if r := a.comp.Result(); r != nil {
 			cmd := a.handleComposerResult(r)
 			a.comp.ClearResult()
@@ -1699,12 +1699,12 @@ func (a *App) handleLeftPress(x, y int) (tea.Model, tea.Cmd) {
 		if a.comp.IsActive() {
 			if a.comp.IsPrompting() {
 				if key := a.comp.HitTestDraftPrompt(x, contentY); key != "" {
-					a.comp.HandleKey(key)
+					a.comp.HandleKey(syntheticKeyMsg(key))
 				}
 			} else if field := a.comp.HitTestField(contentY); field >= 0 {
 				a.comp.SetFocus(field)
 			} else if key := a.comp.HitTestFooter(x, contentY); key != "" {
-				a.comp.HandleKey(key)
+				a.comp.HandleKey(syntheticKeyMsg(key))
 				if r := a.comp.Result(); r != nil {
 					cmd := a.handleComposerResult(r)
 					a.comp.ClearResult()
@@ -1825,6 +1825,8 @@ func syntheticKeyMsg(key string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyCtrlD}
 	case "ctrl+enter":
 		return tea.KeyMsg{Type: tea.KeyCtrlJ}
+	case "ctrl+s":
+		return tea.KeyMsg{Type: tea.KeyCtrlS}
 	}
 	if len([]rune(key)) == 1 {
 		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)}

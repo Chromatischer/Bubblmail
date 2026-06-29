@@ -175,10 +175,11 @@ func (c *Composer) SetSize(w, h int) {
 }
 
 // HandleKey processes a key press.
-func (c *Composer) HandleKey(key string) {
+func (c *Composer) HandleKey(msg tea.KeyMsg) {
 	if !c.active {
 		return
 	}
+	key := msg.String()
 
 	// Continue/Discard prompt intercepts all keys.
 	if c.prompting {
@@ -304,13 +305,29 @@ func (c *Composer) HandleKey(key string) {
 	case "end", "ctrl+e":
 		f.cursorEnd()
 	default:
-		if len(key) == 1 && key[0] >= 32 {
-			// Trigger file picker when @ is typed in the body field.
-			if key == "@" && c.focused == 3 {
-				c.filePicker.activate()
-				return
-			}
-			f.insert(key)
+		// Literal text input: single chars, multi-byte runes (ä, €, …), and
+		// bracketed pastes all arrive as KeyRunes/KeySpace. Use msg.Runes
+		// rather than the string form so multi-byte chars aren't dropped by a
+		// byte-length check and pastes aren't mangled by the "[...]" wrapper
+		// that KeyMsg.String() adds. Skip Alt combos — those are commands.
+		if (msg.Type != tea.KeyRunes && msg.Type != tea.KeySpace) || msg.Alt {
+			break
+		}
+		text := string(msg.Runes)
+		// Trigger file picker when @ is typed in the body field.
+		if text == "@" && c.focused == 3 {
+			c.filePicker.activate()
+			return
+		}
+		// Sanitise pasted control characters. Single-line fields can't hold
+		// newlines/tabs, so flatten them to spaces.
+		text = strings.ReplaceAll(text, "\r", "")
+		if f.Kind != FieldTextArea {
+			text = strings.ReplaceAll(text, "\n", " ")
+			text = strings.ReplaceAll(text, "\t", " ")
+		}
+		if text != "" {
+			f.insert(text)
 		}
 	}
 	c.ensureBodyVisible()
