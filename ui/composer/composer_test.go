@@ -1,6 +1,8 @@
 package composer
 
 import (
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/bubblmail/bubblmail/config"
@@ -121,5 +123,36 @@ func TestComposerIgnoresNamedKeys(t *testing.T) {
 
 	if got := c.fields[2].Value; got != "" {
 		t.Fatalf("subject = %q, want empty", got)
+	}
+}
+
+func TestComposerShowsAttachmentFailure(t *testing.T) {
+	c := NewComposer(&config.Theme{})
+	c.OpenNew(data.Address{})
+	c.SetSize(100, 30)
+
+	c.addAttachment(filepath.Join(t.TempDir(), "missing"), true)
+
+	if c.errMessage == "" {
+		t.Fatal("errMessage is empty, want attachment failure")
+	}
+	if !strings.Contains(c.View(), "Attachment failed:") {
+		t.Fatal("composer view does not show attachment failure")
+	}
+}
+
+func TestComposerClearsAttachmentFailureOnSuccess(t *testing.T) {
+	c := NewComposer(&config.Theme{})
+	c.OpenNew(data.Address{})
+	c.addAttachment(filepath.Join(t.TempDir(), "missing"), true)
+	if c.errMessage == "" {
+		t.Fatal("errMessage is empty after failed attach")
+	}
+
+	path := filepath.Join(t.TempDir(), "ok.txt")
+	c.addAttachment(path, false)
+
+	if c.errMessage != "" {
+		t.Fatalf("errMessage = %q, want empty after successful attach", c.errMessage)
 	}
 }

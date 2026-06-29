@@ -50,6 +50,7 @@ type Composer struct {
 	filePicker   *filePicker
 	anonymize    bool
 	attachCursor int // selected index in attachment list when focused==4
+	errMessage   string
 
 	// Draft persistence: stash when closing with content, prompt on reopen.
 	savedDraft *savedDraftState
@@ -79,6 +80,7 @@ func (c *Composer) openWith(from data.Address, fields []*Field, mode string, foc
 	c.attachments = nil
 	c.anonymize = false
 	c.attachCursor = 0
+	c.errMessage = ""
 
 	if c.savedDraft != nil {
 		// Stash the intended fresh fields so "Discard" can load them.
@@ -340,7 +342,8 @@ func (c *Composer) addAttachment(path string, isDir bool) {
 	if isDir {
 		zipPath, err := zipDir(path)
 		if err != nil {
-			return // silently ignore; could surface as status msg
+			c.errMessage = "Attachment failed: " + err.Error()
+			return
 		}
 		c.attachments = append(c.attachments, Attachment{
 			Path:        zipPath,
@@ -349,11 +352,13 @@ func (c *Composer) addAttachment(path string, isDir bool) {
 			Compressed:  true,
 			TempFile:    true,
 		})
+		c.errMessage = ""
 	} else {
 		c.attachments = append(c.attachments, Attachment{
 			Path:        path,
 			DisplayName: filepath.Base(path),
 		})
+		c.errMessage = ""
 	}
 }
 
@@ -367,6 +372,7 @@ func (c *Composer) removeAttachment(idx int) {
 		_ = os.Remove(a.Path)
 	}
 	c.attachments = append(c.attachments[:idx], c.attachments[idx+1:]...)
+	c.errMessage = ""
 	if c.attachCursor >= len(c.attachments) && c.attachCursor > 0 {
 		c.attachCursor--
 	}
@@ -958,6 +964,15 @@ func (c *Composer) View() string {
 
 	// ── Footer ───────────────────────────────────────────────────────────────
 	rows = append(rows, divider)
+
+	if c.errMessage != "" {
+		errLine := lipgloss.NewStyle().
+			Foreground(theme.Error).
+			Background(theme.Surface).
+			Width(innerW).
+			Render(icons.Error + " " + c.errMessage)
+		rows = append(rows, errLine)
+	}
 
 	hintIconSt := lipgloss.NewStyle().Foreground(theme.Accent).Background(theme.Surface)
 	hintDescSt := lipgloss.NewStyle().Foreground(theme.TextMuted).Background(theme.Surface)

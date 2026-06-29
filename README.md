@@ -24,6 +24,7 @@ A keyboard-driven terminal email client built for people who live in the shell. 
 - **Quick actions** — press `←`/`→` in the inbox to reveal action panels that slide in from the edges of the selected row; press again to expose a second action, press a third time to execute; `Enter` executes the highlighted action at any step
 - **Smart move** — the MOVE quick action uses OpenRouter embeddings and cosine similarity to suggest the best destination folder automatically
 - **Move to folder** — folder picker with QWERTY quick-select for fast filing
+- **Archive** — moves messages to the account's Archive folder, with undo when the server reports the new UID
 - **Star and mark read/unread** — local flag changes synced back to IMAP
 - **Delete** — moves to Trash on the server
 - **Collapsible sidebar** — account and folder tree with live unread counts
@@ -37,7 +38,6 @@ A keyboard-driven terminal email client built for people who live in the shell. 
 ## Planned Features
 
 - **Tag picker UI** — local labels with color support; backend already implemented, UI overlay pending
-- **Archive action** — `e` key is wired; server-side archive move not yet implemented
 - **HTML rendering improvements** — richer conversion of HTML email to terminal output
 
 ---

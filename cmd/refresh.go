@@ -34,7 +34,7 @@ var refreshCmd = &cobra.Command{
 		}
 
 		if countsOnly {
-			return refreshFolderCounts(cfg, store, account)
+			return refreshFolderCounts(cmd.Context(), cfg, store, account)
 		}
 
 		opts := listOptions{
@@ -42,9 +42,9 @@ var refreshCmd = &cobra.Command{
 			mailbox: mailbox,
 			limit:   limit,
 		}
-		if err := refreshMessages(cfg, store, opts); err != nil {
+		if err := refreshMessages(cmd.Context(), cfg, store, opts); err != nil {
 			return err
 		}
-		return refreshFolderCounts(cfg, store, account)
+		return refreshFolderCounts(cmd.Context(), cfg, store, account)
 	},
 }

@@ -54,8 +54,15 @@ var folderCreateCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		if err := cmd.Context().Err(); err != nil {
+			return err
+		}
 		client, err := imaplib.Connect(acct)
 		if err != nil {
+			return err
+		}
+		if err := cmd.Context().Err(); err != nil {
+			client.Close()
 			return err
 		}
 		if err := client.CreateFolderSync(name); err != nil {
@@ -63,6 +70,9 @@ var folderCreateCmd = &cobra.Command{
 			return err
 		}
 		if err := client.Close(); err != nil {
+			return err
+		}
+		if err := cmd.Context().Err(); err != nil {
 			return err
 		}
 		if err := store.UpsertFolders(account, []*data.Folder{folderFromPath(account, name)}); err != nil {
@@ -103,8 +113,15 @@ var folderMoveCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		if err := cmd.Context().Err(); err != nil {
+			return err
+		}
 		client, err := imaplib.Connect(acct)
 		if err != nil {
+			return err
+		}
+		if err := cmd.Context().Err(); err != nil {
+			client.Close()
 			return err
 		}
 		if err := client.RenameFolder(oldName, newName); err != nil {
@@ -112,6 +129,9 @@ var folderMoveCmd = &cobra.Command{
 			return err
 		}
 		if err := client.Close(); err != nil {
+			return err
+		}
+		if err := cmd.Context().Err(); err != nil {
 			return err
 		}
 		if err := store.RenameFolder(account, oldName, newName); err != nil {
@@ -148,8 +168,15 @@ var folderDeleteCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		if err := cmd.Context().Err(); err != nil {
+			return err
+		}
 		client, err := imaplib.Connect(acct)
 		if err != nil {
+			return err
+		}
+		if err := cmd.Context().Err(); err != nil {
+			client.Close()
 			return err
 		}
 		if err := client.DeleteFolder(name); err != nil {
@@ -157,6 +184,9 @@ var folderDeleteCmd = &cobra.Command{
 			return err
 		}
 		if err := client.Close(); err != nil {
+			return err
+		}
+		if err := cmd.Context().Err(); err != nil {
 			return err
 		}
 		if err := store.DeleteFolder(account, name); err != nil {

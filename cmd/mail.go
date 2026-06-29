@@ -60,6 +60,9 @@ var mailViewCmd = &cobra.Command{
 			return fmt.Errorf("reading cached body: %w", err)
 		}
 		if bodyText == "" && bodyHTML == "" {
+			if err := cmd.Context().Err(); err != nil {
+				return err
+			}
 			acct, err := selectAccount(cfg, account)
 			if err != nil {
 				return err
@@ -75,6 +78,9 @@ var mailViewCmd = &cobra.Command{
 			}
 			if closeErr != nil {
 				return closeErr
+			}
+			if err := cmd.Context().Err(); err != nil {
+				return err
 			}
 			if err := store.UpsertBody(msg.ID, bodyText, bodyHTML); err != nil {
 				return fmt.Errorf("caching body: %w", err)
@@ -116,8 +122,15 @@ var mailMoveCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		if err := cmd.Context().Err(); err != nil {
+			return err
+		}
 		client, err := imaplib.Connect(acct)
 		if err != nil {
+			return err
+		}
+		if err := cmd.Context().Err(); err != nil {
+			client.Close()
 			return err
 		}
 		destUID, err := client.MoveMessageSync(sourceFolder, uid, destFolder)
@@ -126,6 +139,9 @@ var mailMoveCmd = &cobra.Command{
 			return err
 		}
 		if err := client.Close(); err != nil {
+			return err
+		}
+		if err := cmd.Context().Err(); err != nil {
 			return err
 		}
 		if err := store.MoveMessage(account, sourceFolder, uid, destFolder, destUID); err != nil {
