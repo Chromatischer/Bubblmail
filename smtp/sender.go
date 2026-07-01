@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"mime"
 	"mime/multipart"
+	"mime/quotedprintable"
 	"net/smtp"
 	"net/textproto"
 	"os"
@@ -44,6 +45,9 @@ type SendResultMsg struct {
 // BuildRawMessage builds the raw RFC 2822 bytes for a composed message.
 // The returned bytes can be used both for SMTP DATA and for IMAP APPEND.
 func BuildRawMessage(draft *ComposedMessage) ([]byte, error) {
+	if draft == nil {
+		return nil, fmt.Errorf("draft is nil")
+	}
 	var buf bytes.Buffer
 	date := time.Now().Format(time.RFC1123Z)
 	buf.WriteString("Date: " + date + "\r\n")
@@ -59,7 +63,9 @@ func BuildRawMessage(draft *ComposedMessage) ([]byte, error) {
 		buf.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
 		buf.WriteString("Content-Transfer-Encoding: quoted-printable\r\n")
 		buf.WriteString("\r\n")
-		buf.WriteString(draft.Body)
+		if err := writeQuotedPrintable(&buf, draft.Body); err != nil {
+			return nil, fmt.Errorf("encoding text body: %w", err)
+		}
 	} else {
 		mw := multipart.NewWriter(&buf)
 		buf.WriteString("Content-Type: multipart/mixed; boundary=\"" + mw.Boundary() + "\"\r\n")
@@ -72,7 +78,9 @@ func BuildRawMessage(draft *ComposedMessage) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("creating text part: %w", err)
 		}
-		fmt.Fprint(pw, draft.Body)
+		if err := writeQuotedPrintable(pw, draft.Body); err != nil {
+			return nil, fmt.Errorf("encoding text part: %w", err)
+		}
 
 		for _, a := range draft.Attachments {
 			fileData, err := os.ReadFile(a.Path)
@@ -89,12 +97,26 @@ func BuildRawMessage(draft *ComposedMessage) ([]byte, error) {
 				return nil, fmt.Errorf("creating attachment part: %w", err)
 			}
 			enc := base64.NewEncoder(base64.StdEncoding, aw)
-			enc.Write(fileData)
-			enc.Close()
+			if _, err := enc.Write(fileData); err != nil {
+				return nil, fmt.Errorf("encoding attachment %s: %w", a.Filename, err)
+			}
+			if err := enc.Close(); err != nil {
+				return nil, fmt.Errorf("encoding attachment %s: %w", a.Filename, err)
+			}
 		}
-		mw.Close()
+		if err := mw.Close(); err != nil {
+			return nil, fmt.Errorf("closing multipart message: %w", err)
+		}
 	}
 	return buf.Bytes(), nil
+}
+
+func writeQuotedPrintable(w interface{ Write([]byte) (int, error) }, body string) error {
+	qp := quotedprintable.NewWriter(w)
+	if _, err := qp.Write([]byte(body)); err != nil {
+		return err
+	}
+	return qp.Close()
 }
 
 // SendMessage returns a tea.Cmd that sends the composed message via SMTP.

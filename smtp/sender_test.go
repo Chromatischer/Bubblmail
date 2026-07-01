@@ -1,6 +1,8 @@
 package smtp
 
 import (
+	"io"
+	"mime/quotedprintable"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,7 +17,7 @@ func TestBuildRawMessagePlainText(t *testing.T) {
 		To:      []data.Address{{Name: "Alice", Address: "alice@example.com"}},
 		CC:      []data.Address{{Address: "cc@example.com"}},
 		Subject: "Café update",
-		Body:    "hello\nworld",
+		Body:    "hello café\nworld",
 	})
 	if err != nil {
 		t.Fatalf("BuildRawMessage: %v", err)
@@ -28,11 +30,22 @@ func TestBuildRawMessagePlainText(t *testing.T) {
 		"Cc: cc@example.com\r\n",
 		"Subject: =?utf-8?q?Caf=C3=A9_update?=\r\n",
 		"Content-Type: text/plain; charset=utf-8\r\n",
-		"\r\nhello\nworld",
+		"Content-Transfer-Encoding: quoted-printable\r\n",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("raw message missing %q:\n%s", want, text)
 		}
+	}
+	_, body, ok := strings.Cut(text, "\r\n\r\n")
+	if !ok {
+		t.Fatal("raw message missing body")
+	}
+	decoded, err := io.ReadAll(quotedprintable.NewReader(strings.NewReader(body)))
+	if err != nil {
+		t.Fatalf("decode quoted-printable body: %v", err)
+	}
+	if string(decoded) != "hello café\r\nworld" {
+		t.Fatalf("decoded body = %q", decoded)
 	}
 }
 
@@ -58,12 +71,20 @@ func TestBuildRawMessageWithAttachment(t *testing.T) {
 	for _, want := range []string{
 		"Content-Type: multipart/mixed;",
 		"Content-Type: text/plain",
+		"Content-Transfer-Encoding: quoted-printable",
 		"Content-Disposition: attachment; filename=\"note.txt\"",
 		"YXR0YWNoZWQgdGV4dA==",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("raw message missing %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestBuildRawMessageNilDraft(t *testing.T) {
+	_, err := BuildRawMessage(nil)
+	if err == nil {
+		t.Fatal("BuildRawMessage(nil) error = nil")
 	}
 }
 

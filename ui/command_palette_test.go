@@ -2,6 +2,7 @@ package ui
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -32,20 +33,28 @@ func TestPaletteKeysAreDispatchable(t *testing.T) {
 // dispatchGlobalKeyBody returns the source text of the dispatchGlobalKey method.
 func dispatchGlobalKeyBody(t *testing.T) string {
 	t.Helper()
-	src, err := os.ReadFile("app.go")
+	files, err := filepath.Glob("app*.go")
 	if err != nil {
-		t.Fatalf("reading app.go: %v", err)
+		t.Fatalf("listing app files: %v", err)
 	}
-	s := string(src)
-	start := strings.Index(s, "func (a *App) dispatchGlobalKey(")
-	if start < 0 {
-		t.Fatal("could not find dispatchGlobalKey in app.go")
+	for _, file := range files {
+		src, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("reading %s: %v", file, err)
+		}
+		s := string(src)
+		start := strings.Index(s, "func (a *App) dispatchGlobalKey(")
+		if start < 0 {
+			continue
+		}
+		next := strings.Index(s[start+1:], "\nfunc ")
+		if next < 0 {
+			return s[start:]
+		}
+		return s[start : start+1+next]
 	}
-	next := strings.Index(s[start+1:], "\nfunc ")
-	if next < 0 {
-		return s[start:]
-	}
-	return s[start : start+1+next]
+	t.Fatal("could not find dispatchGlobalKey in app*.go")
+	return ""
 }
 
 func TestPaletteFilterAndSelect(t *testing.T) {
