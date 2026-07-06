@@ -578,15 +578,43 @@ func knownAttachmentFilename(ct string) string {
 	return ""
 }
 
-// fallbackFilename returns a generic filename for a content type using the MIME
-// extension registry, used when Content-Disposition: attachment has no filename.
+// commonAttachmentExts maps frequently seen media types to a file extension so
+// fallbackFilename is deterministic regardless of the host's MIME registry. The
+// system registry (mime.ExtensionsByType) is only populated from files like
+// /etc/mime.types, which are absent on minimal containers and CI runners — there
+// it returns nothing and attachments would otherwise lose their extension. These
+// built-ins cover the types we actually see; anything else falls back to the
+// registry, then to a bare name.
+var commonAttachmentExts = map[string]string{
+	"application/octet-stream": ".bin",
+	"application/pdf":          ".pdf",
+	"application/zip":          ".zip",
+	"application/gzip":         ".gz",
+	"application/json":         ".json",
+	"application/msword":       ".doc",
+	"image/jpeg":               ".jpg",
+	"image/png":                ".png",
+	"image/gif":                ".gif",
+	"image/webp":               ".webp",
+	"text/plain":               ".txt",
+	"text/html":                ".html",
+	"text/csv":                 ".csv",
+}
+
+// fallbackFilename returns a generic filename for a content type, used when
+// Content-Disposition: attachment has no filename. It prefers a built-in table
+// so behaviour is identical across machines, then consults the system MIME
+// registry for less common types.
 func fallbackFilename(ct string) string {
 	mediaType := ct
 	if i := strings.IndexByte(ct, ';'); i >= 0 {
 		mediaType = strings.TrimSpace(ct[:i])
 	}
-	exts, err := mime.ExtensionsByType(mediaType)
-	if err == nil && len(exts) > 0 {
+	mediaType = strings.ToLower(mediaType)
+	if ext, ok := commonAttachmentExts[mediaType]; ok {
+		return "attachment" + ext
+	}
+	if exts, err := mime.ExtensionsByType(mediaType); err == nil && len(exts) > 0 {
 		return "attachment" + exts[0]
 	}
 	return "attachment"
