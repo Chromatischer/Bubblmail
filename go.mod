@@ -11,6 +11,7 @@ require (
 	github.com/emersion/go-message v0.18.2
 	github.com/mark3labs/mcp-go v0.54.1
 	github.com/mattn/go-sqlite3 v1.14.24
+	github.com/muesli/termenv v0.15.2
 	github.com/spf13/cobra v1.8.1
 	golang.org/x/net v0.51.0
 	golang.org/x/term v0.40.0
@@ -30,7 +31,6 @@ require (
 	github.com/mattn/go-runewidth v0.0.16 // indirect
 	github.com/muesli/ansi v0.0.0-20230316100256-276c6243b2f6 // indirect
 	github.com/muesli/cancelreader v0.2.2 // indirect
-	github.com/muesli/termenv v0.15.2 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2 // indirect
 	github.com/spf13/cast v1.7.1 // indirect

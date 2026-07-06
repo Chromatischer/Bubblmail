@@ -8,6 +8,7 @@ import (
 
 func init() {
 	rootCmd.AddCommand(mcpCmd)
+	mcpCmd.Flags().Bool("read-only", false, "Expose only read tools; disable mutating tools (move/mark read/star/tag)")
 }
 
 var mcpCmd = &cobra.Command{
@@ -18,7 +19,8 @@ var mcpCmd = &cobra.Command{
 The server communicates over stdio using JSON-RPC, so it is meant to be
 launched by an MCP client (e.g. Claude Desktop or Claude Code) rather than
 run interactively. Read tools are served from the local cache; write tools
-(move, mark read, star, tag) connect to IMAP on demand.
+(move, mark read, star, tag) connect to IMAP on demand. Pass --read-only to
+expose the read tools only.
 
 Example client config entry:
 
@@ -28,11 +30,12 @@ Example client config entry:
     }
   }`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		readOnly, _ := cmd.Flags().GetBool("read-only")
 		cfg, store, err := loadConfigAndStore()
 		if err != nil {
 			return err
 		}
 		defer store.Close()
-		return mcpserver.Serve(cfg, store)
+		return mcpserver.Serve(cfg, store, readOnly)
 	},
 }

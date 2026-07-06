@@ -28,37 +28,46 @@ const (
 
 // Server wires the mailbox cache and account config into MCP tool handlers.
 type Server struct {
-	cfg   *config.Config
-	store *cache.Store
+	cfg      *config.Config
+	store    *cache.Store
+	readOnly bool
 }
 
 // New creates a Server backed by the given config and cache store. The store is
-// owned by the caller and must outlive the server.
-func New(cfg *config.Config, store *cache.Store) *Server {
-	return &Server{cfg: cfg, store: store}
+// owned by the caller and must outlive the server. When readOnly is true the
+// mutating tools are not registered, so the server can only read the mailbox.
+func New(cfg *config.Config, store *cache.Store, readOnly bool) *Server {
+	return &Server{cfg: cfg, store: store, readOnly: readOnly}
 }
 
-// Serve builds the MCP server and serves it over stdio until stdin closes.
-func Serve(cfg *config.Config, store *cache.Store) error {
-	return server.ServeStdio(New(cfg, store).MCPServer())
+// Serve builds the MCP server and serves it over stdio until stdin closes. Pass
+// readOnly to expose the read tools only.
+func Serve(cfg *config.Config, store *cache.Store, readOnly bool) error {
+	return server.ServeStdio(New(cfg, store, readOnly).MCPServer())
 }
 
-// MCPServer constructs the MCP server with all tools registered.
+// MCPServer constructs the MCP server with all tools registered. In read-only
+// mode the mutating tools are omitted.
 func (s *Server) MCPServer() *server.MCPServer {
+	instructions := "Bubblmail mailbox access. Read tools serve from a local cache and are " +
+		"safe to call freely. Write tools (move_message, move_messages, " +
+		"set_read, set_starred, add_tag, remove_tag) change the real mailbox over IMAP; confirm intent " +
+		"with the user before calling them."
+	if s.readOnly {
+		instructions = "Bubblmail mailbox access, read-only. All tools serve from a local " +
+			"cache and are safe to call freely; no tool can change the mailbox."
+	}
 	srv := server.NewMCPServer(
 		serverName, serverVersion,
 		server.WithToolCapabilities(false),
 		server.WithRecovery(),
-		server.WithInstructions(
-			"Bubblmail mailbox access. Read tools serve from a local cache and are "+
-				"safe to call freely. Write tools (move_message, move_messages, "+
-				"set_read, set_starred, add_tag, remove_tag) change the real mailbox over IMAP; confirm intent "+
-				"with the user before calling them.",
-		),
+		server.WithInstructions(instructions),
 	)
 
 	s.registerReadTools(srv)
-	s.registerWriteTools(srv)
+	if !s.readOnly {
+		s.registerWriteTools(srv)
+	}
 	return srv
 }
 
