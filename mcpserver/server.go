@@ -51,8 +51,8 @@ func (s *Server) MCPServer() *server.MCPServer {
 		server.WithRecovery(),
 		server.WithInstructions(
 			"Bubblmail mailbox access. Read tools serve from a local cache and are "+
-				"safe to call freely. Write tools (move_message, set_read, set_starred, "+
-				"add_tag, remove_tag) change the real mailbox over IMAP; confirm intent "+
+				"safe to call freely. Write tools (move_message, move_messages, "+
+				"set_read, set_starred, add_tag, remove_tag) change the real mailbox over IMAP; confirm intent "+
 				"with the user before calling them.",
 		),
 	)
@@ -127,6 +127,14 @@ func (s *Server) registerWriteTools(srv *server.MCPServer) {
 		mcp.WithNumber("uid", mcp.Required(), mcp.Description("Message UID.")),
 		mcp.WithString("dest_folder", mcp.Required(), mcp.Description("Destination folder.")),
 	), s.handleMoveMessage)
+
+	srv.AddTool(mcp.NewTool("move_messages",
+		mcp.WithDescription("Move multiple messages to another folder over one IMAP connection and update the cache."),
+		mcp.WithString("account", mcp.Required(), mcp.Description("Account name.")),
+		mcp.WithString("source_folder", mcp.Required(), mcp.Description("Current folder of the messages.")),
+		mcp.WithArray("uids", mcp.Required(), mcp.MinItems(1), mcp.WithIntegerItems(mcp.Min(1)), mcp.Description("Message UIDs.")),
+		mcp.WithString("dest_folder", mcp.Required(), mcp.Description("Destination folder.")),
+	), s.handleMoveMessages)
 
 	srv.AddTool(mcp.NewTool("set_read",
 		mcp.WithDescription("Mark a message read or unread over IMAP and update the cache."),

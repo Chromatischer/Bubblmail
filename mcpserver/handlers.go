@@ -352,6 +352,66 @@ func (s *Server) handleMoveMessage(_ context.Context, req mcp.CallToolRequest) (
 	return mcp.NewToolResultText(fmt.Sprintf("Moved %s/%d to %s (new uid %d).", source, uid, dest, destUID)), nil
 }
 
+func (s *Server) handleMoveMessages(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	account, err := req.RequireString("account")
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("account", err), nil
+	}
+	source, err := req.RequireString("source_folder")
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("source_folder", err), nil
+	}
+	dest, err := req.RequireString("dest_folder")
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("dest_folder", err), nil
+	}
+	uids, errRes := uidsArg(req)
+	if errRes != nil {
+		return errRes, nil
+	}
+
+	client, err := s.connect(account)
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("connecting", err), nil
+	}
+
+	succeeded := 0
+	failedUIDs := make([]uint32, 0)
+	newUIDs := make([]string, 0, len(uids))
+	var firstErr error
+	for _, uid := range uids {
+		destUID, err := client.MoveMessageSync(source, uid, dest)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("uid %d: %w", uid, err)
+			}
+			failedUIDs = append(failedUIDs, uid)
+			continue
+		}
+		if err := s.store.MoveMessage(account, source, uid, dest, destUID); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("uid %d: updating cache: %w", uid, err)
+			}
+			failedUIDs = append(failedUIDs, uid)
+			continue
+		}
+		succeeded++
+		newUIDs = append(newUIDs, fmt.Sprintf("%d->%d", uid, destUID))
+	}
+	closeErr := client.Close()
+	if firstErr == nil && closeErr != nil {
+		return mcp.NewToolResultErrorFromErr("closing connection", closeErr), nil
+	}
+
+	if len(failedUIDs) > 0 {
+		return mcp.NewToolResultText(fmt.Sprintf(
+			"Moved %d message(s) from %s to %s. (%d failed; failed uids: %s; first error: %v)",
+			succeeded, source, dest, len(failedUIDs), formatUIDs(failedUIDs), firstErr,
+		)), nil
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("Moved %d message(s) from %s to %s (new uids: %s).", succeeded, source, dest, strings.Join(newUIDs, ", "))), nil
+}
+
 func (s *Server) handleSetRead(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	account, folder, uid, errRes := s.messageTarget(req)
 	if errRes != nil {
@@ -490,4 +550,30 @@ func uidArg(req mcp.CallToolRequest) (uint32, *mcp.CallToolResult) {
 		return 0, mcp.NewToolResultError("uid must be a positive integer")
 	}
 	return uint32(n), nil
+}
+
+func uidsArg(req mcp.CallToolRequest) ([]uint32, *mcp.CallToolResult) {
+	nums, err := req.RequireIntSlice("uids")
+	if err != nil {
+		return nil, mcp.NewToolResultErrorFromErr("uids", err)
+	}
+	if len(nums) == 0 {
+		return nil, mcp.NewToolResultError("uids must contain at least one UID")
+	}
+	uids := make([]uint32, 0, len(nums))
+	for _, n := range nums {
+		if n <= 0 {
+			return nil, mcp.NewToolResultError("uids must contain only positive integers")
+		}
+		uids = append(uids, uint32(n))
+	}
+	return uids, nil
+}
+
+func formatUIDs(uids []uint32) string {
+	parts := make([]string, 0, len(uids))
+	for _, uid := range uids {
+		parts = append(parts, fmt.Sprint(uid))
+	}
+	return strings.Join(parts, ", ")
 }

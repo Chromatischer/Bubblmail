@@ -468,8 +468,11 @@ func (s *Store) GetMessagesFiltered(account, folder string, unreadOnly bool, lim
 		query.WriteString(" AND flags NOT LIKE ?")
 		args = append(args, "%\\Seen%")
 	}
-	query.WriteString(" ORDER BY date DESC LIMIT ?")
-	args = append(args, limit)
+	query.WriteString(" ORDER BY date DESC")
+	if limit > 0 {
+		query.WriteString(" LIMIT ?")
+		args = append(args, limit)
+	}
 
 	rows, err := s.db.Query(query.String(), args...)
 	if err != nil {

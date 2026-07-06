@@ -174,6 +174,13 @@ func (c *Client) MoveMessageSync(sourceFolder string, uid uint32, destFolder str
 	return c.moveToTrash(sourceFolder, uid, destFolder)
 }
 
+// SetFlagSync sets or clears an IMAP flag and waits for completion.
+func (c *Client) SetFlagSync(folder string, uid uint32, flag data.Flag, set bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.setFlag(folder, uid, flag, set)
+}
+
 // MoveToTrash returns a tea.Cmd that moves a message to the trash folder.
 // trashFolder is the full IMAP name of the destination (e.g. "Trash").
 func (c *Client) MoveToTrash(sourceFolder string, uid uint32, trashFolder string) tea.Cmd {

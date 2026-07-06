@@ -360,6 +360,24 @@ func TestGetMessagesFilteredUnreadOnlyAndSetFlags(t *testing.T) {
 	}
 }
 
+func TestGetMessagesFilteredLimitZeroMeansUnlimited(t *testing.T) {
+	store := openTestStore(t)
+	now := time.Unix(1_700_000_000, 0)
+	msg1 := testMessage("work", "INBOX", 1, "First", "", now)
+	msg2 := testMessage("work", "INBOX", 2, "Second", "", now.Add(time.Minute))
+	if err := store.UpsertMessages([]*data.Message{msg1, msg2}); err != nil {
+		t.Fatalf("UpsertMessages: %v", err)
+	}
+
+	msgs, err := store.GetMessagesFiltered("work", "INBOX", false, 0)
+	if err != nil {
+		t.Fatalf("GetMessagesFiltered unlimited: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("GetMessagesFiltered unlimited returned %d messages, want 2", len(msgs))
+	}
+}
+
 func TestListBodiesForEmbeddingAndPrefetchCandidates(t *testing.T) {
 	store := openTestStore(t)
 	now := time.Unix(1_700_000_000, 0)

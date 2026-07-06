@@ -55,6 +55,20 @@ func TestParseUID(t *testing.T) {
 	}
 }
 
+func TestWithFlag(t *testing.T) {
+	flags := []data.Flag{data.FlagFlagged, data.FlagSeen}
+
+	cleared := withFlag(flags, data.FlagSeen, false)
+	if len(cleared) != 1 || cleared[0] != data.FlagFlagged {
+		t.Fatalf("withFlag(clear seen) = %+v, want only flagged", cleared)
+	}
+
+	set := withFlag(flags, data.FlagSeen, true)
+	if len(set) != 2 || set[0] != data.FlagFlagged || set[1] != data.FlagSeen {
+		t.Fatalf("withFlag(set seen) = %+v, want flagged then seen", set)
+	}
+}
+
 func TestFormatMessageViewUsesCachedPlainBody(t *testing.T) {
 	msg := &data.Message{
 		UID:         42,
