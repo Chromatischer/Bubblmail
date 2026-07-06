@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"os"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/bubblmail/bubblmail/cache"
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/ui"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func runTUI() error {

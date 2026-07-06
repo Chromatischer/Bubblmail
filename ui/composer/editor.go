@@ -50,6 +50,20 @@ func (f *Field) backspace() {
 	f.cursor--
 }
 
+// deleteForward deletes the character at cursor.
+func (f *Field) deleteForward() {
+	runes := []rune(f.Value)
+	if f.cursor < 0 {
+		f.cursor = 0
+	}
+	if f.cursor >= len(runes) {
+		f.cursor = len(runes)
+		return
+	}
+	newRunes := append(runes[:f.cursor], runes[f.cursor+1:]...)
+	f.Value = string(newRunes)
+}
+
 func (f *Field) cursorByteIndex() int {
 	if f.cursor <= 0 {
 		return 0

@@ -25,6 +25,14 @@ type StatusBar struct {
 	embedding embeddingStats
 	moveHint  string // suggested destination folder for quick-move
 	hitZones  []StatusHitZone
+	msgSeq    int // bumps on every SetMessage; used to expire stale flashes
+	selCount  int // active inbox multi-selection size (0 = none)
+
+	// Reader sub-state, used to build context-aware hints for the reader view.
+	readerHasAttach    bool
+	readerAttachActive bool
+	readerHasEvent     bool
+	readerThreadNav    bool // thread mode with >1 message: per-message jump available
 }
 
 var spinnerFrames = []string{
@@ -46,11 +54,23 @@ func (sb *StatusBar) SetWidth(w int) {
 	sb.width = w
 }
 
-// SetMessage sets a temporary flash message.
+// SetMessage sets a temporary flash message. Each call bumps msgSeq so a stale
+// auto-clear timer can tell whether it still owns the visible message.
 func (sb *StatusBar) SetMessage(msg, kind string) {
 	sb.message = msg
 	sb.msgKind = kind
+	sb.msgSeq++
 }
+
+// MessageSeq returns the current flash generation.
+func (sb *StatusBar) MessageSeq() int { return sb.msgSeq }
+
+// HasMessage reports whether a flash message is currently shown.
+func (sb *StatusBar) HasMessage() bool { return sb.message != "" }
+
+// SetSelectionCount records the active inbox multi-selection size so it can be
+// surfaced in the hints row. Pass 0 to clear.
+func (sb *StatusBar) SetSelectionCount(n int) { sb.selCount = n }
 
 // ClearMessage clears the flash message.
 func (sb *StatusBar) ClearMessage() {
@@ -77,6 +97,15 @@ func (sb *StatusBar) SetMoveHint(hint string) {
 
 // MoveHint returns the current move hint value.
 func (sb *StatusBar) MoveHint() string { return sb.moveHint }
+
+// SetReaderState updates reader-specific flags so the "reader" context can show
+// hints that match what the user can actually do right now.
+func (sb *StatusBar) SetReaderState(hasAttach, attachActive, hasEvent, threadNav bool) {
+	sb.readerHasAttach = hasAttach
+	sb.readerAttachActive = attachActive
+	sb.readerHasEvent = hasEvent
+	sb.readerThreadNav = threadNav
+}
 
 // HitTest returns the action key for the hint clicked at (x, y), where y is
 // relative to the top of the status bar (0 = divider, 1 = hints row).
@@ -156,17 +185,42 @@ func (sb *StatusBar) View(context string) string {
 			{icons.Close, "esc", "cancel"},
 		}
 	case "reader":
-		hints = []hint{
-			{icons.ArrowUpDown, "j/k", "scroll"},
-			{icons.ArrowLeftRight, "←/→", "event action"},
-			{icons.FloppyDisk, "enter", "copy event"},
-			{icons.Reply, "r", "reply"},
-			{icons.ReplyAll, "R", "reply all"},
-			{icons.Forward, "f", "forward"},
-			{icons.Star, "s", "star"},
-			{icons.Trash, "d", "delete"},
-			{icons.ArrowLeft, "esc/q/h", "back"},
-			{icons.Help, "?", "help"},
+		if sb.readerAttachActive {
+			// Inside the attachment section: show how to drive it.
+			hints = []hint{
+				{icons.Attachment, "tab", "cycle"},
+				{icons.ArrowLeftRight, "←/→", "action"},
+				{icons.Check, "enter", "run"},
+				{icons.ArrowLeft, "esc", "back"},
+				{icons.Help, "?", "help"},
+			}
+		} else {
+			hints = []hint{{icons.ArrowUpDown, "j/k", "scroll"}}
+			// Per-message jump only when reading a multi-message thread.
+			if sb.readerThreadNav {
+				hints = append(hints, hint{icons.ChevronDown, "[/]", "prev/next msg"})
+			}
+			// Event hints only when the mail actually has a suggested event.
+			if sb.readerHasEvent {
+				hints = append(hints,
+					hint{icons.ArrowLeftRight, "←/→", "event action"},
+					hint{icons.FloppyDisk, "enter", "copy event"},
+				)
+			}
+			hints = append(hints,
+				hint{icons.Reply, "r", "reply"},
+				hint{icons.Forward, "f", "forward"},
+				hint{icons.FolderOpen, "v", "move"},
+				hint{icons.Trash, "d", "delete"},
+			)
+			// Attachment entry only when the mail has attachments.
+			if sb.readerHasAttach {
+				hints = append(hints, hint{icons.Attachment, "a", "attachments"})
+			}
+			hints = append(hints,
+				hint{icons.ArrowLeft, "esc/q/h", "back"},
+				hint{icons.Help, "?", "help"},
+			)
 		}
 	case "search":
 		hints = []hint{
@@ -187,6 +241,13 @@ func (sb *StatusBar) View(context string) string {
 			{"", "type", "folder name"},
 			{icons.Check, "enter", "create"},
 			{icons.Close, "esc", "cancel"},
+		}
+	case "palette":
+		hints = []hint{
+			{icons.Search, "type", "filter"},
+			{icons.ArrowUpDown, "↑/↓", "navigate"},
+			{icons.Check, "enter", "run"},
+			{icons.Close, "esc", "close"},
 		}
 	case "quick":
 		applyDesc := "apply"
@@ -270,8 +331,14 @@ func (sb *StatusBar) View(context string) string {
 	}
 	sb.hitZones = newHitZones
 
-	// Inline right side: loading + embedding stats (short, predictable width).
+	// Inline right side: selection count + loading + embedding stats.
 	var inlineParts []string
+	if sb.selCount > 1 {
+		inlineParts = append(inlineParts, lipgloss.NewStyle().
+			Foreground(theme.Accent).
+			Bold(true).
+			Render(fmt.Sprintf("%s %d selected", icons.Check, sb.selCount)))
+	}
 	if sb.loading {
 		inlineParts = append(inlineParts, lipgloss.NewStyle().
 			Foreground(theme.TextMuted).

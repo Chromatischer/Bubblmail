@@ -36,6 +36,9 @@ type Sidebar struct {
 	focused       bool
 	cursorAccount string
 	cursorFolder  string
+
+	// Fold state: key is account+"\x00"+folderName
+	collapsed map[string]bool
 }
 
 // NewSidebar creates a new sidebar.
@@ -142,6 +145,42 @@ func (sb *Sidebar) GoToBottom() {
 	}
 }
 
+// Toggle flips the collapsed/expanded state of the folder under the cursor.
+// It is a no-op for leaf folders (those with no children).
+func (sb *Sidebar) Toggle(account, folder string) {
+	folders := sb.folders[account]
+	hasKids := false
+	for i, f := range folders {
+		if f.Name == folder {
+			hasKids = i+1 < len(folders) && folders[i+1].Depth > f.Depth
+			break
+		}
+	}
+	if !hasKids {
+		return
+	}
+	if sb.collapsed == nil {
+		sb.collapsed = make(map[string]bool)
+	}
+	key := account + "\x00" + folder
+	sb.collapsed[key] = !sb.collapsed[key]
+}
+
+// isFolderHidden reports whether f should be skipped because an ancestor is collapsed.
+func (sb *Sidebar) isFolderHidden(account string, f *data.Folder) bool {
+	if f.Depth == 0 || f.Delimiter == "" || sb.collapsed == nil {
+		return false
+	}
+	parts := strings.Split(f.Name, f.Delimiter)
+	for d := 0; d < len(parts)-1; d++ {
+		ancestor := strings.Join(parts[:d+1], f.Delimiter)
+		if sb.collapsed[account+"\x00"+ancestor] {
+			return true
+		}
+	}
+	return false
+}
+
 // Selected returns the account and folder currently under the cursor.
 func (sb *Sidebar) Selected() (account, folder string, ok bool) {
 	if sb.cursorFolder == "" {
@@ -198,10 +237,22 @@ func (sb *Sidebar) View() string {
 		lines = append(lines, acctLine)
 		row++
 
-		folders := sb.folders[acct.Name]
-		for fi, f := range folders {
+		allFolders := sb.folders[acct.Name]
+		// Compute effective unread counts (own + all descendants) so parent
+		// folders reflect their subtree totals even when children are collapsed.
+		effCounts := effectiveCounts(allFolders)
+
+		// Build a visible subset (skip children of collapsed parents).
+		visibleFolders := make([]*data.Folder, 0, len(allFolders))
+		for _, f := range allFolders {
+			if !sb.isFolderHidden(acct.Name, f) {
+				visibleFolders = append(visibleFolders, f)
+			}
+		}
+		for fi, f := range visibleFolders {
 			isActive := acct.Name == sb.activeAccount && f.Name == sb.activeFolder
 			isCursor := sb.focused && acct.Name == sb.cursorAccount && f.Name == sb.cursorFolder
+			isCollapsed := sb.collapsed != nil && sb.collapsed[acct.Name+"\x00"+f.Name]
 
 			var folderStyle lipgloss.Style
 			var padStyle lipgloss.Style
@@ -230,8 +281,10 @@ func (sb *Sidebar) View() string {
 				name = icon + " " + name
 			}
 
-			// Tree-line prefix (always shown) + leading space
-			treePfx := " " + sidebarTreePrefix(folders, fi)
+			// Tree-line prefix (always shown) + leading space.
+			// Pass isCollapsed so the branch bar becomes ▶ when folded.
+			treePfx := " " + sidebarTreePrefix(visibleFolders, fi, isCollapsed)
+			treePfxW := len([]rune(treePfx)) // ASCII-safe
 			treeStyle := lipgloss.NewStyle().Foreground(theme.Border)
 			if isActive {
 				treeStyle = treeStyle.Background(theme.Accent)
@@ -240,26 +293,35 @@ func (sb *Sidebar) View() string {
 			}
 			indent := treeStyle.Render(treePfx)
 
+			// innerW mirrors smart-folder layout: sb.width minus the 1-col left
+			// padding and 1-col right padding from the sidebar lipgloss style.
+			innerW := sb.width - 2
+			nameW := innerW - treePfxW
+
+			unread := effCounts[f.Name]
 			var line string
-			if f.Unread > 0 {
+			if unread > 0 {
 				var countStyle lipgloss.Style
 				if isActive {
 					countStyle = lipgloss.NewStyle().Foreground(theme.Background).Background(theme.Accent).Bold(true)
+				} else if isCursor {
+					countStyle = lipgloss.NewStyle().Foreground(theme.Unread).Background(theme.Surface).Bold(true)
 				} else {
 					countStyle = lipgloss.NewStyle().Foreground(theme.Unread).Bold(true)
 				}
-				badge := fmt.Sprintf("●%d", f.Unread)
+				badge := fmt.Sprintf("●%d", unread)
 				badgeStr := countStyle.Render(badge)
-				// available width: total − treePrefix(plain) − 2 padding − badge
-				treePfxW := len([]rune(treePfx)) // safe since treePfx is ASCII
-				available := sb.width - treePfxW - 2 - len([]rune(badge))
-				if available < 0 {
-					available = 0
+				// Width(cellW) pads the name so the badge lands at the right edge.
+				cellW := nameW - len([]rune(badge))
+				if cellW < 0 {
+					cellW = 0
 				}
-				nameTrunc := truncateFolderName(name, available)
-				line = indent + folderStyle.Render(nameTrunc) + badgeStr
+				nameTrunc := truncateFolderName(name, cellW)
+				nameCell := folderStyle.Width(cellW).Render(nameTrunc)
+				line = indent + nameCell + badgeStr
 			} else {
-				line = indent + folderStyle.Render(name)
+				nameTrunc := truncateFolderName(name, nameW)
+				line = indent + folderStyle.Width(nameW).Render(nameTrunc)
 			}
 
 			// Pad to full width
@@ -345,6 +407,8 @@ func (sb *Sidebar) View() string {
 				var countStyle lipgloss.Style
 				if isActive {
 					countStyle = lipgloss.NewStyle().Foreground(theme.Background).Background(theme.Accent).Bold(true)
+				} else if isCursor {
+					countStyle = lipgloss.NewStyle().Foreground(theme.Unread).Background(theme.Surface).Bold(true)
 				} else {
 					countStyle = lipgloss.NewStyle().Foreground(theme.Unread).Bold(true)
 				}
@@ -426,8 +490,9 @@ func (sb *Sidebar) View() string {
 }
 
 // sidebarTreePrefix returns the tree-drawing prefix (e.g. "│  ├─ ") for
-// folder at index idx in the folder slice. Each depth level occupies 3 columns.
-func sidebarTreePrefix(folders []*data.Folder, idx int) string {
+// folder at index idx in the visible folder slice. Each depth level occupies 3 columns.
+// collapsed replaces the horizontal bar with ▶ to signal a folded subtree.
+func sidebarTreePrefix(folders []*data.Folder, idx int, collapsed bool) string {
 	d := folders[idx].Depth
 	var b strings.Builder
 	// Ancestor vertical lines: │  or spaces
@@ -445,7 +510,7 @@ func sidebarTreePrefix(folders []*data.Folder, idx int) string {
 			b.WriteString("   ")
 		}
 	}
-	// Branch connector for current node
+	// Branch connector for current node; ▶ signals a collapsed subtree.
 	isLast := true
 	for j := idx + 1; j < len(folders); j++ {
 		if folders[j].Depth < d {
@@ -456,10 +521,14 @@ func sidebarTreePrefix(folders []*data.Folder, idx int) string {
 			break
 		}
 	}
+	bar := "─"
+	if collapsed {
+		bar = "▶"
+	}
 	if isLast {
-		b.WriteString("└─ ")
+		b.WriteString("└" + bar + " ")
 	} else {
-		b.WriteString("├─ ")
+		b.WriteString("├" + bar + " ")
 	}
 	return b.String()
 }
@@ -528,4 +597,64 @@ func titleCase(s string) string {
 	}
 	lower := strings.ToLower(s)
 	return strings.ToUpper(lower[:1]) + lower[1:]
+}
+
+// effectiveCounts returns a map of folder name → unread count where each
+// folder's count includes its own messages plus all descendants. The input
+// slice is assumed to be in tree order (parents before children), which is the
+// typical IMAP LIST response ordering.
+func effectiveCounts(folders []*data.Folder) map[string]int {
+	counts := make(map[string]int, len(folders))
+	for _, f := range folders {
+		counts[f.Name] = f.Unread
+	}
+	// Walk backwards so children are always processed before their parents,
+	// enabling a single-pass accumulation regardless of subtree depth.
+	for i := len(folders) - 1; i >= 0; i-- {
+		f := folders[i]
+		if f.Depth == 0 || f.Delimiter == "" {
+			continue
+		}
+		lastDelim := strings.LastIndex(f.Name, f.Delimiter)
+		if lastDelim < 0 {
+			continue
+		}
+		parentName := f.Name[:lastDelim]
+		counts[parentName] += counts[f.Name]
+	}
+	return counts
+}
+
+// CollapsedKeys returns the set of "account\x00folder" keys that are currently
+// collapsed. Used to persist sidebar state across sessions.
+func (sb *Sidebar) CollapsedKeys() []string {
+	keys := make([]string, 0, len(sb.collapsed))
+	for k, v := range sb.collapsed {
+		if v {
+			keys = append(keys, k)
+		}
+	}
+	return keys
+}
+
+// CollapsedFolders returns the set of folder names currently collapsed for the
+// given account. Used to mirror the sidebar's fold state in the folder picker.
+func (sb *Sidebar) CollapsedFolders(account string) map[string]bool {
+	out := make(map[string]bool)
+	prefix := account + "\x00"
+	for k, v := range sb.collapsed {
+		if v && strings.HasPrefix(k, prefix) {
+			out[strings.TrimPrefix(k, prefix)] = true
+		}
+	}
+	return out
+}
+
+// SetCollapsed initialises the collapsed map from a previously persisted key
+// list (as returned by CollapsedKeys).
+func (sb *Sidebar) SetCollapsed(keys []string) {
+	sb.collapsed = make(map[string]bool, len(keys))
+	for _, k := range keys {
+		sb.collapsed[k] = true
+	}
 }

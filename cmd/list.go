@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -145,7 +146,7 @@ var listCountsCmd = &cobra.Command{
 		refresh, _ := cmd.Flags().GetBool("refresh")
 		account, _ := cmd.Flags().GetString("account")
 		if refresh {
-			if err := refreshFolderCounts(cfg, store, account); err != nil {
+			if err := refreshFolderCounts(cmd.Context(), cfg, store, account); err != nil {
 				return err
 			}
 		}
@@ -215,7 +216,7 @@ func runList(cmd *cobra.Command, opts listOptions, query func(*cache.Store) ([]*
 	defer store.Close()
 
 	if opts.refresh {
-		if err := refreshMessages(cfg, store, opts); err != nil {
+		if err := refreshMessages(cmd.Context(), cfg, store, opts); err != nil {
 			return err
 		}
 	}
@@ -267,18 +268,25 @@ func loadConfigAndStore() (*config.Config, *cache.Store, error) {
 	return cfg, store, nil
 }
 
-func refreshMessages(cfg *config.Config, store *cache.Store, opts listOptions) error {
+func refreshMessages(ctx context.Context, cfg *config.Config, store *cache.Store, opts listOptions) error {
 	accounts, err := selectAccounts(cfg, opts.account)
 	if err != nil {
 		return err
 	}
 
 	for _, acct := range accounts {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		client, err := imaplib.Connect(acct)
 		if err != nil {
 			return err
 		}
-		if err := refreshMessagesForAccount(client, store, opts); err != nil {
+		if err := ctx.Err(); err != nil {
+			client.Close()
+			return err
+		}
+		if err := refreshMessagesForAccount(ctx, client, store, opts); err != nil {
 			client.Close()
 			return err
 		}
@@ -287,9 +295,12 @@ func refreshMessages(cfg *config.Config, store *cache.Store, opts listOptions) e
 	return nil
 }
 
-func refreshMessagesForAccount(client *imaplib.Client, store *cache.Store, opts listOptions) error {
+func refreshMessagesForAccount(ctx context.Context, client *imaplib.Client, store *cache.Store, opts listOptions) error {
 	account := client.AccountName()
 	if opts.mailbox != "" {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		msg := client.FetchMessages(opts.mailbox, opts.limit)()
 		if listMsg, ok := msg.(imaplib.MessageListMsg); ok {
 			if listMsg.Err != nil {
@@ -300,6 +311,9 @@ func refreshMessagesForAccount(client *imaplib.Client, store *cache.Store, opts 
 		return nil
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	foldersMsg := client.FetchFolders()()
 	if msg, ok := foldersMsg.(imaplib.FolderListMsg); ok {
 		if msg.Err != nil {
@@ -315,6 +329,9 @@ func refreshMessagesForAccount(client *imaplib.Client, store *cache.Store, opts 
 	if folder == "" {
 		folder = "INBOX"
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	msg := client.FetchMessages(folder, opts.limit)()
 	if listMsg, ok := msg.(imaplib.MessageListMsg); ok {
 		if listMsg.Err != nil {
@@ -325,14 +342,21 @@ func refreshMessagesForAccount(client *imaplib.Client, store *cache.Store, opts 
 	return nil
 }
 
-func refreshFolderCounts(cfg *config.Config, store *cache.Store, account string) error {
+func refreshFolderCounts(ctx context.Context, cfg *config.Config, store *cache.Store, account string) error {
 	accounts, err := selectAccounts(cfg, account)
 	if err != nil {
 		return err
 	}
 	for _, acct := range accounts {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		client, err := imaplib.Connect(acct)
 		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			client.Close()
 			return err
 		}
 		foldersMsg := client.FetchFolders()()
@@ -346,6 +370,10 @@ func refreshFolderCounts(cfg *config.Config, store *cache.Store, account string)
 				return err
 			}
 			for _, f := range msg.Folders {
+				if err := ctx.Err(); err != nil {
+					client.Close()
+					return err
+				}
 				unread, total, err := client.FolderStatus(f.Name)
 				if err != nil {
 					client.Close()
@@ -379,6 +407,17 @@ func selectAccounts(cfg *config.Config, account string) ([]*config.AccountConfig
 		accounts = append(accounts, &cfg.Accounts[i])
 	}
 	return accounts, nil
+}
+
+func selectAccount(cfg *config.Config, account string) (*config.AccountConfig, error) {
+	accounts, err := selectAccounts(cfg, account)
+	if err != nil {
+		return nil, err
+	}
+	if len(accounts) != 1 {
+		return nil, fmt.Errorf("account is required")
+	}
+	return accounts[0], nil
 }
 
 func writeCounts(folders []*data.Folder) error {

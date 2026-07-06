@@ -68,6 +68,13 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) applySchema() error {
+	// Migration: drop stale FTS4 triggers if they exist. The delete/update
+	// triggers can reject normal message deletes with "SQL logic error" on
+	// FTS4 external-content tables. Search joins FTS rows back to messages, so
+	// orphaned FTS rows from cache deletion are not returned.
+	if _, err := s.db.Exec(`DROP TRIGGER IF EXISTS messages_fts_delete`); err != nil {
+		return fmt.Errorf("dropping stale fts_delete trigger: %w", err)
+	}
 	// Migration: drop the FTS4 update trigger if it exists. It re-inserted with
 	// the same docid after a 'delete', which FTS4 external-content tables reject
 	// with "sql logic error". Email content (subject/snippet/body) never changes
@@ -461,8 +468,11 @@ func (s *Store) GetMessagesFiltered(account, folder string, unreadOnly bool, lim
 		query.WriteString(" AND flags NOT LIKE ?")
 		args = append(args, "%\\Seen%")
 	}
-	query.WriteString(" ORDER BY date DESC LIMIT ?")
-	args = append(args, limit)
+	query.WriteString(" ORDER BY date DESC")
+	if limit > 0 {
+		query.WriteString(" LIMIT ?")
+		args = append(args, limit)
+	}
 
 	rows, err := s.db.Query(query.String(), args...)
 	if err != nil {
@@ -816,19 +826,162 @@ func (s *Store) UpsertFolders(account string, folders []*data.Folder) error {
 	for _, f := range folders {
 		attrs := strings.Join(f.Attributes, " ")
 		_, err := tx.Exec(`
-			INSERT INTO folders (account_name, name, display_name, delimiter, attributes, depth)
-			VALUES (?, ?, ?, ?, ?, ?)
+			INSERT INTO folders (account_name, name, display_name, delimiter, attributes, depth, unread, total)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(account_name, name) DO UPDATE SET
 				display_name = excluded.display_name,
 				delimiter    = excluded.delimiter,
 				attributes   = excluded.attributes,
-				depth        = excluded.depth
-		`, account, f.Name, f.DisplayName, f.Delimiter, attrs, f.Depth)
+				depth        = excluded.depth,
+				unread       = CASE WHEN excluded.unread > 0 THEN excluded.unread ELSE folders.unread END,
+				total        = CASE WHEN excluded.total  > 0 THEN excluded.total  ELSE folders.total  END
+		`, account, f.Name, f.DisplayName, f.Delimiter, attrs, f.Depth, f.Unread, f.Total)
 		if err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
+}
+
+// MoveMessage updates cached metadata for a moved message. If destUID is zero,
+// the destination UID is unknown and the source row is removed instead.
+func (s *Store) MoveMessage(account, sourceFolder string, uid uint32, destFolder string, destUID uint32) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if destUID == 0 {
+		if _, err := tx.Exec(`
+			DELETE FROM messages
+			WHERE account_name = ? AND folder_name = ? AND uid = ?
+		`, account, sourceFolder, uid); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+
+	if _, err := tx.Exec(`
+		DELETE FROM messages
+		WHERE account_name = ? AND folder_name = ? AND uid = ?
+	`, account, destFolder, destUID); err != nil {
+		return err
+	}
+	_, err = tx.Exec(`
+		UPDATE messages
+		SET folder_name = ?, uid = ?
+		WHERE account_name = ? AND folder_name = ? AND uid = ?
+	`, destFolder, destUID, account, sourceFolder, uid)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// RenameFolder updates cached folder metadata and messages for a renamed folder.
+func (s *Store) RenameFolder(account, oldName, newName string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	oldPrefix := oldName + "/"
+	rows, err := tx.Query(`
+		SELECT name FROM folders
+		WHERE account_name = ? AND (name = ? OR substr(name, 1, ?) = ?)
+	`, account, oldName, len(oldPrefix), oldPrefix)
+	if err != nil {
+		return err
+	}
+	var folderNames []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		folderNames = append(folderNames, name)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, oldFolderName := range folderNames {
+		newFolderName := renamedFolderName(oldFolderName, oldName, newName)
+		displayName, depth := folderDisplayNameAndDepth(newFolderName, "/")
+		if _, err := tx.Exec(`
+			UPDATE folders
+			SET name = ?, display_name = ?, delimiter = '/', depth = ?
+			WHERE account_name = ? AND name = ?
+		`, newFolderName, displayName, depth, account, oldFolderName); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.Exec(`
+		UPDATE messages
+		SET folder_name = ? || substr(folder_name, ?)
+		WHERE account_name = ? AND (folder_name = ? OR substr(folder_name, 1, ?) = ?)
+	`, newName, len(oldName)+1, account, oldName, len(oldPrefix), oldPrefix); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		UPDATE folder_embeddings
+		SET folder_name = ? || substr(folder_name, ?)
+		WHERE account_name = ? AND (folder_name = ? OR substr(folder_name, 1, ?) = ?)
+	`, newName, len(oldName)+1, account, oldName, len(oldPrefix), oldPrefix); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func renamedFolderName(name, oldName, newName string) string {
+	if name == oldName {
+		return newName
+	}
+	return newName + strings.TrimPrefix(name, oldName)
+}
+
+// DeleteFolder removes a folder and cached messages it contains.
+func (s *Store) DeleteFolder(account, folder string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`
+		DELETE FROM messages
+		WHERE account_name = ? AND folder_name = ?
+	`, account, folder); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		DELETE FROM folder_embeddings
+		WHERE account_name = ? AND folder_name = ?
+	`, account, folder); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		DELETE FROM folders
+		WHERE account_name = ? AND name = ?
+	`, account, folder); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func folderDisplayNameAndDepth(name, delimiter string) (string, int) {
+	if delimiter == "" {
+		delimiter = "/"
+	}
+	parts := strings.Split(name, delimiter)
+	return parts[len(parts)-1], len(parts) - 1
 }
 
 // GetFolders returns all folders for an account.

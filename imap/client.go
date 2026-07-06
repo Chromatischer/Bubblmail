@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"sync"
 
-	imaplib "github.com/emersion/go-imap/v2/imapclient"
 	"github.com/bubblmail/bubblmail/config"
+	imaplib "github.com/emersion/go-imap/v2/imapclient"
 )
 
 // Client wraps an IMAP connection for a single account.

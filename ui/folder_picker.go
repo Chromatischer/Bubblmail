@@ -2,8 +2,10 @@ package ui
 
 import (
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
+	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/data"
 	"github.com/bubblmail/bubblmail/ui/components"
 	"github.com/bubblmail/bubblmail/ui/icons"
@@ -22,6 +24,10 @@ type FolderPickerOverlay struct {
 	query    string
 	list     components.ScrollList
 	result   *data.Folder
+
+	// collapsed mirrors the sidebar's fold state (folder name → collapsed).
+	// It hides collapsed subtrees while browsing; filtering still searches all.
+	collapsed map[string]bool
 }
 
 // NewFolderPickerOverlay creates a new folder picker overlay.
@@ -36,7 +42,9 @@ func (f *FolderPickerOverlay) SetSize(w, h int) {
 }
 
 // Open opens the picker with selectable folders, excluding currentFolder.
-func (f *FolderPickerOverlay) Open(folders []*data.Folder, currentFolder string) {
+// collapsed mirrors the sidebar's fold state so collapsed subtrees stay hidden
+// while browsing; pass nil to show the full tree.
+func (f *FolderPickerOverlay) Open(folders []*data.Folder, currentFolder string, collapsed map[string]bool) {
 	var sel []*data.Folder
 	for _, folder := range folders {
 		if folder.IsSelectable() && folder.Name != currentFolder {
@@ -44,8 +52,9 @@ func (f *FolderPickerOverlay) Open(folders []*data.Folder, currentFolder string)
 		}
 	}
 	f.all = sel
-	f.filtered = sel
+	f.collapsed = collapsed
 	f.query = ""
+	f.applyFilter()
 	f.list.Reset()
 	f.result = nil
 	f.active = true
@@ -56,6 +65,7 @@ func (f *FolderPickerOverlay) Close() {
 	f.active = false
 	f.all = nil
 	f.filtered = nil
+	f.collapsed = nil
 	f.result = nil
 	f.query = ""
 }
@@ -107,10 +117,37 @@ func (f *FolderPickerOverlay) HitTestFolder(contentY int) int {
 	return f.list.Offset + i
 }
 
-// applyFilter recomputes filtered from all using the current query.
+// folderHiddenByCollapse reports whether folder is hidden because one of its
+// ancestors is collapsed. Mirrors Sidebar.isFolderHidden.
+func folderHiddenByCollapse(folder *data.Folder, collapsed map[string]bool) bool {
+	if folder.Depth == 0 || folder.Delimiter == "" || len(collapsed) == 0 {
+		return false
+	}
+	parts := strings.Split(folder.Name, folder.Delimiter)
+	for d := 0; d < len(parts)-1; d++ {
+		if collapsed[strings.Join(parts[:d+1], folder.Delimiter)] {
+			return true
+		}
+	}
+	return false
+}
+
+// applyFilter recomputes filtered from all using the current query. With no
+// query it shows the browse tree (collapsed subtrees hidden); while filtering it
+// searches every folder so collapsed entries stay reachable by typing.
 func (f *FolderPickerOverlay) applyFilter() {
 	if f.query == "" {
-		f.filtered = f.all
+		if len(f.collapsed) == 0 {
+			f.filtered = f.all
+			return
+		}
+		out := make([]*data.Folder, 0, len(f.all))
+		for _, folder := range f.all {
+			if !folderHiddenByCollapse(folder, f.collapsed) {
+				out = append(out, folder)
+			}
+		}
+		f.filtered = out
 		return
 	}
 	q := strings.ToLower(f.query)
@@ -191,11 +228,16 @@ func (f *FolderPickerOverlay) listHeight() int {
 // Row layout: " " + icon(1) + " " + name → prefixW=3 + name width.
 func (f *FolderPickerOverlay) innerWidth() int {
 	const prefixW = 3 // " " + icon(1) + " "
+	// Tree mode reserves a 2-col chevron gutter when any subtree is collapsed.
+	gutter := 0
+	if len(f.collapsed) > 0 {
+		gutter = 2
+	}
 	const titleStr = "Move to folder"
 	w := util.VisibleWidth(icons.FolderOpen+" "+titleStr) + 1
 	for _, folder := range f.all {
-		// Tree-mode width: indented display name
-		treeW := prefixW + folder.Depth*2 + util.VisibleWidth(folder.DisplayName)
+		// Tree-mode width: chevron gutter + indented display name
+		treeW := prefixW + gutter + folder.Depth*2 + util.VisibleWidth(folder.DisplayName)
 		if treeW > w {
 			w = treeW
 		}
@@ -256,6 +298,131 @@ func pickerFolderIcon(folder *data.Folder) string {
 	}
 }
 
+// folderTreePrefixes builds box-drawing connector prefixes for a depth-ordered
+// folder list. Depth-0 folders get no connector; nested folders get ├/└ at their
+// own level plus │/space continuation columns for each ancestor level. Each
+// segment is two columns wide, matching the old two-space-per-depth indent.
+func folderTreePrefixes(folders []*data.Folder) []string {
+	n := len(folders)
+	prefixes := make([]string, n)
+
+	// last[i]: folder i is the final sibling at its depth within its parent.
+	last := make([]bool, n)
+	for i := 0; i < n; i++ {
+		d := folders[i].Depth
+		last[i] = true
+		for j := i + 1; j < n; j++ {
+			if folders[j].Depth < d {
+				break
+			}
+			if folders[j].Depth == d {
+				last[i] = false
+				break
+			}
+		}
+	}
+
+	// cont[k]: the currently-open ancestor at depth k has a later sibling, so a
+	// vertical guide should continue through deeper rows.
+	var cont []bool
+	for i := 0; i < n; i++ {
+		d := folders[i].Depth
+		if len(cont) < d+1 {
+			cont = append(cont, make([]bool, d+1-len(cont))...)
+		} else {
+			cont = cont[:d+1]
+		}
+		cont[d] = !last[i]
+		if d == 0 {
+			continue // roots have no connector
+		}
+		var b strings.Builder
+		for k := 1; k < d; k++ {
+			if cont[k] {
+				b.WriteString("│ ")
+			} else {
+				b.WriteString("  ")
+			}
+		}
+		if last[i] {
+			b.WriteString("└ ")
+		} else {
+			b.WriteString("├ ")
+		}
+		prefixes[i] = b.String()
+	}
+	return prefixes
+}
+
+// findMatchRange returns the byte [start,end) of the first case-insensitive
+// occurrence of q in s, or (-1,-1) when q is empty or absent.
+func findMatchRange(s, q string) (int, int) {
+	if q == "" {
+		return -1, -1
+	}
+	lq := strings.ToLower(q)
+	var lower strings.Builder
+	offsets := make([]int, 0, len(s)+1)
+	for i, r := range s {
+		offsets = append(offsets, i)
+		lower.WriteRune(unicode.ToLower(r))
+	}
+	offsets = append(offsets, len(s))
+	ls := lower.String()
+	bi := strings.Index(ls, lq)
+	if bi < 0 {
+		return -1, -1
+	}
+	ri := utf8.RuneCountInString(ls[:bi])
+	qr := utf8.RuneCountInString(lq)
+	if ri+qr >= len(offsets) {
+		return -1, -1
+	}
+	return offsets[ri], offsets[ri+qr]
+}
+
+// renderPickerCell renders a folder row to an exact contentW-wide styled cell.
+// When matchStart >= 0, name[matchStart:matchEnd] is accented as a filter hit.
+// Every segment carries the row background so it fills uniformly despite the
+// mid-row style changes.
+func renderPickerCell(theme *config.Theme, lead, name string, matchStart, matchEnd, contentW int, selected bool) string {
+	bg, fg := theme.Surface, theme.Text
+	if selected {
+		bg, fg = theme.Selected, theme.Background
+	}
+	base := lipgloss.NewStyle().Background(bg).Foreground(fg).Bold(selected)
+
+	match := lipgloss.NewStyle().Background(bg).Bold(true)
+	if selected {
+		match = match.Foreground(fg).Underline(true)
+	} else {
+		match = match.Foreground(theme.Accent)
+	}
+
+	var b strings.Builder
+	b.WriteString(base.Render(lead))
+	if matchStart >= 0 && matchEnd > matchStart && matchEnd <= len(name) {
+		b.WriteString(base.Render(name[:matchStart]))
+		b.WriteString(match.Render(name[matchStart:matchEnd]))
+		b.WriteString(base.Render(name[matchEnd:]))
+	} else {
+		b.WriteString(base.Render(name))
+	}
+	if pad := contentW - util.VisibleWidth(lead) - util.VisibleWidth(name); pad > 0 {
+		b.WriteString(base.Render(strings.Repeat(" ", pad)))
+	}
+	return b.String()
+}
+
+// scrollbarCell renders one cell of the right-edge scrollbar.
+func scrollbarCell(theme *config.Theme, thumb bool) string {
+	ch, col := "░", theme.Overlay
+	if thumb {
+		ch, col = "█", theme.Accent
+	}
+	return lipgloss.NewStyle().Background(theme.Surface).Foreground(col).Render(ch)
+}
+
 // View renders the folder picker overlay.
 func (f *FolderPickerOverlay) View() string {
 	theme := f.styles.Theme
@@ -287,7 +454,37 @@ func (f *FolderPickerOverlay) View() string {
 
 	// Folder rows
 	isFiltering := f.query != ""
-	nameAvail := innerW - 3 // " " + icon(1) + " "
+
+	// Reserve a right-edge column for the scrollbar when the list overflows.
+	scrolling := len(f.filtered) > listH
+	contentW := innerW
+	if scrolling {
+		contentW = innerW - 1
+	}
+
+	// Tree connector prefixes (tree mode only; filtering shows a flat list).
+	var treePrefixes []string
+	if !isFiltering {
+		treePrefixes = folderTreePrefixes(f.filtered)
+	}
+	// In tree mode, reserve a left gutter for the ▶ collapsed marker when any
+	// subtree is folded, so collapsed parents read like they do in the sidebar.
+	markCollapse := !isFiltering && len(f.collapsed) > 0
+
+	// Scrollbar thumb extent, in visible-row coordinates.
+	thumbStart, thumbEnd := 0, 0
+	if scrolling {
+		total := len(f.filtered)
+		thumb := listH * listH / total
+		if thumb < 1 {
+			thumb = 1
+		}
+		pos := 0
+		if maxOff := total - listH; maxOff > 0 {
+			pos = f.list.Offset * (listH - thumb) / maxOff
+		}
+		thumbStart, thumbEnd = pos, pos+thumb
+	}
 
 	var rows []string
 	if len(f.filtered) == 0 {
@@ -307,34 +504,42 @@ func (f *FolderPickerOverlay) View() string {
 		isSelected := i == f.list.Cursor
 		icon := pickerFolderIcon(folder)
 
-		// Build the display name as a plain string.
-		var nameStr string
+		// lead is the plain text before the name: leading space, collapse gutter,
+		// tree connector, icon, gap. Widths are measured from this plain string.
+		lead := " "
+		if markCollapse {
+			if f.collapsed[folder.Name] {
+				lead += "▶ "
+			} else {
+				lead += "  "
+			}
+		}
+		if !isFiltering {
+			lead += treePrefixes[i]
+		}
+		lead += icon + " "
+		nameAvail := contentW - util.VisibleWidth(lead)
+		if nameAvail < 1 {
+			nameAvail = 1
+		}
+
+		rawName := folder.DisplayName // tree mode: leaf name, hierarchy in connectors
 		if isFiltering {
-			// Flat mode: show full IMAP path so context is clear while filtering.
-			nameStr = util.SingleLine(folder.Name)
-		} else {
-			// Tree mode: indented display name reflects mailbox hierarchy.
-			indent := strings.Repeat("  ", folder.Depth)
-			nameStr = indent + util.SingleLine(folder.DisplayName)
+			rawName = folder.Name // flat mode: full IMAP path for context
+		}
+		name := util.TruncateText(util.SingleLine(rawName), nameAvail)
+
+		matchStart, matchEnd := -1, -1
+		if isFiltering {
+			matchStart, matchEnd = findMatchRange(name, f.query)
 		}
 
-		// plainRow is pure plain text — safe for Width(innerW).
-		plainRow := " " + icon + " " + util.TruncateText(nameStr, nameAvail)
-
-		if isSelected {
-			rows = append(rows, lipgloss.NewStyle().
-				Background(theme.Selected).
-				Foreground(theme.Background).
-				Bold(true).
-				Width(innerW).
-				Render(plainRow))
-		} else {
-			rows = append(rows, lipgloss.NewStyle().
-				Background(theme.Surface).
-				Foreground(theme.Text).
-				Width(innerW).
-				Render(plainRow))
+		cell := renderPickerCell(theme, lead, name, matchStart, matchEnd, contentW, isSelected)
+		if scrolling {
+			r := i - f.list.Offset
+			cell += scrollbarCell(theme, r >= thumbStart && r < thumbEnd)
 		}
+		rows = append(rows, cell)
 	}
 
 	// Pad remaining rows to keep the box height stable.

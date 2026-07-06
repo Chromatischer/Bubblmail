@@ -24,6 +24,7 @@ A keyboard-driven terminal email client built for people who live in the shell. 
 - **Quick actions** — press `←`/`→` in the inbox to reveal action panels that slide in from the edges of the selected row; press again to expose a second action, press a third time to execute; `Enter` executes the highlighted action at any step
 - **Smart move** — the MOVE quick action uses OpenRouter embeddings and cosine similarity to suggest the best destination folder automatically
 - **Move to folder** — folder picker with QWERTY quick-select for fast filing
+- **Archive** — moves messages to the account's Archive folder, with undo when the server reports the new UID
 - **Star and mark read/unread** — local flag changes synced back to IMAP
 - **Delete** — moves to Trash on the server
 - **Collapsible sidebar** — account and folder tree with live unread counts
@@ -37,7 +38,6 @@ A keyboard-driven terminal email client built for people who live in the shell. 
 ## Planned Features
 
 - **Tag picker UI** — local labels with color support; backend already implemented, UI overlay pending
-- **Archive action** — `e` key is wired; server-side archive move not yet implemented
 - **HTML rendering improvements** — richer conversion of HTML email to terminal output
 
 ---
@@ -75,9 +75,10 @@ The wizard will prompt for:
 - Account name (e.g. `work`, `personal`)
 - IMAP host and port (default 993)
 - SMTP host and port (default 587)
-- Username and password (or a shell command to retrieve it)
+- Username and a password command, with plaintext password entry available as an explicit fallback
 
 Config is written to `~/.config/bubblmail/config.toml`.
+The config file is saved with user-only permissions. Prefer `password_cmd` over storing a plaintext password.
 
 The local cache is stored in `~/.cache/bubblmail` by default.
 
@@ -128,8 +129,8 @@ bubblmail auth status             Test IMAP connections
 bubblmail auth remove <name>      Remove an account
 
 bubblmail embeddings status       Show embedding coverage per account
-bubblmail embeddings embedd       Backfill embeddings for cached bodies
-bubblmail embeddings embedd force Re-embed all cached bodies
+bubblmail embeddings embed        Backfill embeddings for cached bodies
+bubblmail embeddings embed force  Re-embed all cached bodies
 
 bubblmail list unread             List unread messages
 bubblmail list mailbox <name>     List messages in a mailbox

@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -13,6 +14,10 @@ import (
 	"github.com/emersion/go-imap/v2/imapclient"
 	gomail "github.com/emersion/go-message/mail"
 )
+
+// ErrMessageNotFound is returned when the IMAP server has no message at the requested UID.
+// This is expected when a message was moved or deleted by an external client.
+var ErrMessageNotFound = errors.New("message not found")
 
 // --- Message types returned by tea.Cmd ---
 
@@ -66,6 +71,8 @@ type MoveToTrashResultMsg struct {
 	Account string
 	Folder  string
 	UID     uint32
+	Dest    string // trash folder the message was moved to
+	DestUID uint32 // new UID in the trash folder (0 if server lacks UIDPLUS)
 	Err     error
 }
 
@@ -89,6 +96,7 @@ type MoveMessageResultMsg struct {
 	Folder  string
 	UID     uint32
 	Dest    string
+	DestUID uint32
 	Err     error
 }
 
@@ -154,9 +162,23 @@ func (c *Client) MoveMessage(sourceFolder string, uid uint32, destFolder string)
 	return func() tea.Msg {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		err := c.moveToTrash(sourceFolder, uid, destFolder)
-		return MoveMessageResultMsg{Account: c.cfg.Name, Folder: sourceFolder, UID: uid, Dest: destFolder, Err: err}
+		destUID, err := c.moveToTrash(sourceFolder, uid, destFolder)
+		return MoveMessageResultMsg{Account: c.cfg.Name, Folder: sourceFolder, UID: uid, Dest: destFolder, DestUID: destUID, Err: err}
 	}
+}
+
+// MoveMessageSync moves a message to another folder and waits for completion.
+func (c *Client) MoveMessageSync(sourceFolder string, uid uint32, destFolder string) (uint32, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.moveToTrash(sourceFolder, uid, destFolder)
+}
+
+// SetFlagSync sets or clears an IMAP flag and waits for completion.
+func (c *Client) SetFlagSync(folder string, uid uint32, flag data.Flag, set bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.setFlag(folder, uid, flag, set)
 }
 
 // MoveToTrash returns a tea.Cmd that moves a message to the trash folder.
@@ -165,8 +187,8 @@ func (c *Client) MoveToTrash(sourceFolder string, uid uint32, trashFolder string
 	return func() tea.Msg {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		err := c.moveToTrash(sourceFolder, uid, trashFolder)
-		return MoveToTrashResultMsg{Account: c.cfg.Name, Folder: sourceFolder, UID: uid, Err: err}
+		destUID, err := c.moveToTrash(sourceFolder, uid, trashFolder)
+		return MoveToTrashResultMsg{Account: c.cfg.Name, Folder: sourceFolder, UID: uid, Dest: trashFolder, DestUID: destUID, Err: err}
 	}
 }
 
@@ -178,6 +200,34 @@ func (c *Client) CreateFolder(name string) tea.Cmd {
 		err := c.conn.Create(name, nil).Wait()
 		return CreateFolderResultMsg{Account: c.cfg.Name, Name: name, Err: err}
 	}
+}
+
+// FetchBodySync fetches the full body of a message and waits for completion.
+func (c *Client) FetchBodySync(folder string, uid uint32) (string, string, []data.Attachment, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.fetchBody(folder, uid)
+}
+
+// CreateFolderSync creates an IMAP mailbox and waits for completion.
+func (c *Client) CreateFolderSync(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.Create(name, nil).Wait()
+}
+
+// RenameFolder renames an IMAP mailbox and waits for completion.
+func (c *Client) RenameFolder(oldName, newName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.Rename(oldName, newName).Wait()
+}
+
+// DeleteFolder deletes an IMAP mailbox and waits for completion.
+func (c *Client) DeleteFolder(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.Delete(name).Wait()
 }
 
 // AppendMessage returns a tea.Cmd that appends a raw RFC 2822 message to a
@@ -207,7 +257,16 @@ func (c *Client) AppendMessage(folder string, raw []byte, flags []data.Flag) tea
 // --- internal implementation ---
 
 func (c *Client) fetchFolders() ([]*data.Folder, error) {
-	mailboxes, err := c.conn.List("", "*", nil).Collect()
+	// Request STATUS (unread/total) alongside the folder list when the server
+	// supports LIST-STATUS (RFC 5819) or IMAP4rev2. Servers that don't support
+	// it silently omit the Status field; counts default to 0.
+	opts := &imaplib.ListOptions{
+		ReturnStatus: &imaplib.StatusOptions{
+			NumMessages: true,
+			NumUnseen:   true,
+		},
+	}
+	mailboxes, err := c.conn.List("", "*", opts).Collect()
 	if err != nil {
 		return nil, fmt.Errorf("listing mailboxes: %w", err)
 	}
@@ -227,14 +286,23 @@ func (c *Client) fetchFolders() ([]*data.Folder, error) {
 			attrs = append(attrs, string(a))
 		}
 
-		folders = append(folders, &data.Folder{
+		f := &data.Folder{
 			Name:        mb.Mailbox,
 			DisplayName: displayName,
 			Delimiter:   delim,
 			Attributes:  attrs,
 			Depth:       depth,
 			AccountName: c.cfg.Name,
-		})
+		}
+		if mb.Status != nil {
+			if mb.Status.NumUnseen != nil {
+				f.Unread = int(*mb.Status.NumUnseen)
+			}
+			if mb.Status.NumMessages != nil {
+				f.Total = int(*mb.Status.NumMessages)
+			}
+		}
+		folders = append(folders, f)
 	}
 	return folders, nil
 }
@@ -305,7 +373,7 @@ func (c *Client) fetchBody(folder string, uid uint32) (string, string, []data.At
 		return "", "", nil, fmt.Errorf("fetching body: %w", err)
 	}
 	if len(buffers) == 0 {
-		return "", "", nil, fmt.Errorf("message not found")
+		return "", "", nil, ErrMessageNotFound
 	}
 
 	buf := buffers[0]
@@ -340,14 +408,30 @@ func (c *Client) setFlag(folder string, uid uint32, flag data.Flag, set bool) er
 	return cmd.Close()
 }
 
-func (c *Client) moveToTrash(sourceFolder string, uid uint32, trashFolder string) error {
+func (c *Client) moveToTrash(sourceFolder string, uid uint32, trashFolder string) (uint32, error) {
 	if _, err := c.conn.Select(sourceFolder, nil).Wait(); err != nil {
-		return fmt.Errorf("selecting folder: %w", err)
+		return 0, fmt.Errorf("selecting folder: %w", err)
 	}
 	uidSet := imaplib.UIDSetNum(imaplib.UID(uid))
 	// Move handles MOVE extension fallback (COPY + STORE \Deleted + EXPUNGE) automatically.
-	_, err := c.conn.Move(uidSet, trashFolder).Wait()
-	return err
+	data, err := c.conn.Move(uidSet, trashFolder).Wait()
+	if err != nil {
+		return 0, err
+	}
+	destUID, _ := firstUID(data.DestUIDs)
+	return destUID, nil
+}
+
+func firstUID(uidSet imaplib.NumSet) (uint32, bool) {
+	uids, ok := uidSet.(imaplib.UIDSet)
+	if !ok {
+		return 0, false
+	}
+	nums, ok := uids.Nums()
+	if !ok || len(nums) == 0 {
+		return 0, false
+	}
+	return uint32(nums[0]), true
 }
 
 // convertMessageBuffer converts a FetchMessageBuffer to a data.Message.
@@ -494,15 +578,43 @@ func knownAttachmentFilename(ct string) string {
 	return ""
 }
 
-// fallbackFilename returns a generic filename for a content type using the MIME
-// extension registry, used when Content-Disposition: attachment has no filename.
+// commonAttachmentExts maps frequently seen media types to a file extension so
+// fallbackFilename is deterministic regardless of the host's MIME registry. The
+// system registry (mime.ExtensionsByType) is only populated from files like
+// /etc/mime.types, which are absent on minimal containers and CI runners — there
+// it returns nothing and attachments would otherwise lose their extension. These
+// built-ins cover the types we actually see; anything else falls back to the
+// registry, then to a bare name.
+var commonAttachmentExts = map[string]string{
+	"application/octet-stream": ".bin",
+	"application/pdf":          ".pdf",
+	"application/zip":          ".zip",
+	"application/gzip":         ".gz",
+	"application/json":         ".json",
+	"application/msword":       ".doc",
+	"image/jpeg":               ".jpg",
+	"image/png":                ".png",
+	"image/gif":                ".gif",
+	"image/webp":               ".webp",
+	"text/plain":               ".txt",
+	"text/html":                ".html",
+	"text/csv":                 ".csv",
+}
+
+// fallbackFilename returns a generic filename for a content type, used when
+// Content-Disposition: attachment has no filename. It prefers a built-in table
+// so behaviour is identical across machines, then consults the system MIME
+// registry for less common types.
 func fallbackFilename(ct string) string {
 	mediaType := ct
 	if i := strings.IndexByte(ct, ';'); i >= 0 {
 		mediaType = strings.TrimSpace(ct[:i])
 	}
-	exts, err := mime.ExtensionsByType(mediaType)
-	if err == nil && len(exts) > 0 {
+	mediaType = strings.ToLower(mediaType)
+	if ext, ok := commonAttachmentExts[mediaType]; ok {
+		return "attachment" + ext
+	}
+	if exts, err := mime.ExtensionsByType(mediaType); err == nil && len(exts) > 0 {
 		return "attachment" + exts[0]
 	}
 	return "attachment"

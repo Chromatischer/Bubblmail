@@ -1,6 +1,7 @@
 # Configuration
 
-Config lives at `~/.config/bubblmail/config.toml`.
+Config lives at `~/.config/bubblmail/config.toml` and is written with user-only
+permissions (`0600`).
 
 ## Minimal example
 

@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
-	"golang.org/x/net/html"
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/util"
+	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/net/html"
 )
 
 // block represents a logical content block extracted from an HTML document.

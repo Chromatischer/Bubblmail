@@ -2,11 +2,11 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -56,7 +56,6 @@ type embeddingStartedMsg struct {
 }
 
 type prefetchTickMsg struct{}
-type suggestPollMsg struct{}
 
 type quickMoveResultMsg struct {
 	msgID   int64
@@ -71,8 +70,9 @@ type quickMoveResultMsg struct {
 // moveHintMsg carries a precomputed folder suggestion for the quick-move hint.
 type moveHintMsg struct{ dest string }
 
-// clearStatusMsg clears the flash message.
-type clearStatusMsg struct{}
+// clearStatusMsg clears the flash message. seq identifies which flash generation
+// this timer belongs to, so a stale timer cannot clear a newer message.
+type clearStatusMsg struct{ seq int }
 
 // quitTimeoutMsg clears the pending quit state.
 type quitTimeoutMsg struct{}
@@ -118,13 +118,14 @@ type App struct {
 	imapClients map[string]*imaplib.Client
 
 	// UI components
-	header        *Header
-	sidebar       *Sidebar
-	statusbar     *StatusBar
-	helpOverlay   *HelpOverlay
-	searchOverlay *SearchOverlay
-	folderPicker  *FolderPickerOverlay
-	newFolder     *NewFolderOverlay
+	header         *Header
+	sidebar        *Sidebar
+	statusbar      *StatusBar
+	helpOverlay    *HelpOverlay
+	searchOverlay  *SearchOverlay
+	folderPicker   *FolderPickerOverlay
+	newFolder      *NewFolderOverlay
+	commandPalette *CommandPaletteOverlay
 
 	// Main views
 	viewID     ViewID
@@ -150,11 +151,14 @@ type App struct {
 	fetchedCount   int
 	loadingMore    bool
 	allLoaded      bool
+	unreadOnly     bool
 	quitPending    bool
 	searchSeq      int
 	searchState    *searchState
 	prefetchSkip   map[int64]bool
 	quickMenu      *quickMenuState
+	lastUndo       *undoMove // last reversible move/delete/archive (nil if none)
+	persisted      *uiState  // on-disk UI state (collapsed folders, first-run tip)
 
 	accounts []*data.Account
 
@@ -208,6 +212,7 @@ func (a *App) canQuitNow() bool {
 		!a.searchOverlay.IsActive() &&
 		!a.folderPicker.IsActive() &&
 		!a.newFolder.IsActive() &&
+		!a.commandPalette.IsActive() &&
 		!a.showHelp &&
 		!a.comp.IsActive()
 }
@@ -264,6 +269,7 @@ func NewApp(cfg *config.Config, store *cache.Store) *App {
 	app.searchOverlay = NewSearchOverlay(styles)
 	app.folderPicker = NewFolderPickerOverlay(styles)
 	app.newFolder = NewNewFolderOverlay(styles)
+	app.commandPalette = NewCommandPaletteOverlay(styles)
 	app.inboxView = views.NewInboxView(theme)
 	app.readerView = views.NewReaderView(theme)
 	app.folderView = views.NewFolderView(theme)
@@ -290,6 +296,14 @@ func NewApp(cfg *config.Config, store *cache.Store) *App {
 	app.sidebar.SetAccounts(app.accounts)
 	app.sidebar.SetActive(app.activeAccount, app.activeFolder)
 
+	if state, err := loadUIState(); err == nil {
+		app.persisted = state
+	}
+	if app.persisted == nil {
+		app.persisted = &uiState{}
+	}
+	app.sidebar.SetCollapsed(app.persisted.CollapsedFolders)
+
 	return app
 }
 
@@ -297,6 +311,12 @@ func NewApp(cfg *config.Config, store *cache.Store) *App {
 func (a *App) Init() tea.Cmd {
 	cmds := []tea.Cmd{
 		tea.SetWindowTitle("bubblmail"),
+	}
+	// One-time onboarding hint, shown a beat after the first render settles.
+	if a.persisted != nil && !a.persisted.TipSeen {
+		cmds = append(cmds, tea.Tick(1500*time.Millisecond, func(time.Time) tea.Msg {
+			return firstRunTipMsg{}
+		}))
 	}
 	if a.embQueue != nil {
 		a.statusbar.SetEmbeddingStats(a.embQueue.Stats())
@@ -310,10 +330,10 @@ func (a *App) Init() tea.Cmd {
 		cmds = append(cmds, prefetchTick(interval))
 	}
 	if a.classifyQueue != nil {
-		cmds = append(cmds, classifyResultsTick())
+		cmds = append(cmds, a.waitForClassifyResult())
 	}
 	if a.suggestQueue != nil {
-		cmds = append(cmds, suggestResultsTick())
+		cmds = append(cmds, a.waitForSuggestResult())
 	}
 	// Load any previously cached classification counts immediately so the
 	// sidebar is populated on first render without waiting for new messages.
@@ -337,6 +357,14 @@ func (a *App) Init() tea.Cmd {
 			},
 		)
 		return tea.Batch(cmds...)
+	}
+
+	// Populate sidebar from cache immediately so it is visible before IMAP connects.
+	for i := range a.cfg.Accounts {
+		acfg := &a.cfg.Accounts[i]
+		if cached, err := a.store.GetFolders(acfg.Name); err == nil && len(cached) > 0 {
+			a.sidebar.SetFolders(acfg.Name, cached)
+		}
 	}
 
 	// Connect to all accounts and fetch folders/messages
@@ -431,24 +459,93 @@ func embeddingTick() tea.Cmd {
 	})
 }
 
-// classifyResultsTick polls the classification results channel.
-func classifyResultsTick() tea.Cmd {
-	return tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg {
-		return classifyPollMsg{}
-	})
+// waitForClassifyResult blocks on the classification results channel and wakes
+// the Update loop only when a result actually arrives — no idle polling.
+func (a *App) waitForClassifyResult() tea.Cmd {
+	return func() tea.Msg {
+		r, ok := <-a.classifyResults
+		return classifyResultReadyMsg{result: r, ok: ok}
+	}
 }
 
-func suggestResultsTick() tea.Cmd {
-	return tea.Tick(300*time.Millisecond, func(t time.Time) tea.Msg {
-		return suggestPollMsg{}
-	})
+// waitForSuggestResult blocks on the suggested-event results channel, waking the
+// Update loop only when a result arrives.
+func (a *App) waitForSuggestResult() tea.Cmd {
+	return func() tea.Msg {
+		r, ok := <-a.suggestResults
+		return suggestResultReadyMsg{result: r, ok: ok}
+	}
 }
 
-// classifyPollMsg is the tick that drains the classify results channel.
-type classifyPollMsg struct{}
+// classifyResultReadyMsg delivers one classification result from the channel.
+type classifyResultReadyMsg struct {
+	result classifylib.ResultMsg
+	ok     bool // false once the channel is closed
+}
 
-// Update implements tea.Model.
+// suggestResultReadyMsg delivers one suggested-event result from the channel.
+type suggestResultReadyMsg struct {
+	result suggest.ResultMsg
+	ok     bool
+}
+
+// applyClassifyResult folds one classification result into the smart-folder
+// counts, reporting whether it changed anything.
+func (a *App) applyClassifyResult(r classifylib.ResultMsg) bool {
+	if r.Err == nil && r.Category != "" {
+		a.smartCounts[r.Category]++
+		return true
+	}
+	return false
+}
+
+// applySuggestResult delivers one suggested-event result to the reader if it is
+// still showing the matching message.
+func (a *App) applySuggestResult(r suggest.ResultMsg) {
+	if r.Err != nil && r.Event == nil {
+		a.flash("Suggested event error: "+r.Err.Error(), "err")
+		r.Event = &data.SuggestedEvent{
+			MessageID:    r.MessageID,
+			GenerationOK: false,
+			ParseError:   r.Err.Error(),
+		}
+	}
+	if cur := a.readerView.CurrentMessage(); cur != nil && cur.ID == r.MessageID {
+		a.readerView.SetSuggestedEvent(r.Event)
+	} else if t := a.readerView.CurrentThread(); t != nil {
+		if latest := t.Latest(); latest != nil && latest.ID == r.MessageID {
+			a.readerView.SetSuggestedEvent(r.Event)
+		}
+	}
+	if r.Event != nil && !r.Event.GenerationOK && r.Err != nil {
+		a.flash("Suggested event parse error: "+r.Err.Error(), "err")
+	}
+}
+
+// flashTimeout is how long a status flash stays visible before it auto-clears.
+const flashTimeout = 3 * time.Second
+
+// Update implements tea.Model. It wraps the real handler so that any flash
+// raised during the update — including by background result handlers that
+// discard flash()'s return value — is given an auto-clear timer exactly once.
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	before := a.statusbar.MessageSeq()
+	model, cmd := a.update(msg)
+	if a.statusbar.MessageSeq() != before && a.statusbar.HasMessage() {
+		seq := a.statusbar.MessageSeq()
+		clear := tea.Tick(flashTimeout, func(time.Time) tea.Msg {
+			return clearStatusMsg{seq: seq}
+		})
+		if cmd == nil {
+			cmd = clear
+		} else {
+			cmd = tea.Batch(cmd, clear)
+		}
+	}
+	return model, cmd
+}
+
+func (a *App) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
 	case tea.WindowSizeMsg:
@@ -502,6 +599,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Err != nil {
 			a.flash("Fetch error: "+msg.Err.Error(), "err")
 			a.statusbar.SetLoading(false)
+			a.inboxView.SetError(msg.Err.Error())
 			return a, nil
 		}
 		a.loadedMessages = msg.Messages
@@ -511,9 +609,12 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if err := a.store.UpsertMessages(msg.Messages); err != nil {
 			a.flash("Cache write error: "+err.Error(), "err")
 		}
-		threads := thread.BuildThreads(a.loadedMessages)
+		threads := thread.BuildThreads(a.visibleMessages())
 		a.inboxView.SetThreads(threads)
 		a.applyQuickMenuState()
+		if a.unreadOnly {
+			a.header.SetUnreadFilter(true, len(threads))
+		}
 		a.statusbar.SetLoading(false)
 		// Submit new inbox messages for classification
 		if a.classifyQueue != nil {
@@ -537,9 +638,12 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if err := a.store.UpsertMessages(msg.Messages); err != nil {
 			a.flash("Cache write error: "+err.Error(), "err")
 		}
-		threads := thread.BuildThreads(a.loadedMessages)
+		threads := thread.BuildThreads(a.visibleMessages())
 		a.inboxView.AppendThreads(threads)
 		a.applyQuickMenuState()
+		if a.unreadOnly {
+			a.header.SetUnreadFilter(true, len(threads))
+		}
 		// Submit newly loaded messages for classification
 		if a.classifyQueue != nil {
 			a.classifyQueue.Submit(msg.Messages)
@@ -548,10 +652,18 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case imaplib.MessageBodyMsg:
 		if msg.Err != nil {
-			details := fmt.Sprintf("Body fetch error (%s %s uid=%d id=%d): %s", msg.Account, msg.Folder, msg.UID, msg.MsgID, msg.Err.Error())
-			a.flash(details, "err")
 			if msg.MsgID > 0 {
 				a.prefetchSkip[msg.MsgID] = true
+			}
+			if errors.Is(msg.Err, imaplib.ErrMessageNotFound) {
+				// Message was moved or deleted externally; insert a sentinel body row so
+				// the prefetcher never retries this UID again across sessions.
+				if msg.MsgID > 0 {
+					_ = a.store.UpsertBody(msg.MsgID, "", "")
+				}
+			} else {
+				details := fmt.Sprintf("Body fetch error (%s %s uid=%d id=%d): %s", msg.Account, msg.Folder, msg.UID, msg.MsgID, msg.Err.Error())
+				a.flash(details, "err")
 			}
 			return a, nil
 		}
@@ -630,14 +742,17 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.flash("Move failed: "+msg.Err.Error(), "err")
 			return a, nil
 		}
-		a.flash("Moved to Trash", "ok")
+		a.flash("Moved to Trash"+a.registerUndo(msg.Account, msg.Folder, msg.Dest, msg.DestUID, "Trash"), "ok")
 		// Remove the message from local state and refresh the inbox view.
 		// Preserve cursor: keep it at the same index so the next thread is selected.
 		cursor := a.inboxView.CursorPos()
 		a.loadedMessages = removeByUID(a.loadedMessages, msg.UID)
 		a.fetchedCount = len(a.loadedMessages)
-		threads := thread.BuildThreads(a.loadedMessages)
+		threads := thread.BuildThreads(a.visibleMessages())
 		a.inboxView.AppendThreads(threads)
+		if a.unreadOnly {
+			a.header.SetUnreadFilter(true, len(threads))
+		}
 		if cursor < len(threads) {
 			a.inboxView.SetCursor(cursor)
 		}
@@ -667,12 +782,15 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.flash("Move failed: "+msg.Err.Error(), "err")
 			return a, nil
 		}
-		a.flash("Moved to "+msg.Dest, "ok")
+		a.flash("Moved to "+msg.Dest+a.registerUndo(msg.Account, msg.Folder, msg.Dest, msg.DestUID, msg.Dest), "ok")
 		cursor := a.inboxView.CursorPos()
 		a.loadedMessages = removeByUID(a.loadedMessages, msg.UID)
 		a.fetchedCount = len(a.loadedMessages)
-		threads := thread.BuildThreads(a.loadedMessages)
+		threads := thread.BuildThreads(a.visibleMessages())
 		a.inboxView.AppendThreads(threads)
+		if a.unreadOnly {
+			a.header.SetUnreadFilter(true, len(threads))
+		}
 		if cursor < len(threads) {
 			a.inboxView.SetCursor(cursor)
 		}
@@ -780,62 +898,47 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.inboxView.SetThreads(threads)
 		return a, nil
 
-	case classifyPollMsg:
-		if a.classifyQueue == nil {
-			return a, nil
+	case classifyResultReadyMsg:
+		if a.classifyQueue == nil || !msg.ok {
+			return a, nil // channel closed: stop waiting
 		}
-		// Drain all pending results without blocking
-		changed := false
-		for {
+		// Apply the delivered result, then drain any others already queued so a
+		// burst is handled in one Update rather than one frame each.
+		changed := a.applyClassifyResult(msg.result)
+		for drained := false; !drained; {
 			select {
 			case r := <-a.classifyResults:
-				if r.Err == nil && r.Category != "" {
-					a.smartCounts[r.Category]++
+				if a.applyClassifyResult(r) {
 					changed = true
 				}
 			default:
-				goto drained
+				drained = true
 			}
 		}
-	drained:
+		cmds := []tea.Cmd{a.waitForClassifyResult()} // re-arm the blocking read
 		if changed {
 			a.refreshSmartCounts()
-			// If viewing a smart folder, refresh its thread list
+			// If viewing a smart folder, refresh its thread list.
 			if a.viewID == ViewSmartFolder && a.smartFolder != "" {
-				return a, tea.Batch(classifyResultsTick(), a.fetchSmartFolder(a.smartFolder))
+				cmds = append(cmds, a.fetchSmartFolder(a.smartFolder))
 			}
 		}
-		return a, classifyResultsTick()
+		return a, tea.Batch(cmds...)
 
-	case suggestPollMsg:
-		if a.suggestQueue == nil {
-			return a, nil
+	case suggestResultReadyMsg:
+		if a.suggestQueue == nil || !msg.ok {
+			return a, nil // channel closed: stop waiting
 		}
-		for {
+		a.applySuggestResult(msg.result)
+		for drained := false; !drained; {
 			select {
 			case r := <-a.suggestResults:
-				if r.Err != nil && r.Event == nil {
-					a.flash("Suggested event error: "+r.Err.Error(), "err")
-					r.Event = &data.SuggestedEvent{
-						MessageID:    r.MessageID,
-						GenerationOK: false,
-						ParseError:   r.Err.Error(),
-					}
-				}
-				if cur := a.readerView.CurrentMessage(); cur != nil && cur.ID == r.MessageID {
-					a.readerView.SetSuggestedEvent(r.Event)
-				} else if t := a.readerView.CurrentThread(); t != nil {
-					if latest := t.Latest(); latest != nil && latest.ID == r.MessageID {
-						a.readerView.SetSuggestedEvent(r.Event)
-					}
-				}
-				if r.Event != nil && !r.Event.GenerationOK && r.Err != nil {
-					a.flash("Suggested event parse error: "+r.Err.Error(), "err")
-				}
+				a.applySuggestResult(r)
 			default:
-				return a, suggestResultsTick()
+				drained = true
 			}
 		}
+		return a, a.waitForSuggestResult() // re-arm the blocking read
 
 	case prefetchTickMsg:
 		if !a.cfg.Embeddings.PrefetchBodies {
@@ -883,13 +986,38 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case clearStatusMsg:
+		if msg.seq != a.statusbar.MessageSeq() {
+			return a, nil // a newer flash replaced this one; its own timer will clear it
+		}
 		a.statusbar.ClearMessage()
+		a.lastUndo = nil // undo is offered only while its flash is visible
 		a.updateLayout() // message gone; reclaim the extra line
 		return a, nil
+
+	case undoResultMsg:
+		if msg.err != nil {
+			a.flash("Undo failed: "+msg.err.Error(), "err")
+			return a, nil
+		}
+		// Re-sync the folder the message returned to so it reappears in the list.
+		if msg.account == a.activeAccount && msg.folder == a.activeFolder {
+			return a, tea.Batch(a.flash("Undone", "ok"), a.fetchMessages())
+		}
+		return a, a.flash("Undone", "ok")
 
 	case quitTimeoutMsg:
 		a.quitPending = false
 		return a, nil
+
+	case firstRunTipMsg:
+		if a.persisted != nil && a.persisted.TipSeen {
+			return a, nil
+		}
+		if a.persisted != nil {
+			a.persisted.TipSeen = true
+			a.persistUI()
+		}
+		return a, a.flash(fmt.Sprintf("%s Tip: press . for all commands · ? for keys · ctrl+z to undo", icons.Sparkle), "info")
 
 	case tea.MouseMsg:
 		if a.comp.IsActive() {
@@ -916,7 +1044,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// 1. Composer captures all keys when active
 	if a.comp.IsActive() {
-		a.comp.HandleKey(key)
+		a.comp.HandleKey(msg)
 		if r := a.comp.Result(); r != nil {
 			cmd := a.handleComposerResult(r)
 			a.comp.ClearResult()
@@ -1023,6 +1151,19 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
+	// 4b. Command palette
+	if a.commandPalette.IsActive() {
+		closed := a.commandPalette.HandleKey(key)
+		if closed {
+			result := a.commandPalette.Result()
+			a.commandPalette.Close()
+			if result != nil {
+				return a.dispatchGlobalKey(result.Key)
+			}
+		}
+		return a, nil
+	}
+
 	// 5. Help overlay — any key closes it
 	if a.showHelp {
 		a.showHelp = false
@@ -1063,7 +1204,12 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				a.viewID = ViewInbox
 				return a, a.fetchMessages()
 			}
-		case "esc", "h", "left", "tab", "q":
+		case "z":
+			if acct, folder, ok := a.sidebar.Selected(); ok {
+				a.sidebar.Toggle(acct, folder)
+				a.persistUI()
+			}
+		case "esc", "h", "left", "tab", "q", KeySidebarFocus:
 			a.sidebarFocused = false
 			a.sidebar.SetFocused(false)
 		case "ctrl+c":
@@ -1073,6 +1219,12 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// 7. Global keys
+	return a.dispatchGlobalKey(key)
+}
+
+// dispatchGlobalKey handles top-level (non-overlay) key actions. It is also the
+// entry point used by the command palette to run a chosen action by its key.
+func (a *App) dispatchGlobalKey(key string) (tea.Model, tea.Cmd) {
 	switch key {
 	case "ctrl+c":
 		return a, tea.Quit
@@ -1097,24 +1249,43 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.readerView.ToggleQuoteFolds()
 		}
 
+	case "]":
+		if a.viewID == ViewReader {
+			a.readerView.JumpToMessage(1)
+		}
+
+	case "[":
+		if a.viewID == ViewReader {
+			a.readerView.JumpToMessage(-1)
+		}
+
 	case "b":
 		a.wantSidebar = !a.wantSidebar
 		a.updateLayout()
 
-	case "tab":
+	case KeyAttachments:
+		// Enter/leave the attachment section in the reader. Dedicated key so Tab
+		// stays free to focus the sidebar.
 		if a.viewID == ViewReader && a.readerView.HasAttachments() {
+			if a.readerView.AttachFocusActive() {
+				a.readerView.ExitAttachments()
+			} else {
+				a.readerView.EnterAttachments()
+			}
+			return a, nil
+		}
+
+	case "tab":
+		// Within the attachment section, Tab cycles attachments; otherwise it
+		// focuses the sidebar (consistent across views).
+		if a.viewID == ViewReader && a.readerView.AttachFocusActive() {
 			a.readerView.FocusNextAttachment(1)
 			return a, nil
 		}
-		if a.showSidebar {
-			a.sidebarFocused = true
-			a.sidebar.SetFocused(true)
-			if a.viewID == ViewSmartFolder {
-				a.sidebar.FocusAt("", a.smartFolder)
-			} else {
-				a.sidebar.FocusAt(a.activeAccount, a.activeFolder)
-			}
-		}
+		a.focusSidebar()
+
+	case KeySidebarFocus: // "\" — dedicated, never-overloaded sidebar focus
+		a.focusSidebar()
 
 	case "i":
 		a.activeFolder = "INBOX"
@@ -1128,8 +1299,14 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.statusbar.SetLoading(true)
 		return a, tea.Batch(a.fetchMessages(), spinnerTick())
 
+	case "ctrl+z":
+		return a, a.performUndo()
+
+	case ".":
+		a.openCommandPalette()
+
 	case "shift+tab":
-		if a.viewID == ViewReader && a.readerView.HasAttachments() {
+		if a.viewID == ViewReader && a.readerView.AttachFocusActive() {
 			a.readerView.FocusNextAttachment(-1)
 			return a, nil
 		}
@@ -1183,6 +1360,27 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.inboxView.ClearSelection()
 		}
 		a.moveUp()
+		return a, nil
+
+	case "ctrl+down":
+		// Fast keyboard scroll, matching the mouse-wheel step (selection stays).
+		a.closeQuickMenu()
+		if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
+			a.inboxView.ClearSelection()
+		}
+		for i := 0; i < wheelScrollStep; i++ {
+			a.moveDown()
+		}
+		return a, a.maybeLoadMore()
+
+	case "ctrl+up":
+		a.closeQuickMenu()
+		if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
+			a.inboxView.ClearSelection()
+		}
+		for i := 0; i < wheelScrollStep; i++ {
+			a.moveUp()
+		}
 		return a, nil
 
 	case "ctrl+d":
@@ -1258,6 +1456,11 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		fallthrough
 	case "esc", "h":
+		// In the attachment section, leave the section first rather than the reader.
+		if a.viewID == ViewReader && a.readerView.AttachFocusActive() {
+			a.readerView.ExitAttachments()
+			return a, nil
+		}
 		if a.viewID == ViewReader {
 			a.viewID = a.prevViewID
 		} else if a.viewID == ViewFolder {
@@ -1322,19 +1525,41 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "e":
 		return a, a.archiveMessage()
+
+	case KeyUnreadFilter:
+		a.unreadOnly = !a.unreadOnly
+		threads := thread.BuildThreads(a.visibleMessages())
+		a.inboxView.SetThreads(threads)
+		a.inboxView.SetFiltered(a.unreadOnly)
+		a.header.SetUnreadFilter(a.unreadOnly, len(threads))
 	}
 
 	return a, nil
 }
 
 func (a *App) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	// Mouse wheel scrolling for content views.
+	// Mouse wheel scrolling for content views — several steps per notch so the
+	// wheel moves faster than single-step keyboard navigation. In the inbox the
+	// wheel scrolls without a selection highlight (pointer-driven, no keyboard
+	// focus); other views just step their cursor/scroll.
 	if msg.Button == tea.MouseButtonWheelDown {
-		a.moveDown()
+		if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
+			a.inboxView.WheelScroll(wheelScrollStep)
+		} else {
+			for i := 0; i < wheelScrollStep; i++ {
+				a.moveDown()
+			}
+		}
 		return a, a.maybeLoadMore()
 	}
 	if msg.Button == tea.MouseButtonWheelUp {
-		a.moveUp()
+		if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
+			a.inboxView.WheelScroll(-wheelScrollStep)
+		} else {
+			for i := 0; i < wheelScrollStep; i++ {
+				a.moveUp()
+			}
+		}
 		return a, nil
 	}
 
@@ -1433,7 +1658,7 @@ func (a *App) handleLeftPress(x, y int) (tea.Model, tea.Cmd) {
 	}
 
 	// Sidebar click — skip when any overlay is active (sidebar is not rendered then).
-	overlayActive := a.comp.IsActive() || a.searchOverlay.IsActive() || a.folderPicker.IsActive() || a.newFolder.IsActive()
+	overlayActive := a.comp.IsActive() || a.searchOverlay.IsActive() || a.folderPicker.IsActive() || a.newFolder.IsActive() || a.commandPalette.IsActive()
 	if !overlayActive && a.showSidebar && x < sidebarRenderedWidth() {
 		contentY := y - headerH
 		acct, folder, ok := a.sidebar.HitTest(x, contentY)
@@ -1473,12 +1698,12 @@ func (a *App) handleLeftPress(x, y int) (tea.Model, tea.Cmd) {
 		if a.comp.IsActive() {
 			if a.comp.IsPrompting() {
 				if key := a.comp.HitTestDraftPrompt(x, contentY); key != "" {
-					a.comp.HandleKey(key)
+					a.comp.HandleKey(syntheticKeyMsg(key))
 				}
 			} else if field := a.comp.HitTestField(contentY); field >= 0 {
 				a.comp.SetFocus(field)
 			} else if key := a.comp.HitTestFooter(x, contentY); key != "" {
-				a.comp.HandleKey(key)
+				a.comp.HandleKey(syntheticKeyMsg(key))
 				if r := a.comp.Result(); r != nil {
 					cmd := a.handleComposerResult(r)
 					a.comp.ClearResult()
@@ -1599,6 +1824,8 @@ func syntheticKeyMsg(key string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyCtrlD}
 	case "ctrl+enter":
 		return tea.KeyMsg{Type: tea.KeyCtrlJ}
+	case "ctrl+s":
+		return tea.KeyMsg{Type: tea.KeyCtrlS}
 	}
 	if len([]rune(key)) == 1 {
 		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)}
@@ -1745,7 +1972,7 @@ func (a *App) openThread(t *data.Thread) tea.Cmd {
 		}
 	}
 	t.HasUnread = false
-	
+
 	// Fetch body for every message in the thread that doesn't have one yet.
 	// Use each message's own account and folder — threads can span folders (e.g. INBOX + Sent).
 	for _, msg := range t.Messages {
@@ -1766,7 +1993,6 @@ func (a *App) openThread(t *data.Thread) tea.Cmd {
 		}
 	}
 
-	
 	// Trigger suggested event extraction for every message in the thread
 	for _, msg := range t.Messages {
 		a.debugLog("loadSuggestedEvent for thread %s: msg.ID=%d", t.ID, msg.ID)
@@ -1814,28 +2040,45 @@ func (a *App) loadSuggestedEvent(msg *data.Message) tea.Cmd {
 	return nil
 }
 
+// visibleMessages returns loadedMessages filtered to unread-only when the
+// unread filter is active, otherwise returns the full slice.
+func (a *App) visibleMessages() []*data.Message {
+	if !a.unreadOnly {
+		return a.loadedMessages
+	}
+	out := make([]*data.Message, 0, len(a.loadedMessages))
+	for _, m := range a.loadedMessages {
+		if !m.HasFlag(data.FlagSeen) {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 func (a *App) fetchMessages() tea.Cmd {
 	a.loadedMessages = nil
 	a.fetchedCount = 0
 	a.loadingMore = false
 	a.allLoaded = false
+	a.unreadOnly = false
+	a.header.SetUnreadFilter(false, 0)
+	a.inboxView.SetFiltered(false)
 
 	client, ok := a.imapClients[a.activeAccount]
 	if !ok {
 		// Try loading from cache
 		threads, err := a.store.GetThreads(a.activeAccount, a.activeFolder)
 		if err == nil {
-			// Flatten to messages for BuildThreads
-			var msgs []*data.Message
 			for _, t := range threads {
-				msgs = append(msgs, t.Messages...)
+				a.loadedMessages = append(a.loadedMessages, t.Messages...)
 			}
-			built := thread.BuildThreads(msgs)
+			built := thread.BuildThreads(a.visibleMessages())
 			a.inboxView.SetThreads(built)
 		}
 		return nil
 	}
 	a.statusbar.SetLoading(true)
+	a.inboxView.SetLoading() // shown only while the list is empty
 	return tea.Batch(
 		client.FetchMessages(a.activeFolder, a.cfg.General.PageSize),
 		spinnerTick(),
@@ -2026,7 +2269,9 @@ func (a *App) quickMoveSingleMessage(msg *data.Message) tea.Cmd {
 				content = content[:maxChars]
 			}
 			if content != "" {
-				vecs, err := a.embClient.EmbedTexts(context.Background(), []string{content})
+				ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+				vecs, err := a.embClient.EmbedTexts(ctx, []string{content})
+				cancel()
 				if err == nil && len(vecs) > 0 {
 					vec = vecs[0]
 					norm = embeddings.VectorNorm(vec)
@@ -2195,79 +2440,36 @@ func (a *App) openQuickMenu(side quickMenuSide) tea.Cmd {
 	return nil
 }
 
-func (a *App) handleQuickMenuEnter() tea.Cmd {
-	if a.quickMenu == nil || a.quickMenu.side == quickMenuNone {
-		return nil
+// persistUI writes the current UI state (collapsed folders + flags) to disk,
+// preserving all fields rather than overwriting the file with a partial struct.
+func (a *App) persistUI() {
+	if a.persisted == nil {
+		a.persisted = &uiState{}
 	}
-	side := a.quickMenu.side
-	step := a.quickMenu.step
-	a.closeQuickMenu()
-	if side == quickMenuLeft {
-		switch step {
-		case 0:
-			return a.toggleRead()
-		case 1:
-			return a.quickMoveMessage()
-		}
-	}
-	if side == quickMenuRight {
-		switch step {
-		case 0:
-			return a.toggleStar()
-		case 1:
-			return a.deleteMessage()
-		}
-	}
-	return nil
+	a.persisted.CollapsedFolders = a.sidebar.CollapsedKeys()
+	_ = saveUIState(a.persisted)
 }
 
-func (a *App) deleteMessage() tea.Cmd {
-	if a.viewID != ViewInbox && a.viewID != ViewSmartFolder {
-		// Outside inbox — single-message mode (e.g. reader).
-		msg := a.currentMessage()
-		if msg == nil {
-			return nil
-		}
-		client, ok := a.imapClients[a.activeAccount]
-		if !ok {
-			return nil
-		}
-		trash := a.findTrashFolder(a.activeAccount)
-		if trash == "" {
-			a.flash("No Trash folder found", "err")
-			return nil
-		}
-		a.flash(fmt.Sprintf("%s Moving to Trash…", icons.Trash), "info")
-		return client.MoveToTrash(a.activeFolder, msg.UID, trash)
+// firstRunTipMsg triggers the one-time onboarding hint.
+type firstRunTipMsg struct{}
+
+// focusSidebar moves keyboard focus into the sidebar (bound to both Tab and \).
+func (a *App) focusSidebar() {
+	if !a.showSidebar {
+		return
 	}
-	threads := a.inboxView.SelectedThreads()
-	if len(threads) == 0 {
-		return nil
-	}
-	client, ok := a.imapClients[a.activeAccount]
-	if !ok {
-		return nil
-	}
-	trash := a.findTrashFolder(a.activeAccount)
-	if trash == "" {
-		a.flash("No Trash folder found", "err")
-		return nil
-	}
-	var cmds []tea.Cmd
-	for _, t := range threads {
-		msg := t.Latest()
-		if msg == nil {
-			continue
-		}
-		cmds = append(cmds, client.MoveToTrash(msg.FolderName, msg.UID, trash))
-	}
-	if len(cmds) == 1 {
-		a.flash(fmt.Sprintf("%s Moving to Trash…", icons.Trash), "info")
+	a.sidebarFocused = true
+	a.sidebar.SetFocused(true)
+	if a.viewID == ViewSmartFolder {
+		a.sidebar.FocusAt("", a.smartFolder)
 	} else {
-		a.flash(fmt.Sprintf("%s Moving %d to Trash…", icons.Trash, len(cmds)), "info")
+		a.sidebar.FocusAt(a.activeAccount, a.activeFolder)
 	}
-	a.inboxView.ClearSelection()
-	return tea.Batch(cmds...)
+}
+
+func (a *App) openCommandPalette() {
+	a.commandPalette.SetSize(a.width, a.height-a.headerHeight()-a.statusHeight())
+	a.commandPalette.Open()
 }
 
 func (a *App) openFolderPicker() {
@@ -2283,7 +2485,7 @@ func (a *App) openFolderPicker() {
 		return
 	}
 	a.folderPicker.SetSize(a.width, a.height-a.headerHeight()-a.statusHeight())
-	a.folderPicker.Open(folders, a.activeFolder)
+	a.folderPicker.Open(folders, a.activeFolder, a.sidebar.CollapsedFolders(a.activeAccount))
 }
 
 func (a *App) openNewFolderDialog() {
@@ -2302,336 +2504,6 @@ func (a *App) createFolder(name string) tea.Cmd {
 	}
 	a.flash(fmt.Sprintf("%s Creating folder '%s'…", icons.FolderNew, name), "info")
 	return client.CreateFolder(name)
-}
-
-func (a *App) moveMessageToFolder(destFolder string) tea.Cmd {
-	if a.viewID != ViewInbox && a.viewID != ViewSmartFolder {
-		// Outside inbox — single-message mode (e.g. reader).
-		msg := a.currentMessage()
-		if msg == nil {
-			return nil
-		}
-		client, ok := a.imapClients[a.activeAccount]
-		if !ok {
-			return nil
-		}
-		a.flash(fmt.Sprintf("%s Moving…", icons.FolderOpen), "info")
-		return client.MoveMessage(a.activeFolder, msg.UID, destFolder)
-	}
-	threads := a.inboxView.SelectedThreads()
-	if len(threads) == 0 {
-		return nil
-	}
-	client, ok := a.imapClients[a.activeAccount]
-	if !ok {
-		return nil
-	}
-	var cmds []tea.Cmd
-	for _, t := range threads {
-		msg := t.Latest()
-		if msg == nil {
-			continue
-		}
-		cmds = append(cmds, client.MoveMessage(msg.FolderName, msg.UID, destFolder))
-	}
-	if len(cmds) == 0 {
-		return nil
-	}
-	a.flash(fmt.Sprintf("%s Moving…", icons.FolderOpen), "info")
-	a.inboxView.ClearSelection()
-	return tea.Batch(cmds...)
-}
-
-// findTrashFolder returns the IMAP name of the Trash folder for the given account.
-// It looks for a folder with the \Trash attribute, then falls back to common names.
-func (a *App) findTrashFolder(account string) string {
-	for _, acct := range a.accounts {
-		if acct.Name != account {
-			continue
-		}
-		// First pass: look for \Trash attribute
-		for _, f := range acct.Folders {
-			for _, attr := range f.Attributes {
-				if attr == `\Trash` {
-					return f.Name
-				}
-			}
-		}
-		// Second pass: common names
-		for _, f := range acct.Folders {
-			switch f.DisplayName {
-			case "Trash", "Deleted", "Deleted Items", "Deleted Messages", "Bin":
-				return f.Name
-			}
-		}
-	}
-	return ""
-}
-
-// findSentFolder returns the IMAP name of the Sent folder for the given account.
-// It checks for the \Sent attribute first, then falls back to common names.
-func (a *App) findSentFolder(account string) string {
-	for _, acct := range a.accounts {
-		if acct.Name != account {
-			continue
-		}
-		for _, f := range acct.Folders {
-			for _, attr := range f.Attributes {
-				if attr == `\Sent` {
-					return f.Name
-				}
-			}
-		}
-		for _, f := range acct.Folders {
-			switch f.DisplayName {
-			case "Sent", "Sent Items", "Sent Mail", "Sent Messages":
-				return f.Name
-			}
-		}
-	}
-	return ""
-}
-
-// findDraftsFolder returns the IMAP name of the Drafts folder for the given account.
-// It checks for the \Drafts attribute first, then falls back to common names.
-func (a *App) findDraftsFolder(account string) string {
-	for _, acct := range a.accounts {
-		if acct.Name != account {
-			continue
-		}
-		for _, f := range acct.Folders {
-			for _, attr := range f.Attributes {
-				if attr == `\Drafts` || attr == `\Draft` {
-					return f.Name
-				}
-			}
-		}
-		for _, f := range acct.Folders {
-			switch f.DisplayName {
-			case "Drafts", "Draft":
-				return f.Name
-			}
-		}
-	}
-	return ""
-}
-
-func (a *App) archiveMessage() tea.Cmd {
-	a.flash(fmt.Sprintf("%s Archive not yet implemented", icons.Archive), "info")
-	return nil
-}
-
-func (a *App) doLocalSearch(q string) tea.Cmd {
-	return func() tea.Msg {
-		msgs, err := a.store.SearchLocalWithFilters(q)
-		if err != nil {
-			return imaplib.SearchResultMsg{Err: err}
-		}
-		items := make([]embeddings.TopKItem, 0, len(msgs))
-		for i, msg := range msgs {
-			if msg == nil {
-				continue
-			}
-			var score float32
-			if len(msgs) > 1 {
-				score = 1 - float32(i)/float32(len(msgs)-1)
-			} else {
-				score = 1
-			}
-			items = append(items, embeddings.TopKItem{Message: msg, Score: score})
-		}
-		if a.searchState != nil {
-			a.searchState.semItems = items
-		}
-		return imaplib.SearchResultMsg{Messages: msgs}
-	}
-}
-
-func (a *App) doStreamingSearch(q string, seq int) tea.Cmd {
-	return func() tea.Msg {
-		query := strings.TrimSpace(q)
-		if query == "" {
-			return embeddings.StreamSearchMsg{Seq: seq, Loading: false}
-		}
-
-		semItems := make([]embeddings.TopKItem, 0)
-		semMsgs, semErr := a.store.SearchLocalWithFilters(query)
-		if semErr == nil {
-			semItems = make([]embeddings.TopKItem, 0, len(semMsgs))
-			for i, msg := range semMsgs {
-				if msg == nil {
-					continue
-				}
-				var score float32
-				if len(semMsgs) > 1 {
-					score = 1 - float32(i)/float32(len(semMsgs)-1)
-				} else {
-					score = 1
-				}
-				semItems = append(semItems, embeddings.TopKItem{Message: msg, Score: score})
-			}
-		}
-
-		if a.embClient == nil {
-			if semErr != nil {
-				return embeddings.StreamSearchMsg{Seq: seq, Err: semErr}
-			}
-			return embeddings.StreamSearchMsg{Seq: seq, Results: mergeSearchHits(semItems, nil), Loading: false}
-		}
-		ctx := context.Background()
-		vecs, err := a.embClient.EmbedTexts(ctx, []string{query})
-		if err != nil || len(vecs) == 0 {
-			if semErr != nil {
-				return embeddings.StreamSearchMsg{Seq: seq, Err: err}
-			}
-			return embeddings.StreamSearchMsg{Seq: seq, Results: mergeSearchHits(semItems, nil), Loading: false}
-		}
-		queryVec := vecs[0]
-		queryNorm := embeddings.VectorNorm(queryVec)
-
-		maxCandidates := a.cfg.Embeddings.MaxCandidates
-		if maxCandidates <= 0 {
-			maxCandidates = 5000
-		}
-		msgs, vectors, norms, err := a.store.ListEmbeddingCandidates(a.activeAccount, a.cfg.Embeddings.Model, maxCandidates)
-		if err != nil || len(msgs) == 0 {
-			if semErr != nil {
-				return embeddings.StreamSearchMsg{Seq: seq, Err: err}
-			}
-			return embeddings.StreamSearchMsg{Seq: seq, Results: mergeSearchHits(semItems, nil), Loading: false}
-		}
-		kSim := a.cfg.Embeddings.TopSimilar
-		if kSim <= 0 {
-			kSim = 30
-		}
-		simItems := embeddings.TopK(msgs, vectors, norms, queryVec, queryNorm, kSim)
-		results := mergeSearchHits(semItems, simItems)
-		return embeddings.StreamSearchMsg{Seq: seq, Results: results, Loading: false}
-	}
-}
-
-func (a *App) searchStreamTick(seq int) tea.Cmd {
-	return func() tea.Msg {
-		if a.searchState == nil || a.searchState.seq != seq {
-			return nil
-		}
-		return a.searchStreamNext()()
-	}
-}
-
-func (a *App) searchStreamNext() tea.Cmd {
-	return func() tea.Msg {
-		state := a.searchState
-		if state == nil {
-			return nil
-		}
-		batch := a.cfg.Embeddings.StreamBatch
-		if batch <= 0 {
-			batch = 128
-		}
-		total := len(state.msgs)
-		start := state.nextIndex
-		if start >= total {
-			return embeddings.StreamSearchMsg{Seq: state.seq, Results: state.results, Loading: false}
-		}
-		end := start + batch
-		if end > total {
-			end = total
-		}
-		for i := start; i < end; i++ {
-			score := embeddings.CosineSimilarity(state.queryVec, state.queryNorm, state.vectors[i], state.norms[i])
-			state.simHeap.Add(state.msgs[i], score)
-		}
-		sem := state.semItems
-		sim := state.simHeap.ItemsSorted()
-		state.results = mergeSearchHits(sem, sim)
-		state.nextIndex = end
-		loading := end < total
-		return embeddings.StreamSearchMsg{Seq: state.seq, Results: state.results, Loading: loading}
-	}
-}
-
-func mergeSearchHits(sem []embeddings.TopKItem, sim []embeddings.TopKItem) []*embeddings.SearchHit {
-	denomSem := float32(0)
-	if len(sem) > 1 {
-		denomSem = float32(len(sem) - 1)
-	}
-	denomSim := float32(0)
-	if len(sim) > 1 {
-		denomSim = float32(len(sim) - 1)
-	}
-
-	byID := make(map[int64]*embeddings.SearchHit)
-	for i, item := range sem {
-		if item.Message == nil {
-			continue
-		}
-		score := float32(1)
-		if denomSem > 0 {
-			score = 1 - float32(i)/denomSem
-		}
-		entry, ok := byID[item.Message.ID]
-		if !ok {
-			entry = &embeddings.SearchHit{Message: item.Message}
-			byID[item.Message.ID] = entry
-		}
-		entry.Semantic = true
-		entry.Score += score
-	}
-	for i, item := range sim {
-		if item.Message == nil {
-			continue
-		}
-		score := float32(1)
-		if denomSim > 0 {
-			score = 1 - float32(i)/denomSim
-		}
-		entry, ok := byID[item.Message.ID]
-		if !ok {
-			entry = &embeddings.SearchHit{Message: item.Message}
-			byID[item.Message.ID] = entry
-		}
-		entry.Similar = true
-		entry.Score += score
-	}
-
-	merged := make([]*embeddings.SearchHit, 0, len(byID))
-	for _, entry := range byID {
-		merged = append(merged, entry)
-	}
-	sort.Slice(merged, func(i, j int) bool {
-		if merged[i].Score == merged[j].Score {
-			return merged[i].Message.Date.After(merged[j].Message.Date)
-		}
-		return merged[i].Score > merged[j].Score
-	})
-
-	withBoth := merged[:0]
-	onlySem := make([]*embeddings.SearchHit, 0, len(merged))
-	onlySim := make([]*embeddings.SearchHit, 0, len(merged))
-	for _, entry := range merged {
-		if entry.Semantic && entry.Similar {
-			withBoth = append(withBoth, entry)
-		} else if entry.Semantic {
-			onlySem = append(onlySem, entry)
-		} else if entry.Similar {
-			onlySim = append(onlySim, entry)
-		}
-	}
-	return append(append(withBoth, onlySem...), onlySim...)
-}
-
-func convertSearchResults(results []*embeddings.SearchHit) []*SearchResult {
-	converted := make([]*SearchResult, 0, len(results))
-	for _, res := range results {
-		converted = append(converted, &SearchResult{
-			Message:  res.Message,
-			Score:    res.Score,
-			Semantic: res.Semantic,
-			Similar:  res.Similar,
-		})
-	}
-	return converted
 }
 
 func (a *App) findMessageByID(id int64) *data.Message {
@@ -2828,11 +2700,14 @@ func writeAttachmentTemp(att data.Attachment) (string, error) {
 	return f.Name(), nil
 }
 
-
 // --- layout ---
 
 const sidebarWidth = 26 // content width
 const sidebarBorderWidth = 1
+
+// wheelScrollStep is how many navigation steps one mouse-wheel notch moves, so
+// the wheel scrolls faster than single-step keyboard navigation.
+const wheelScrollStep = 3
 
 func sidebarRenderedWidth() int {
 	return sidebarWidth + sidebarBorderWidth
@@ -2847,6 +2722,12 @@ func (a *App) currentSbContext() string {
 	switch a.viewID {
 	case ViewReader:
 		ctx = "reader"
+		a.statusbar.SetReaderState(
+			a.readerView.HasAttachments(),
+			a.readerView.AttachFocusActive(),
+			a.readerView.HasFocusableEvent(),
+			a.readerView.CanJumpMessages(),
+		)
 	case ViewFolder:
 		ctx = "folder"
 	case ViewSmartFolder:
@@ -2863,6 +2744,9 @@ func (a *App) currentSbContext() string {
 	}
 	if a.newFolder.IsActive() {
 		ctx = "new-folder"
+	}
+	if a.commandPalette.IsActive() {
+		ctx = "palette"
 	}
 	if a.sidebarFocused {
 		ctx = "sidebar"
@@ -2942,11 +2826,15 @@ func (a *App) View() string {
 	if a.comp.IsActive() {
 		mainContent = a.comp.View()
 		output := lipgloss.JoinVertical(lipgloss.Left, header, mainContent, a.statusbar.View("composer"))
-		lines := a.updateLineBuffers(output)
-		if a.drag != nil && a.drag.isDrag && a.drag.canCopy {
-			output = applySelectionHighlight(lines,
-				a.drag.startX, a.drag.startY, a.drag.endX, a.drag.endY,
-				a.drag.zoneX0, a.drag.zoneY0, a.drag.zoneX1, a.drag.zoneY1)
+		// Line buffers are only consumed by drag-to-copy, so build them only while
+		// a drag is in progress instead of ANSI-stripping the whole screen every frame.
+		if a.drag != nil {
+			lines := a.updateLineBuffers(output)
+			if a.drag.isDrag && a.drag.canCopy {
+				output = applySelectionHighlight(lines,
+					a.drag.startX, a.drag.startY, a.drag.endX, a.drag.endY,
+					a.drag.zoneX0, a.drag.zoneY0, a.drag.zoneX1, a.drag.zoneY1)
+			}
 		}
 		return output
 	}
@@ -2984,22 +2872,34 @@ func (a *App) View() string {
 	if a.newFolder.IsActive() {
 		mainContent = a.newFolder.View()
 	}
+	if a.commandPalette.IsActive() {
+		mainContent = a.commandPalette.View()
+	}
 	if a.showHelp {
 		mainContent = a.helpOverlay.View(a.width, contentH)
 	}
 
+	if a.viewID == ViewInbox || a.viewID == ViewSmartFolder {
+		a.statusbar.SetSelectionCount(a.inboxView.SelectionCount())
+	} else {
+		a.statusbar.SetSelectionCount(0)
+	}
 	statusbar := a.statusbar.View(a.currentSbContext())
 
 	output := lipgloss.JoinVertical(lipgloss.Left, header, mainContent, statusbar)
 
-	// Update line buffers for drag-selection text extraction.
-	lines := a.updateLineBuffers(output)
-
-	// Apply visual selection highlight during an active drag (reader only).
-	if a.drag != nil && a.drag.isDrag && a.drag.canCopy {
-		output = applySelectionHighlight(lines,
-			a.drag.startX, a.drag.startY, a.drag.endX, a.drag.endY,
-			a.drag.zoneX0, a.drag.zoneY0, a.drag.zoneX1, a.drag.zoneY1)
+	// Line buffers feed drag-selection text extraction, which can only run while a
+	// drag is active. Building them every frame would ANSI-strip the entire screen
+	// on each keystroke, scroll notch, and idle timer tick for nothing — so only
+	// refresh them when a drag is in progress.
+	if a.drag != nil {
+		lines := a.updateLineBuffers(output)
+		// Apply visual selection highlight during an active drag (reader only).
+		if a.drag.isDrag && a.drag.canCopy {
+			output = applySelectionHighlight(lines,
+				a.drag.startX, a.drag.startY, a.drag.endX, a.drag.endY,
+				a.drag.zoneX0, a.drag.zoneY0, a.drag.zoneX1, a.drag.zoneY1)
+		}
 	}
 
 	return output
@@ -3013,9 +2913,11 @@ func (a *App) maybeLoadMore() tea.Cmd {
 	if !ok {
 		return nil
 	}
+	// Trigger off the bottom of the viewport rather than the cursor, so wheel
+	// scrolling (offset-driven, cursor parked mid-view) prefetches just like
+	// keyboard navigation does as the cursor nears the end.
 	n := a.inboxView.Len()
-	cursor := a.inboxView.CursorPos()
-	if n == 0 || cursor < n-10 {
+	if n == 0 || a.inboxView.LastVisibleIndex() < n-10 {
 		return nil
 	}
 	a.loadingMore = true
@@ -3028,12 +2930,12 @@ func (a *App) maybeLoadMore() tea.Cmd {
 
 // --- utility ---
 
+// flash sets a temporary status message. The auto-clear timer is scheduled
+// centrally in Update, so callers may use or discard the (nil) return freely.
 func (a *App) flash(msg, kind string) tea.Cmd {
 	a.statusbar.SetMessage(msg, kind)
 	a.updateLayout() // flash message adds a line; recalculate content height
-	return tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
-		return clearStatusMsg{}
-	})
+	return nil
 }
 
 // updateLineBuffers splits the rendered output into per-line buffers used for

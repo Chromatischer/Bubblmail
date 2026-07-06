@@ -50,6 +50,7 @@ type Composer struct {
 	filePicker   *filePicker
 	anonymize    bool
 	attachCursor int // selected index in attachment list when focused==4
+	errMessage   string
 
 	// Draft persistence: stash when closing with content, prompt on reopen.
 	savedDraft *savedDraftState
@@ -79,6 +80,7 @@ func (c *Composer) openWith(from data.Address, fields []*Field, mode string, foc
 	c.attachments = nil
 	c.anonymize = false
 	c.attachCursor = 0
+	c.errMessage = ""
 
 	if c.savedDraft != nil {
 		// Stash the intended fresh fields so "Discard" can load them.
@@ -175,10 +177,11 @@ func (c *Composer) SetSize(w, h int) {
 }
 
 // HandleKey processes a key press.
-func (c *Composer) HandleKey(key string) {
+func (c *Composer) HandleKey(msg tea.KeyMsg) {
 	if !c.active {
 		return
 	}
+	key := msg.String()
 
 	// Continue/Discard prompt intercepts all keys.
 	if c.prompting {
@@ -295,6 +298,8 @@ func (c *Composer) HandleKey(key string) {
 		}
 	case "backspace", "ctrl+h":
 		f.backspace()
+	case "delete":
+		f.deleteForward()
 	case "left":
 		f.cursorLeft()
 	case "right":
@@ -304,13 +309,29 @@ func (c *Composer) HandleKey(key string) {
 	case "end", "ctrl+e":
 		f.cursorEnd()
 	default:
-		if len(key) == 1 && key[0] >= 32 {
-			// Trigger file picker when @ is typed in the body field.
-			if key == "@" && c.focused == 3 {
-				c.filePicker.activate()
-				return
-			}
-			f.insert(key)
+		// Literal text input: single chars, multi-byte runes (ä, €, …), and
+		// bracketed pastes all arrive as KeyRunes/KeySpace. Use msg.Runes
+		// rather than the string form so multi-byte chars aren't dropped by a
+		// byte-length check and pastes aren't mangled by the "[...]" wrapper
+		// that KeyMsg.String() adds. Skip Alt combos — those are commands.
+		if (msg.Type != tea.KeyRunes && msg.Type != tea.KeySpace) || msg.Alt {
+			break
+		}
+		text := string(msg.Runes)
+		// Trigger file picker when @ is typed in the body field.
+		if text == "@" && c.focused == 3 {
+			c.filePicker.activate()
+			return
+		}
+		// Sanitise pasted control characters. Single-line fields can't hold
+		// newlines/tabs, so flatten them to spaces.
+		text = strings.ReplaceAll(text, "\r", "")
+		if f.Kind != FieldTextArea {
+			text = strings.ReplaceAll(text, "\n", " ")
+			text = strings.ReplaceAll(text, "\t", " ")
+		}
+		if text != "" {
+			f.insert(text)
 		}
 	}
 	c.ensureBodyVisible()
@@ -321,7 +342,8 @@ func (c *Composer) addAttachment(path string, isDir bool) {
 	if isDir {
 		zipPath, err := zipDir(path)
 		if err != nil {
-			return // silently ignore; could surface as status msg
+			c.errMessage = "Attachment failed: " + err.Error()
+			return
 		}
 		c.attachments = append(c.attachments, Attachment{
 			Path:        zipPath,
@@ -330,11 +352,13 @@ func (c *Composer) addAttachment(path string, isDir bool) {
 			Compressed:  true,
 			TempFile:    true,
 		})
+		c.errMessage = ""
 	} else {
 		c.attachments = append(c.attachments, Attachment{
 			Path:        path,
 			DisplayName: filepath.Base(path),
 		})
+		c.errMessage = ""
 	}
 }
 
@@ -348,6 +372,7 @@ func (c *Composer) removeAttachment(idx int) {
 		_ = os.Remove(a.Path)
 	}
 	c.attachments = append(c.attachments[:idx], c.attachments[idx+1:]...)
+	c.errMessage = ""
 	if c.attachCursor >= len(c.attachments) && c.attachCursor > 0 {
 		c.attachCursor--
 	}
@@ -365,8 +390,9 @@ func (c *Composer) IsPrompting() bool { return c.prompting }
 // content-area to screen coordinates.
 //
 // Geometry (all in screen coords, y=0 is terminal top):
-//   x: skip left-border(1) + left-pad(2) + label(10) + sep(3) = 16 cols from box left
-//   y: border(1)+pad(1)+title(1)+from(1)+divider(1)+3fields(3)+sectionDiv(1) = 9 rows down
+//
+//	x: skip left-border(1) + left-pad(2) + label(10) + sep(3) = 16 cols from box left
+//	y: border(1)+pad(1)+title(1)+from(1)+divider(1)+3fields(3)+sectionDiv(1) = 9 rows down
 func (c *Composer) BodyDragZone(headerH int) (x0, y0, x1, y1 int) {
 	if !c.active || c.prompting {
 		return
@@ -938,6 +964,15 @@ func (c *Composer) View() string {
 
 	// ── Footer ───────────────────────────────────────────────────────────────
 	rows = append(rows, divider)
+
+	if c.errMessage != "" {
+		errLine := lipgloss.NewStyle().
+			Foreground(theme.Error).
+			Background(theme.Surface).
+			Width(innerW).
+			Render(icons.Error + " " + c.errMessage)
+		rows = append(rows, errLine)
+	}
 
 	hintIconSt := lipgloss.NewStyle().Foreground(theme.Accent).Background(theme.Surface)
 	hintDescSt := lipgloss.NewStyle().Foreground(theme.TextMuted).Background(theme.Surface)
