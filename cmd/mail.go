@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -11,6 +12,7 @@ import (
 
 	"github.com/bubblmail/bubblmail/data"
 	imaplib "github.com/bubblmail/bubblmail/imap"
+	smtplib "github.com/bubblmail/bubblmail/smtp"
 	"github.com/bubblmail/bubblmail/util"
 )
 
@@ -20,11 +22,13 @@ func init() {
 	mailCmd.AddCommand(mailMoveCmd)
 	mailCmd.AddCommand(mailReadCmd)
 	mailCmd.AddCommand(mailUnreadCmd)
+	mailCmd.AddCommand(mailSendCmd)
 
 	addMailTargetFlags(mailViewCmd)
 	addMailTargetFlags(mailMoveCmd)
 	addMailReadFlags(mailReadCmd)
 	addMailReadFlags(mailUnreadCmd)
+	addMailSendFlags(mailSendCmd)
 }
 
 var mailCmd = &cobra.Command{
@@ -211,6 +215,40 @@ var mailUnreadCmd = &cobra.Command{
 	},
 }
 
+var mailSendCmd = &cobra.Command{
+	Use:   "send",
+	Short: "Send a message",
+	Args:  cobra.NoArgs,
+	Example: strings.Join([]string{
+		`bubblmail mail send --account work --to "Alice <alice@example.com>" --subject "Hello" --body "Hi Alice"`,
+		`bubblmail mail send --account work --to alice@example.com --cc bob@example.com --subject "Report" --body-file report.txt --attach report.pdf`,
+	}, "\n"),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		account, draft, err := readMailSendDraft(cmd)
+		if err != nil {
+			return err
+		}
+		cfg, store, err := loadConfigAndStore()
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		acct, err := selectAccount(cfg, account)
+		if err != nil {
+			return err
+		}
+		draft.From = data.Address{Address: acct.Username}
+		if err := cmd.Context().Err(); err != nil {
+			return err
+		}
+		if err := smtplib.Send(acct, draft); err != nil {
+			return fmt.Errorf("sending message: %w", err)
+		}
+		fmt.Fprintf(os.Stdout, "Sent to %s (subject: %s)\n", smtplib.FormatRecipientList(messageRecipients(draft)), draft.Subject)
+		return nil
+	},
+}
+
 type mailFlagTarget struct {
 	uid   uint32
 	flags []data.Flag
@@ -366,6 +404,16 @@ func addMailReadFlags(cmd *cobra.Command) {
 	cmd.Flags().Bool("all", false, "Mark all messages currently not in the target state")
 }
 
+func addMailSendFlags(cmd *cobra.Command) {
+	cmd.Flags().String("account", "", "Account name")
+	cmd.Flags().StringArray("to", nil, "Recipient address; repeat or separate multiple addresses with commas")
+	cmd.Flags().StringArray("cc", nil, "Cc address; repeat or separate multiple addresses with commas")
+	cmd.Flags().String("subject", "", "Message subject")
+	cmd.Flags().String("body", "", "Message body")
+	cmd.Flags().String("body-file", "", "Path to a file containing the message body")
+	cmd.Flags().StringArray("attach", nil, "Attachment path; repeat or separate multiple paths with commas")
+}
+
 func readMailTarget(cmd *cobra.Command) (string, string, error) {
 	account, _ := cmd.Flags().GetString("account")
 	account = strings.TrimSpace(account)
@@ -378,6 +426,92 @@ func readMailTarget(cmd *cobra.Command) (string, string, error) {
 		return "", "", fmt.Errorf("mailbox: %w", err)
 	}
 	return account, mailbox, nil
+}
+
+func readMailSendDraft(cmd *cobra.Command) (string, *smtplib.ComposedMessage, error) {
+	account, _ := cmd.Flags().GetString("account")
+	account = strings.TrimSpace(account)
+	if account == "" {
+		return "", nil, errors.New("account is required")
+	}
+
+	toValues, _ := cmd.Flags().GetStringArray("to")
+	to, err := smtplib.ParseAddresses(toValues)
+	if err != nil {
+		return "", nil, fmt.Errorf("to: %w", err)
+	}
+	if len(to) == 0 {
+		return "", nil, errors.New("at least one --to is required")
+	}
+	ccValues, _ := cmd.Flags().GetStringArray("cc")
+	cc, err := smtplib.ParseAddresses(ccValues)
+	if err != nil {
+		return "", nil, fmt.Errorf("cc: %w", err)
+	}
+
+	subject, _ := cmd.Flags().GetString("subject")
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		return "", nil, errors.New("subject is required")
+	}
+
+	bodySet := cmd.Flags().Changed("body")
+	bodyFileSet := cmd.Flags().Changed("body-file")
+	if bodySet == bodyFileSet {
+		return "", nil, errors.New("exactly one of --body or --body-file is required")
+	}
+	body, _ := cmd.Flags().GetString("body")
+	if bodyFileSet {
+		bodyFile, _ := cmd.Flags().GetString("body-file")
+		bodyFile = strings.TrimSpace(bodyFile)
+		if bodyFile == "" {
+			return "", nil, errors.New("body-file is required")
+		}
+		bodyBytes, err := os.ReadFile(bodyFile)
+		if err != nil {
+			return "", nil, fmt.Errorf("reading body file: %w", err)
+		}
+		body = string(bodyBytes)
+	}
+
+	attachValues, _ := cmd.Flags().GetStringArray("attach")
+	attachments := make([]smtplib.Attachment, 0, len(attachValues))
+	for _, path := range splitCommaValues(attachValues) {
+		attachments = append(attachments, smtplib.Attachment{
+			Path:     path,
+			Filename: filepath.Base(path),
+		})
+	}
+
+	return account, &smtplib.ComposedMessage{
+		To:          to,
+		CC:          cc,
+		Subject:     subject,
+		Body:        body,
+		Attachments: attachments,
+	}, nil
+}
+
+func splitCommaValues(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+	}
+	return out
+}
+
+func messageRecipients(draft *smtplib.ComposedMessage) []data.Address {
+	if draft == nil {
+		return nil
+	}
+	out := make([]data.Address, 0, len(draft.To)+len(draft.CC))
+	out = append(out, draft.To...)
+	out = append(out, draft.CC...)
+	return out
 }
 
 func parseUID(raw string) (uint32, error) {

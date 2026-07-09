@@ -3,13 +3,17 @@
 // same cache and IMAP layers the TUI uses.
 //
 // The server speaks JSON-RPC over stdio; stdout is reserved for the protocol,
-// so nothing here may print to stdout. Read tools are served entirely from the
-// local SQLite cache and are cheap; write tools connect to IMAP on demand and
-// mirror the change back into the cache, matching the CLI's behaviour.
+// so nothing here may print to stdout. Most read tools are served from the
+// local SQLite cache and are cheap; attachment reads may connect to IMAP because
+// attachment blobs are lazy and not stored in SQLite. Write tools connect to
+// IMAP on demand and mirror the change back into the cache, matching the CLI's
+// behaviour.
 package mcpserver
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -28,16 +32,22 @@ const (
 
 // Server wires the mailbox cache and account config into MCP tool handlers.
 type Server struct {
-	cfg      *config.Config
-	store    *cache.Store
-	readOnly bool
+	cfg       *config.Config
+	store     *cache.Store
+	readOnly  bool
+	cacheDir  string
+	fetchBody bodyFetcher
 }
 
 // New creates a Server backed by the given config and cache store. The store is
 // owned by the caller and must outlive the server. When readOnly is true the
 // mutating tools are not registered, so the server can only read the mailbox.
 func New(cfg *config.Config, store *cache.Store, readOnly bool) *Server {
-	return &Server{cfg: cfg, store: store, readOnly: readOnly}
+	cacheDir := ""
+	if cfg != nil {
+		cacheDir = strings.TrimSpace(cfg.Cache.Dir)
+	}
+	return &Server{cfg: cfg, store: store, readOnly: readOnly, cacheDir: cacheDir}
 }
 
 // Serve builds the MCP server and serves it over stdio until stdin closes. Pass
@@ -50,12 +60,13 @@ func Serve(cfg *config.Config, store *cache.Store, readOnly bool) error {
 // mode the mutating tools are omitted.
 func (s *Server) MCPServer() *server.MCPServer {
 	instructions := "Bubblmail mailbox access. Read tools serve from a local cache and are " +
-		"safe to call freely. Write tools (move_message, move_messages, " +
-		"set_read, set_starred, add_tag, remove_tag) change the real mailbox over IMAP; confirm intent " +
-		"with the user before calling them."
+		"safe to call freely, except attachment reads may fetch attachment blobs over IMAP. Write tools (move_message, move_messages, " +
+		"set_read, set_starred, add_tag, remove_tag) change the real mailbox over IMAP; send_message sends " +
+		"real email over SMTP. Confirm intent with the user before calling any write tool, and only call " +
+		"send_message after the user has explicitly confirmed the exact recipients, subject, and body."
 	if s.readOnly {
 		instructions = "Bubblmail mailbox access, read-only. All tools serve from a local " +
-			"cache and are safe to call freely; no tool can change the mailbox."
+			"cache except attachment reads, which may fetch attachment blobs over IMAP; no tool can change the mailbox."
 	}
 	srv := server.NewMCPServer(
 		serverName, serverVersion,
@@ -116,6 +127,22 @@ func (s *Server) registerReadTools(srv *server.MCPServer) {
 		mcp.WithNumber("uid", mcp.Required(), mcp.Description("Message UID.")),
 	), s.handleReadMessage)
 
+	srv.AddTool(mcp.NewTool("list_attachments",
+		mcp.WithDescription("List attachment metadata for a message without returning the message body. Fetches from IMAP because attachment metadata is lazy."),
+		mcp.WithString("account", mcp.Required(), mcp.Description("Account name.")),
+		mcp.WithString("folder", mcp.Required(), mcp.Description("Folder name.")),
+		mcp.WithNumber("uid", mcp.Required(), mcp.Description("Message UID.")),
+	), s.handleListAttachments)
+
+	srv.AddTool(mcp.NewTool("read_attachment",
+		mcp.WithDescription("Fetch one message attachment, cache it under the Bubblmail cache directory, and return its local path."),
+		mcp.WithString("account", mcp.Required(), mcp.Description("Account name.")),
+		mcp.WithString("folder", mcp.Required(), mcp.Description("Folder name.")),
+		mcp.WithNumber("uid", mcp.Required(), mcp.Description("Message UID.")),
+		mcp.WithNumber("index", mcp.Description("Zero-based attachment index. Provide either index or filename.")),
+		mcp.WithString("filename", mcp.Description("Attachment filename. Provide either filename or index.")),
+	), s.handleReadAttachment)
+
 	srv.AddTool(mcp.NewTool("list_categories",
 		mcp.WithDescription("Show smart-folder category counts for an account."),
 		mcp.WithString("account", mcp.Required(), mcp.Description("Account name.")),
@@ -129,6 +156,20 @@ func (s *Server) registerReadTools(srv *server.MCPServer) {
 }
 
 func (s *Server) registerWriteTools(srv *server.MCPServer) {
+	srv.AddTool(mcp.NewTool("send_message",
+		mcp.WithDescription("Sends a real email over SMTP from the selected account. This may be the user's real personal mail account or a real company's mail account. Sending is irreversible and externally visible; the message cannot be unsent. Proceed with caution: only send after the user has explicitly confirmed the exact recipients, subject, and body. Do not invent or guess recipient addresses."),
+		mcp.WithReadOnlyHintAnnotation(false),
+		mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithIdempotentHintAnnotation(false),
+		mcp.WithOpenWorldHintAnnotation(true),
+		mcp.WithString("account", mcp.Required(), mcp.Description("Account name.")),
+		mcp.WithArray("to", mcp.Required(), mcp.MinItems(1), mcp.WithStringItems(mcp.MinLength(1)), mcp.Description("Recipient addresses.")),
+		mcp.WithArray("cc", mcp.WithStringItems(mcp.MinLength(1)), mcp.Description("Cc recipient addresses.")),
+		mcp.WithString("subject", mcp.Required(), mcp.MinLength(1), mcp.Description("Message subject.")),
+		mcp.WithString("body", mcp.Required(), mcp.MinLength(1), mcp.Description("Plain text message body.")),
+		mcp.WithArray("attachments", mcp.WithStringItems(mcp.MinLength(1)), mcp.Description("Attachment file paths.")),
+	), s.handleSendMessage)
+
 	srv.AddTool(mcp.NewTool("move_message",
 		mcp.WithDescription("Move a message to another folder over IMAP and update the cache."),
 		mcp.WithString("account", mcp.Required(), mcp.Description("Account name.")),
@@ -211,4 +252,18 @@ func (s *Server) connect(name string) (*imaplib.Client, error) {
 		return nil, err
 	}
 	return imaplib.Connect(acct)
+}
+
+func (s *Server) cacheDirPath() (string, error) {
+	if strings.TrimSpace(s.cacheDir) != "" {
+		return filepath.Abs(s.cacheDir)
+	}
+	if s.cfg != nil && strings.TrimSpace(s.cfg.Cache.Dir) != "" {
+		return filepath.Abs(s.cfg.Cache.Dir)
+	}
+	userCache, err := os.UserCacheDir()
+	if err != nil {
+		return "", fmt.Errorf("finding cache dir: %w", err)
+	}
+	return filepath.Join(userCache, "bubblmail"), nil
 }

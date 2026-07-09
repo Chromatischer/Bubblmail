@@ -2,7 +2,10 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -10,42 +13,73 @@ import (
 	"github.com/bubblmail/bubblmail/data"
 	"github.com/bubblmail/bubblmail/embeddings"
 	imaplib "github.com/bubblmail/bubblmail/imap"
+	smtplib "github.com/bubblmail/bubblmail/smtp"
+	"github.com/bubblmail/bubblmail/util"
 )
+
+type bodyFetcher func(account, folder string, uid uint32) (string, string, []data.Attachment, error)
+
+type attachmentJSON struct {
+	Index       int    `json:"index"`
+	Filename    string `json:"filename"`
+	ContentType string `json:"content_type"`
+	Size        int    `json:"size"`
+	Cached      bool   `json:"cached"`
+	LocalPath   string `json:"local_path,omitempty"`
+}
+
+type attachmentListResult struct {
+	Attachments []attachmentJSON `json:"attachments"`
+	Count       int              `json:"count"`
+}
+
+type cachedAttachmentMeta struct {
+	Account     string `json:"account"`
+	Folder      string `json:"folder"`
+	UID         uint32 `json:"uid"`
+	Index       int    `json:"index"`
+	Filename    string `json:"filename"`
+	ContentType string `json:"content_type"`
+	Size        int    `json:"size"`
+	LocalPath   string `json:"local_path"`
+}
 
 // messageJSON is the wire shape for a message summary returned by tools.
 type messageJSON struct {
-	Account  string   `json:"account"`
-	Folder   string   `json:"folder"`
-	UID      uint32   `json:"uid"`
-	ID       int64    `json:"id"`
-	Subject  string   `json:"subject"`
-	From     []string `json:"from"`
-	To       []string `json:"to,omitempty"`
-	Date     string   `json:"date"`
-	Snippet  string   `json:"snippet,omitempty"`
-	Read     bool     `json:"read"`
-	Starred  bool     `json:"starred"`
-	Tags     []string `json:"tags,omitempty"`
-	ThreadID string   `json:"thread_id,omitempty"`
-	Score    float32  `json:"score,omitempty"`
-	Body     string   `json:"body,omitempty"`
+	Account     string           `json:"account"`
+	Folder      string           `json:"folder"`
+	UID         uint32           `json:"uid"`
+	ID          int64            `json:"id"`
+	Subject     string           `json:"subject"`
+	From        []string         `json:"from"`
+	To          []string         `json:"to,omitempty"`
+	Date        string           `json:"date"`
+	Snippet     string           `json:"snippet,omitempty"`
+	Read        bool             `json:"read"`
+	Starred     bool             `json:"starred"`
+	Tags        []string         `json:"tags,omitempty"`
+	ThreadID    string           `json:"thread_id,omitempty"`
+	Score       float32          `json:"score,omitempty"`
+	Body        string           `json:"body,omitempty"`
+	Attachments []attachmentJSON `json:"attachments"`
 }
 
 func toMessageJSON(m *data.Message) messageJSON {
 	return messageJSON{
-		Account:  m.AccountName,
-		Folder:   m.FolderName,
-		UID:      m.UID,
-		ID:       m.ID,
-		Subject:  m.Subject,
-		From:     addressStrings(m.From),
-		To:       addressStrings(m.To),
-		Date:     m.Date.Format("2006-01-02 15:04"),
-		Snippet:  m.Snippet,
-		Read:     m.IsRead(),
-		Starred:  m.IsStarred(),
-		Tags:     m.Tags,
-		ThreadID: m.ThreadID,
+		Account:     m.AccountName,
+		Folder:      m.FolderName,
+		UID:         m.UID,
+		ID:          m.ID,
+		Subject:     m.Subject,
+		From:        addressStrings(m.From),
+		To:          addressStrings(m.To),
+		Date:        m.Date.Format("2006-01-02 15:04"),
+		Snippet:     m.Snippet,
+		Read:        m.IsRead(),
+		Starred:     m.IsStarred(),
+		Tags:        m.Tags,
+		ThreadID:    m.ThreadID,
+		Attachments: []attachmentJSON{},
 	}
 }
 
@@ -260,22 +294,17 @@ func (s *Server) handleReadMessage(_ context.Context, req mcp.CallToolRequest) (
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("reading cached body", err), nil
 	}
+	var attachments []data.Attachment
+	fetched := false
 	if bodyText == "" && bodyHTML == "" {
-		client, err := s.connect(account)
-		if err != nil {
-			return mcp.NewToolResultErrorFromErr("connecting", err), nil
-		}
-		bodyText, bodyHTML, _, err = client.FetchBodySync(folder, uid)
-		closeErr := client.Close()
+		bodyText, bodyHTML, attachments, err = s.fetchMessageBody(account, folder, uid)
 		if err != nil {
 			return mcp.NewToolResultErrorFromErr("fetching body", err), nil
-		}
-		if closeErr != nil {
-			return mcp.NewToolResultErrorFromErr("closing connection", closeErr), nil
 		}
 		if err := s.store.UpsertBody(msg.ID, bodyText, bodyHTML); err != nil {
 			return mcp.NewToolResultErrorFromErr("caching body", err), nil
 		}
+		fetched = true
 	}
 	body := bodyText
 	if strings.TrimSpace(body) == "" {
@@ -283,7 +312,251 @@ func (s *Server) handleReadMessage(_ context.Context, req mcp.CallToolRequest) (
 	}
 	mj := toMessageJSON(msg)
 	mj.Body = body
+	if fetched {
+		mj.Attachments = s.attachmentsJSON(account, folder, uid, attachments)
+	} else {
+		// Attachment metadata/blobs are not persisted in SQLite. On the cached
+		// body fast path, avoid an IMAP fetch just to prove there are no
+		// attachments; only report attachments already materialized in the MCP
+		// attachment cache by read_attachment.
+		cached, err := s.cachedAttachmentsJSON(account, folder, uid)
+		if err != nil {
+			return mcp.NewToolResultErrorFromErr("reading cached attachments", err), nil
+		}
+		mj.Attachments = cached
+	}
 	return mcp.NewToolResultJSON(mj)
+}
+
+func (s *Server) handleListAttachments(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	account, folder, uid, errRes := s.messageTarget(req)
+	if errRes != nil {
+		return errRes, nil
+	}
+	if _, err := s.store.GetMessageByUID(account, folder, uid); err != nil {
+		return mcp.NewToolResultErrorFromErr("finding message", err), nil
+	}
+	// IMAP FetchBodySync is currently the only cheap-enough source of
+	// attachment metadata; SQLite deliberately stores only body text/HTML.
+	// This tool discards the body so clients can enumerate attachments without
+	// receiving message body content in the MCP response.
+	_, _, attachments, err := s.fetchMessageBody(account, folder, uid)
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("fetching attachments", err), nil
+	}
+	out := s.attachmentsJSON(account, folder, uid, attachments)
+	return mcp.NewToolResultJSON(attachmentListResult{Attachments: out, Count: len(out)})
+}
+
+func (s *Server) handleReadAttachment(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	account, folder, uid, errRes := s.messageTarget(req)
+	if errRes != nil {
+		return errRes, nil
+	}
+	if _, err := s.store.GetMessageByUID(account, folder, uid); err != nil {
+		return mcp.NewToolResultErrorFromErr("finding message", err), nil
+	}
+	index := req.GetInt("index", -1)
+	filename := strings.TrimSpace(req.GetString("filename", ""))
+	if index >= 0 && filename != "" {
+		return mcp.NewToolResultError("provide either index or filename, not both"), nil
+	}
+	if index < 0 && filename == "" {
+		return mcp.NewToolResultError("index or filename is required"), nil
+	}
+
+	_, _, attachments, err := s.fetchMessageBody(account, folder, uid)
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("fetching attachment", err), nil
+	}
+	if filename != "" {
+		index, err = attachmentIndexByFilename(attachments, filename)
+		if err != nil {
+			return mcp.NewToolResultErrorFromErr("selecting attachment", err), nil
+		}
+	}
+	if index < 0 || index >= len(attachments) {
+		return mcp.NewToolResultError(fmt.Sprintf("attachment index %d out of range (count %d)", index, len(attachments))), nil
+	}
+
+	att := attachments[index]
+	path, err := s.cacheAttachment(account, folder, uid, index, att)
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("caching attachment", err), nil
+	}
+	out := attachmentJSON{
+		Index:       index,
+		Filename:    att.Filename,
+		ContentType: att.ContentType,
+		Size:        len(att.Data),
+		Cached:      true,
+		LocalPath:   path,
+	}
+	return mcp.NewToolResultJSON(out)
+}
+
+func (s *Server) fetchMessageBody(account, folder string, uid uint32) (string, string, []data.Attachment, error) {
+	if s.fetchBody != nil {
+		return s.fetchBody(account, folder, uid)
+	}
+	client, err := s.connect(account)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("connecting: %w", err)
+	}
+	bodyText, bodyHTML, attachments, err := client.FetchBodySync(folder, uid)
+	closeErr := client.Close()
+	if err != nil {
+		return "", "", nil, err
+	}
+	if closeErr != nil {
+		return "", "", nil, fmt.Errorf("closing connection: %w", closeErr)
+	}
+	return bodyText, bodyHTML, attachments, nil
+}
+
+func (s *Server) attachmentsJSON(account, folder string, uid uint32, attachments []data.Attachment) []attachmentJSON {
+	out := make([]attachmentJSON, 0, len(attachments))
+	for i, att := range attachments {
+		item := attachmentJSON{
+			Index:       i,
+			Filename:    att.Filename,
+			ContentType: att.ContentType,
+			Size:        len(att.Data),
+		}
+		if path, err := s.attachmentPath(account, folder, uid, i, att.Filename); err == nil {
+			if _, err := os.Stat(path); err == nil {
+				item.Cached = true
+				item.LocalPath = path
+			}
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func (s *Server) cachedAttachmentsJSON(account, folder string, uid uint32) ([]attachmentJSON, error) {
+	dir, err := s.attachmentDir(account, folder)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return []attachmentJSON{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	prefix := fmt.Sprintf("%d-", uid)
+	out := []attachmentJSON{}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".meta.json") {
+			continue
+		}
+		meta, err := readCachedAttachmentMeta(filepath.Join(dir, name))
+		if err != nil {
+			return nil, err
+		}
+		if meta.Account != account || meta.Folder != folder || meta.UID != uid {
+			continue
+		}
+		out = append(out, attachmentJSON{
+			Index:       meta.Index,
+			Filename:    meta.Filename,
+			ContentType: meta.ContentType,
+			Size:        meta.Size,
+			Cached:      true,
+			LocalPath:   meta.LocalPath,
+		})
+	}
+	return out, nil
+}
+
+func readCachedAttachmentMeta(path string) (cachedAttachmentMeta, error) {
+	var meta cachedAttachmentMeta
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return meta, err
+	}
+	if err := json.Unmarshal(b, &meta); err != nil {
+		return meta, fmt.Errorf("decoding %s: %w", path, err)
+	}
+	return meta, nil
+}
+
+func (s *Server) cacheAttachment(account, folder string, uid uint32, index int, att data.Attachment) (string, error) {
+	dir, err := s.attachmentDir(account, folder)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", err
+	}
+	path, err := s.attachmentPath(account, folder, uid, index, att.Filename)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, att.Data, 0600); err != nil {
+		return "", err
+	}
+	meta := cachedAttachmentMeta{
+		Account:     account,
+		Folder:      folder,
+		UID:         uid,
+		Index:       index,
+		Filename:    att.Filename,
+		ContentType: att.ContentType,
+		Size:        len(att.Data),
+		LocalPath:   path,
+	}
+	metaBytes, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path+".meta.json", metaBytes, 0600); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func (s *Server) attachmentPath(account, folder string, uid uint32, index int, filename string) (string, error) {
+	dir, err := s.attachmentDir(account, folder)
+	if err != nil {
+		return "", err
+	}
+	name := fmt.Sprintf("%d-%d-%s", uid, index, util.SafeAttachmentFilename(filename))
+	return filepath.Join(dir, name), nil
+}
+
+func (s *Server) attachmentDir(account, folder string) (string, error) {
+	cacheDir, err := s.cacheDirPath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(cacheDir, "attachments", safePathSegment(account), safePathSegment(folder)), nil
+}
+
+func safePathSegment(s string) string {
+	s = strings.NewReplacer("/", "_", "\\", "_").Replace(s)
+	return util.SafeAttachmentFilename(s)
+}
+
+func attachmentIndexByFilename(attachments []data.Attachment, filename string) (int, error) {
+	matches := []int{}
+	safeFilename := util.SafeAttachmentFilename(filename)
+	for i, att := range attachments {
+		if att.Filename == filename || util.SafeAttachmentFilename(att.Filename) == safeFilename {
+			matches = append(matches, i)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return -1, fmt.Errorf("no attachment named %q", filename)
+	case 1:
+		return matches[0], nil
+	default:
+		return -1, fmt.Errorf("multiple attachments named %q; use index", filename)
+	}
 }
 
 func (s *Server) handleListCategories(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -315,6 +588,80 @@ func (s *Server) handleListByCategory(_ context.Context, req mcp.CallToolRequest
 }
 
 // --- write handlers ---
+
+func (s *Server) handleSendMessage(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	account, err := req.RequireString("account")
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("account", err), nil
+	}
+	acct, err := s.account(account)
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("account", err), nil
+	}
+	toValues, err := req.RequireStringSlice("to")
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("to", err), nil
+	}
+	to, err := smtplib.ParseAddresses(toValues)
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("to", err), nil
+	}
+	if len(to) == 0 {
+		return mcp.NewToolResultError("to must contain at least one recipient"), nil
+	}
+	cc, err := smtplib.ParseAddresses(req.GetStringSlice("cc", nil))
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("cc", err), nil
+	}
+	subject, err := req.RequireString("subject")
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("subject", err), nil
+	}
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		return mcp.NewToolResultError("subject is required"), nil
+	}
+	body, err := req.RequireString("body")
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("body", err), nil
+	}
+
+	attachmentPaths := req.GetStringSlice("attachments", nil)
+	attachments := make([]smtplib.Attachment, 0, len(attachmentPaths))
+	for _, path := range attachmentPaths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		attachments = append(attachments, smtplib.Attachment{
+			Path:     path,
+			Filename: filepath.Base(path),
+		})
+	}
+
+	draft := &smtplib.ComposedMessage{
+		From:        data.Address{Address: acct.Username},
+		To:          to,
+		CC:          cc,
+		Subject:     subject,
+		Body:        body,
+		Attachments: attachments,
+	}
+	if err := smtplib.Send(acct, draft); err != nil {
+		return mcp.NewToolResultErrorFromErr("sending message", err), nil
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("Sent to %s (subject: %s).", smtplib.FormatRecipientList(sendRecipients(draft)), subject)), nil
+}
+
+func sendRecipients(draft *smtplib.ComposedMessage) []data.Address {
+	if draft == nil {
+		return nil
+	}
+	out := make([]data.Address, 0, len(draft.To)+len(draft.CC))
+	out = append(out, draft.To...)
+	out = append(out, draft.CC...)
+	return out
+}
 
 func (s *Server) handleMoveMessage(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	account, err := req.RequireString("account")
