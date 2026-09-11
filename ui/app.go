@@ -93,7 +93,6 @@ type classifyBackfillMsg struct {
 type App struct {
 	cfg       *config.Config
 	theme     *config.Theme
-	styles    *Styles
 	store     *cache.Store
 	embClient *embeddings.Client
 	embQueue  *embeddingQueue
@@ -140,6 +139,7 @@ type App struct {
 	height         int
 	showSidebar    bool
 	wantSidebar    bool
+	uiState        *config.UIState
 	showHelp       bool
 	sidebarFocused bool
 	activeAccount  string
@@ -215,7 +215,6 @@ func (a *App) canQuitNow() bool {
 // NewApp creates the root application model.
 func NewApp(cfg *config.Config, store *cache.Store) *App {
 	theme := config.NewTheme(cfg)
-	styles := NewStyles(theme)
 	embClient, _ := embeddings.NewClient(cfg.Embeddings)
 	var embQueue *embeddingQueue
 	if embClient != nil {
@@ -238,7 +237,6 @@ func NewApp(cfg *config.Config, store *cache.Store) *App {
 	app := &App{
 		cfg:             cfg,
 		theme:           theme,
-		styles:          styles,
 		store:           store,
 		embClient:       embClient,
 		embQueue:        embQueue,
@@ -250,10 +248,10 @@ func NewApp(cfg *config.Config, store *cache.Store) *App {
 		suggestResults:  suggestResults,
 		smartCounts:     make(map[string]int),
 		imapClients:     make(map[string]*imaplib.Client),
-		header:          NewHeader(styles),
-		sidebar:         NewSidebar(styles),
-		statusbar:       NewStatusBar(styles),
-		helpOverlay:     NewHelpOverlay(styles),
+		header:          NewHeader(theme),
+		sidebar:         NewSidebar(theme),
+		statusbar:       NewStatusBar(theme),
+		helpOverlay:     NewHelpOverlay(theme),
 		showSidebar:     true,
 		wantSidebar:     true,
 		viewID:          ViewInbox,
@@ -261,9 +259,9 @@ func NewApp(cfg *config.Config, store *cache.Store) *App {
 		quickMenu:       &quickMenuState{side: quickMenuNone},
 	}
 
-	app.searchOverlay = NewSearchOverlay(styles)
-	app.folderPicker = NewFolderPickerOverlay(styles)
-	app.newFolder = NewNewFolderOverlay(styles)
+	app.searchOverlay = NewSearchOverlay(theme)
+	app.folderPicker = NewFolderPickerOverlay(theme)
+	app.newFolder = NewNewFolderOverlay(theme)
 	app.inboxView = views.NewInboxView(theme)
 	app.readerView = views.NewReaderView(theme)
 	app.folderView = views.NewFolderView(theme)
@@ -290,7 +288,29 @@ func NewApp(cfg *config.Config, store *cache.Store) *App {
 	app.sidebar.SetAccounts(app.accounts)
 	app.sidebar.SetActive(app.activeAccount, app.activeFolder)
 
+	// Restore the parts of the layout the user last left in place. Fold state
+	// is worth persisting because an account with thirty mailboxes is only
+	// usable folded, and refolding it at every start is busywork.
+	app.uiState = config.LoadState()
+	app.sidebar.SetCollapsed(app.uiState.CollapsedFolders)
+	app.sidebar.OnFoldChange(app.saveUIState)
+	if app.uiState.SidebarHidden {
+		app.showSidebar = false
+		app.wantSidebar = false
+	}
+
 	return app
+}
+
+// saveUIState persists the layout state. Failures are ignored on purpose:
+// losing a fold is not worth an error banner over the user's mail.
+func (a *App) saveUIState() {
+	if a.uiState == nil {
+		a.uiState = &config.UIState{}
+	}
+	a.uiState.CollapsedFolders = a.sidebar.CollapsedKeys()
+	a.uiState.SidebarHidden = !a.wantSidebar
+	_ = a.uiState.Save()
 }
 
 // Init implements tea.Model.
@@ -462,7 +482,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Start fetching folders
 		return a, tea.Batch(
 			msg.client.FetchFolders(),
-			msg.client.FetchMessages(a.activeFolder, a.cfg.General.PageSize),
+			msg.client.FetchMessages("INBOX", a.cfg.General.PageSize),
 			a.startEmbeddingBackfill(msg.account),
 			a.startClassifyBackfill(msg.account),
 		)
@@ -501,24 +521,33 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case imaplib.MessageListMsg:
 		if msg.Err != nil {
 			a.flash("Fetch error: "+msg.Err.Error(), "err")
-			a.statusbar.SetLoading(false)
-			return a, nil
+			if msg.Account == a.activeAccount && msg.Folder == a.activeFolder {
+				a.header.SetSyncState("error")
+				a.statusbar.SetLoading(false)
+			}
+			return a, a.scheduleSyncTick(msg.Account)
+		}
+		if err := a.store.UpsertMessages(msg.Messages); err != nil {
+			a.flash("Cache write error: "+err.Error(), "err")
+		}
+		// Submit new inbox messages for classification
+		if a.classifyQueue != nil {
+			a.classifyQueue.Submit(msg.Messages)
+		}
+		// A background response for another account or a folder that the user
+		// has left must update the cache without replacing the visible inbox.
+		if msg.Account != a.activeAccount || msg.Folder != a.activeFolder {
+			return a, a.scheduleSyncTick(msg.Account)
 		}
 		a.loadedMessages = msg.Messages
 		a.fetchedCount = len(msg.Messages)
 		a.loadingMore = false
 		a.allLoaded = false
-		if err := a.store.UpsertMessages(msg.Messages); err != nil {
-			a.flash("Cache write error: "+err.Error(), "err")
-		}
 		threads := thread.BuildThreads(a.loadedMessages)
 		a.inboxView.SetThreads(threads)
 		a.applyQuickMenuState()
+		a.header.SetSyncState("synced")
 		a.statusbar.SetLoading(false)
-		// Submit new inbox messages for classification
-		if a.classifyQueue != nil {
-			a.classifyQueue.Submit(msg.Messages)
-		}
 		return a, a.scheduleSyncTick(msg.Account)
 
 	case imaplib.MoreMessageListMsg:
@@ -709,8 +738,15 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case outsmtp.SendResultMsg:
 		if msg.Err != nil {
 			a.flash("Send failed: "+msg.Err.Error(), "err")
-		} else {
-			a.flash("Message sent!", "ok")
+			return a, nil
+		}
+		a.flash("Message sent!", "ok")
+		// Append the exact submitted message after SMTP accepts it. This keeps
+		// the Sent copy's Message-ID identical and avoids saving failed sends.
+		if sent := a.findSentFolder(msg.Account); sent != "" && len(msg.Raw) > 0 {
+			if client, ok := a.imapClients[msg.Account]; ok {
+				return a, client.AppendMessage(sent, msg.Raw, []data.Flag{data.FlagSeen})
+			}
 		}
 		return a, nil
 
@@ -719,10 +755,14 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !ok {
 			return a, nil
 		}
-		a.header.SetSyncState("syncing")
-		a.statusbar.SetLoading(true)
+		folder := "INBOX"
+		if msg.account == a.activeAccount {
+			folder = a.activeFolder
+			a.header.SetSyncState("syncing")
+			a.statusbar.SetLoading(true)
+		}
 		return a, tea.Batch(
-			client.FetchMessages(a.activeFolder, a.cfg.General.PageSize),
+			client.FetchMessages(folder, a.cfg.General.PageSize),
 			spinnerTick(),
 		)
 
@@ -1042,6 +1082,18 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.sidebar.GoToBottom()
 		case "n":
 			a.openNewFolderDialog()
+		case " ", "space":
+			a.sidebar.ToggleFold()
+		case "l", "right":
+			a.sidebar.Expand()
+		case "H":
+			if acct, _, ok := a.sidebar.Selected(); ok && acct != "" {
+				a.sidebar.FoldAll(acct, true)
+			}
+		case "L":
+			if acct, _, ok := a.sidebar.Selected(); ok && acct != "" {
+				a.sidebar.FoldAll(acct, false)
+			}
 		case "enter":
 			if acct, folder, ok := a.sidebar.Selected(); ok {
 				a.sidebarFocused = false
@@ -1063,7 +1115,14 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				a.viewID = ViewInbox
 				return a, a.fetchMessages()
 			}
-		case "esc", "h", "left", "tab", "q":
+		case "h", "left":
+			// h folds the tree up one level at a time and only leaves the
+			// sidebar once there is nothing left to fold.
+			if !a.sidebar.Collapse() {
+				a.sidebarFocused = false
+				a.sidebar.SetFocused(false)
+			}
+		case "esc", "tab", "q":
 			a.sidebarFocused = false
 			a.sidebar.SetFocused(false)
 		case "ctrl+c":
@@ -1099,6 +1158,7 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "b":
 		a.wantSidebar = !a.wantSidebar
+		a.saveUIState()
 		a.updateLayout()
 
 	case "tab":
@@ -1436,6 +1496,10 @@ func (a *App) handleLeftPress(x, y int) (tea.Model, tea.Cmd) {
 	overlayActive := a.comp.IsActive() || a.searchOverlay.IsActive() || a.folderPicker.IsActive() || a.newFolder.IsActive()
 	if !overlayActive && a.showSidebar && x < sidebarRenderedWidth() {
 		contentY := y - headerH
+		if acct, folder, ok := a.sidebar.HitTestFold(x, contentY); ok {
+			a.sidebar.ToggleFoldAt(acct, folder)
+			return a, nil
+		}
 		acct, folder, ok := a.sidebar.HitTest(x, contentY)
 		if ok && folder != "" {
 			if acct == "" {
@@ -1597,7 +1661,12 @@ func syntheticKeyMsg(key string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyCtrlR}
 	case "ctrl+d":
 		return tea.KeyMsg{Type: tea.KeyCtrlD}
+	case "ctrl+s":
+		return tea.KeyMsg{Type: tea.KeyCtrlS}
 	case "ctrl+enter":
+		// Terminals deliver ctrl+enter as ctrl+j, and the composer does not
+		// bind ctrl+j — synthesizing it would click through to nothing. The
+		// send hint uses ctrl+s for that reason.
 		return tea.KeyMsg{Type: tea.KeyCtrlJ}
 	}
 	if len([]rune(key)) == 1 {
@@ -1745,7 +1814,7 @@ func (a *App) openThread(t *data.Thread) tea.Cmd {
 		}
 	}
 	t.HasUnread = false
-	
+
 	// Fetch body for every message in the thread that doesn't have one yet.
 	// Use each message's own account and folder — threads can span folders (e.g. INBOX + Sent).
 	for _, msg := range t.Messages {
@@ -1766,7 +1835,6 @@ func (a *App) openThread(t *data.Thread) tea.Cmd {
 		}
 	}
 
-	
 	// Trigger suggested event extraction for every message in the thread
 	for _, msg := range t.Messages {
 		a.debugLog("loadSuggestedEvent for thread %s: msg.ID=%d", t.ID, msg.ID)
@@ -2663,16 +2731,7 @@ func (a *App) handleComposerResult(r *composer.Result) tea.Cmd {
 			if a.cfg.Accounts[i].Name == a.activeAccount {
 				acfg := &a.cfg.Accounts[i]
 				a.flash(fmt.Sprintf("%s Sending…", icons.Send), "info")
-				cmds := []tea.Cmd{outsmtp.SendMessage(acfg, r.Draft)}
-				// Append a copy to Sent if we can find the folder.
-				if sent := a.findSentFolder(a.activeAccount); sent != "" {
-					if client, ok := a.imapClients[a.activeAccount]; ok {
-						if raw, err := outsmtp.BuildRawMessage(r.Draft); err == nil {
-							cmds = append(cmds, client.AppendMessage(sent, raw, []data.Flag{data.FlagSeen}))
-						}
-					}
-				}
-				return tea.Batch(cmds...)
+				return outsmtp.SendMessage(acfg, r.Draft)
 			}
 		}
 		a.flash("No account configured for sending", "err")
@@ -2828,7 +2887,6 @@ func writeAttachmentTemp(att data.Attachment) (string, error) {
 	return f.Name(), nil
 }
 
-
 // --- layout ---
 
 const sidebarWidth = 26 // content width
@@ -2839,7 +2897,7 @@ func sidebarRenderedWidth() int {
 }
 
 func (a *App) headerHeight() int {
-	return 3 // row1 + row2 + divider
+	return a.header.Height()
 }
 
 func (a *App) currentSbContext() string {
@@ -2927,7 +2985,15 @@ func (a *App) View() string {
 			lipgloss.NewStyle().Foreground(a.theme.TextMuted).Render(msg))
 	}
 
-	// Header
+	// Header. Counts are pushed here rather than in updateLayout because they
+	// change with every sync, not with every resize.
+	unread, total := a.inboxView.Counts()
+	a.header.SetCounts(unread, total)
+	if a.viewID == ViewSmartFolder {
+		a.header.SetFilterLabel(a.activeFolder)
+	} else {
+		a.header.SetFilterLabel("")
+	}
 	header := a.header.View()
 
 	// Content

@@ -4,29 +4,56 @@ package views
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/data"
+	"github.com/bubblmail/bubblmail/ui/components"
 	"github.com/bubblmail/bubblmail/ui/icons"
 	"github.com/bubblmail/bubblmail/util"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
 
-// InboxView displays a scrollable list of email threads.
-// Each thread occupies two rows:
+// rowsPerThread is the fixed height of one thread entry.
+const rowsPerThread = 2
+
+// Row kinds in the render plan.
+const (
+	rowKindThread = iota
+	rowKindHeader
+)
+
+// planRow is one terminal line of the list. The view keeps an explicit plan
+// rather than deriving line numbers from the thread index, because date group
+// headers make the mapping non-uniform — and every piece of geometry in this
+// file (scrolling, paging, mouse hit-testing) then reads from the same table
+// instead of each re-deriving it.
+type planRow struct {
+	kind   int
+	thread int    // index into threads, for rowKindThread
+	sub    int    // 0 = top line, 1 = detail line
+	label  string // for rowKindHeader
+}
+
+// InboxView displays a scrollable list of email threads grouped by date.
 //
-//	● From Name                    tag1  tag2     Jun 12
-//	  Re: Subject truncated…                   (3 msgs)
+//	 TODAY ──────────────────────────────────────────────────────
+//	▌ ● Sarah Chen                          ‹work›  󰁦     09:41
+//	    Q1 Planning Meeting · Let's align on the roadmap…      3
 type InboxView struct {
 	theme           *config.Theme
 	width           int
 	height          int
 	threads         []*data.Thread
 	cursor          int // focused thread index
-	offset          int // first visible thread
+	offset          int // first visible plan row
 	quick           *QuickMenuRender
 	selectionAnchor int // -1 = no multi-selection; ≥0 = anchor index
+
+	plan      []planRow
+	threadRow map[int]int // thread index → plan row of its first line
+	grouped   bool        // date group headers enabled
 }
 
 // QuickMenuRender controls the inline quick action hint rendering.
@@ -38,7 +65,16 @@ type QuickMenuRender struct {
 
 // NewInboxView creates a new inbox view.
 func NewInboxView(theme *config.Theme) *InboxView {
-	return &InboxView{theme: theme, selectionAnchor: -1}
+	return &InboxView{theme: theme, selectionAnchor: -1, grouped: true}
+}
+
+// SetGrouped turns date group headers on or off. Off is appropriate where the
+// list order is relevance rather than time, such as search results.
+func (v *InboxView) SetGrouped(on bool) {
+	if v.grouped != on {
+		v.grouped = on
+		v.rebuildPlan()
+	}
 }
 
 // SetQuickMenu updates the inline quick action state.
@@ -56,6 +92,7 @@ func (v *InboxView) SetQuickMenu(side string, step int, moveHint string) {
 func (v *InboxView) SetSize(w, h int) {
 	v.width = w
 	v.height = h
+	v.scrollToCursor()
 }
 
 // SetThreads updates the thread list and resets scroll.
@@ -64,6 +101,7 @@ func (v *InboxView) SetThreads(threads []*data.Thread) {
 	v.cursor = 0
 	v.offset = 0
 	v.selectionAnchor = -1
+	v.rebuildPlan()
 }
 
 // AppendThreads replaces the thread list while preserving cursor position.
@@ -76,12 +114,14 @@ func (v *InboxView) AppendThreads(threads []*data.Thread) {
 
 	v.threads = threads
 	v.selectionAnchor = -1
+	v.rebuildPlan()
 
 	// Try to find the previously selected thread in the new (possibly reordered) list.
 	if selectedID != "" {
 		for i, t := range v.threads {
 			if t.ID == selectedID {
 				v.cursor = i
+				v.scrollToCursor()
 				return
 			}
 		}
@@ -93,22 +133,64 @@ func (v *InboxView) AppendThreads(threads []*data.Thread) {
 	if v.cursor < 0 {
 		v.cursor = 0
 	}
+	v.scrollToCursor()
+}
+
+// rebuildPlan recomputes the line plan from the current thread list.
+func (v *InboxView) rebuildPlan() {
+	v.plan = v.plan[:0]
+	v.threadRow = make(map[int]int, len(v.threads))
+
+	lastBucket := ""
+	for i, t := range v.threads {
+		if v.grouped {
+			if b := dateBucket(t.LastDate); b != lastBucket {
+				// A blank row opens every group but the first. With no rules
+				// anywhere in this pane, the space above a heading is what
+				// makes it read as a heading rather than as another mail row.
+				if lastBucket != "" {
+					v.plan = append(v.plan, planRow{kind: rowKindHeader})
+				}
+				v.plan = append(v.plan, planRow{kind: rowKindHeader, label: b})
+				lastBucket = b
+			}
+		}
+		v.threadRow[i] = len(v.plan)
+		for sub := 0; sub < rowsPerThread; sub++ {
+			v.plan = append(v.plan, planRow{kind: rowKindThread, thread: i, sub: sub})
+		}
+	}
 }
 
 // Len returns the number of threads loaded.
 func (v *InboxView) Len() int { return len(v.threads) }
 
+// Counts returns how many loaded threads have unread mail, and how many there
+// are in total. The header reports these so the count always describes what is
+// actually on screen rather than a separately-tracked figure that can drift.
+func (v *InboxView) Counts() (unread, total int) {
+	for _, t := range v.threads {
+		if t.HasUnread {
+			unread++
+		}
+	}
+	return unread, len(v.threads)
+}
+
 // HitTestThread returns the thread index for a click at contentY (rows from the
 // top of the inbox area), or -1 if the click doesn't land on a thread row.
 func (v *InboxView) HitTestThread(contentY int) int {
-	if contentY < 0 || len(v.threads) == 0 {
+	if contentY < 0 {
 		return -1
 	}
-	idx := v.offset + contentY/2 // each thread occupies 2 rows
-	if idx >= 0 && idx < len(v.threads) {
-		return idx
+	i := v.offset + contentY
+	if i < 0 || i >= len(v.plan) {
+		return -1
 	}
-	return -1
+	if v.plan[i].kind != rowKindThread {
+		return -1
+	}
+	return v.plan[i].thread
 }
 
 // CursorPos returns the current cursor index.
@@ -123,6 +205,7 @@ func (v *InboxView) SetCursor(i int) {
 		i = 0
 	}
 	v.cursor = i
+	v.scrollToCursor()
 }
 
 // SelectedThread returns the currently focused thread, or nil.
@@ -133,13 +216,58 @@ func (v *InboxView) SelectedThread() *data.Thread {
 	return v.threads[v.cursor]
 }
 
+// scrollToCursor pulls the viewport so both lines of the focused thread — and
+// the group header immediately above it, if any — are on screen.
+func (v *InboxView) scrollToCursor() {
+	if v.height <= 0 || len(v.plan) == 0 {
+		return
+	}
+	first, ok := v.threadRow[v.cursor]
+	if !ok {
+		return
+	}
+	last := first + rowsPerThread - 1
+
+	top := first
+	if top > 0 && v.plan[top-1].kind == rowKindHeader {
+		top--
+	}
+	if top < v.offset {
+		v.offset = top
+	}
+	if last >= v.offset+v.height {
+		v.offset = last - v.height + 1
+	}
+	v.clampOffset()
+}
+
+func (v *InboxView) clampOffset() {
+	maxOffset := len(v.plan) - v.height
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if v.offset > maxOffset {
+		v.offset = maxOffset
+	}
+	if v.offset < 0 {
+		v.offset = 0
+	}
+}
+
+// pageThreads is how many threads a page key moves by.
+func (v *InboxView) pageThreads() int {
+	n := v.height / rowsPerThread
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
 // MoveUp moves cursor up.
 func (v *InboxView) MoveUp() {
 	if v.cursor > 0 {
 		v.cursor--
-		if v.cursor < v.offset {
-			v.offset--
-		}
+		v.scrollToCursor()
 	}
 }
 
@@ -147,46 +275,29 @@ func (v *InboxView) MoveUp() {
 func (v *InboxView) MoveDown() {
 	if v.cursor < len(v.threads)-1 {
 		v.cursor++
-		rowsPerThread := 2
-		visibleThreads := v.height / rowsPerThread
-		if visibleThreads < 1 {
-			visibleThreads = 1
-		}
-		if v.cursor >= v.offset+visibleThreads {
-			v.offset++
-		}
+		v.scrollToCursor()
 	}
 }
 
 // PageUp moves cursor up by a page.
 func (v *InboxView) PageUp() {
-	rowsPerThread := 2
-	page := v.height / rowsPerThread
-	if page < 1 {
-		page = 1
-	}
-	v.cursor -= page
+	v.cursor -= v.pageThreads()
 	if v.cursor < 0 {
 		v.cursor = 0
 	}
-	v.offset = v.cursor
+	v.scrollToCursor()
 }
 
 // PageDown moves cursor down by a page.
 func (v *InboxView) PageDown() {
-	rowsPerThread := 2
-	page := v.height / rowsPerThread
-	if page < 1 {
-		page = 1
-	}
-	v.cursor += page
+	v.cursor += v.pageThreads()
 	if v.cursor >= len(v.threads) {
 		v.cursor = len(v.threads) - 1
 	}
 	if v.cursor < 0 {
 		v.cursor = 0
 	}
-	v.offset = v.cursor
+	v.scrollToCursor()
 }
 
 // GoToTop jumps to the first thread.
@@ -201,15 +312,8 @@ func (v *InboxView) GoToBottom() {
 		return
 	}
 	v.cursor = len(v.threads) - 1
-	rowsPerThread := 2
-	visibleThreads := v.height / rowsPerThread
-	if visibleThreads < 1 {
-		visibleThreads = 1
-	}
-	v.offset = v.cursor - visibleThreads + 1
-	if v.offset < 0 {
-		v.offset = 0
-	}
+	v.offset = len(v.plan) // scrollToCursor clamps this back to the last page
+	v.scrollToCursor()
 }
 
 // selRange returns the inclusive [lo, hi] index range of the current selection.
@@ -241,9 +345,7 @@ func (v *InboxView) SelectedThreads() []*data.Thread {
 }
 
 // ClearSelection collapses multi-selection back to just the cursor.
-func (v *InboxView) ClearSelection() {
-	v.selectionAnchor = -1
-}
+func (v *InboxView) ClearSelection() { v.selectionAnchor = -1 }
 
 // ShiftMoveUp extends or starts a shift-selection one step upward.
 func (v *InboxView) ShiftMoveUp() {
@@ -261,45 +363,128 @@ func (v *InboxView) ShiftMoveDown() {
 	v.MoveDown()
 }
 
+// gutterW and barW are the two fixed columns framing every list row: the
+// shared selection gutter on the left and the scroll position on the right.
+const (
+	gutterW = 1
+	barW    = 1
+)
+
 // View renders the inbox thread list.
 func (v *InboxView) View() string {
 	if len(v.threads) == 0 {
-		return v.emptyState()
+		return components.EmptyState(v.theme, v.width, v.height,
+			icons.Inbox, "Nothing in this folder",
+			"ctrl+r to sync  ·  / to search  ·  c to compose")
 	}
 
-	rowsPerThread := 2
-	visibleThreads := v.height / rowsPerThread
-	if visibleThreads < 1 {
-		visibleThreads = 1
+	contentW := v.width - gutterW - barW
+	if contentW < 10 {
+		contentW = 10
 	}
+	// The pane itself is transparent — only the cursor row and the marked rows
+	// carry a fill, and those are small deliberate patches rather than a plane.
+	const pane = lipgloss.Color("")
 
-	end := v.offset + visibleThreads
-	if end > len(v.threads) {
-		end = len(v.threads)
-	}
-
+	v.clampOffset()
 	lo, hi := v.selRange()
 	center := (lo + hi) / 2
 
-	var rows []string
-	for i := v.offset; i < end; i++ {
-		t := v.threads[i]
-		isSelected := i == v.cursor
-		inMultiSel := v.selectionAnchor >= 0 && i >= lo && i <= hi && !isSelected
-		showQuickIcon := i == center
-		rows = append(rows, v.renderThread(t, isSelected, i, inMultiSel, showQuickIcon)...)
+	// Rendered thread pairs are memoised because the plan visits each thread
+	// twice and renderThread is not cheap.
+	pairs := make(map[int][]string, v.height)
+
+	rows := make([]string, 0, v.height)
+	for i := v.offset; i < len(v.plan) && len(rows) < v.height; i++ {
+		p := v.plan[i]
+		if p.kind == rowKindHeader {
+			if p.label == "" {
+				rows = append(rows, "")
+				continue
+			}
+			rows = append(rows,
+				components.Fill(gutterW, pane)+
+					components.SectionLabel(v.theme, p.label, contentW+barW, pane))
+			continue
+		}
+
+		ti := p.thread
+		pair, ok := pairs[ti]
+		if !ok {
+			isCursor := ti == v.cursor
+			inMulti := v.selectionAnchor >= 0 && ti >= lo && ti <= hi && !isCursor
+			pair = v.renderThread(v.threads[ti], isCursor, ti, inMulti, ti == center, contentW)
+			pairs[ti] = pair
+		}
+		if p.sub >= len(pair) {
+			continue
+		}
+
+		gutter := components.GutterNone
+		switch {
+		case ti == v.cursor:
+			gutter = components.GutterActive
+		case v.selectionAnchor >= 0 && ti >= lo && ti <= hi:
+			gutter = components.GutterMarked
+		}
+		rows = append(rows, components.GutterCell(v.theme, gutter, pane)+pair[p.sub])
 	}
 
-	// Pad to full height
-	for len(rows) < v.height {
-		rows = append(rows, lipgloss.NewStyle().Width(v.width).Render(""))
+	// Scroll position: one column down the right edge.
+	track := components.Scrollbar(v.theme, len(v.plan), v.height, v.offset, len(rows), pane)
+	for i := range rows {
+		if i < len(track) {
+			rows[i] += track[i]
+		}
 	}
 
-	return strings.Join(rows[:v.height], "\n")
+	return strings.Join(components.Pad(rows, v.height, v.width, pane), "\n")
 }
 
-func (v *InboxView) renderThread(t *data.Thread, selected bool, index int, inMultiSel bool, showQuickIcon bool) []string {
-	fullW := v.width
+// dateBucket names the group a thread belongs to. Buckets get coarser as they
+// recede, which is how people actually remember when mail arrived.
+func dateBucket(t time.Time) string {
+	now := time.Now()
+	y, m, d := now.Date()
+	today := time.Date(y, m, d, 0, 0, 0, 0, now.Location())
+
+	switch {
+	case t.IsZero():
+		return "No date"
+	case !t.Before(today.AddDate(0, 0, 1)):
+		return "Today" // includes clock-skewed future mail
+	case !t.Before(today):
+		return "Today"
+	case !t.Before(today.AddDate(0, 0, -1)):
+		return "Yesterday"
+	case !t.Before(today.AddDate(0, 0, -7)):
+		return "Earlier this week"
+	case !t.Before(today.AddDate(0, 0, -30)):
+		return "Earlier this month"
+	case t.Year() == y:
+		return t.Format("January")
+	default:
+		return t.Format("January 2006")
+	}
+}
+
+// listDate is the right-aligned timestamp. Inside the Today and Yesterday
+// groups the date is already known from the header, so the clock time is the
+// only new information and the column shows that instead.
+func listDate(t time.Time, grouped bool) string {
+	if t.IsZero() {
+		return ""
+	}
+	if grouped {
+		switch dateBucket(t) {
+		case "Today", "Yesterday":
+			return t.Format("15:04")
+		}
+	}
+	return util.FormatDate(t)
+}
+
+func (v *InboxView) renderThread(t *data.Thread, selected bool, index int, inMultiSel bool, showQuickIcon bool, fullW int) []string {
 	theme := v.theme
 	// Quick menu renders for the cursor row normally; for other selected rows it
 	// renders a colour strip (icon only shown on the centre of the selection).
@@ -321,117 +506,88 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool, index int, inMul
 	//   - right slide:crop [12 .. 12+fullW]→ content[6:] + rightBadge
 	contentW := fullW
 
+	// Resting rows carry no fill at all, so the terminal shows through them.
+	// The list used to zebra-stripe onto theme.Surface — a two-step lift on a
+	// list with two rows per thread, which banded the whole pane. Threads are
+	// told apart by their date group and their own second line.
 	rowBg := lipgloss.Color("")
-	if !selected && !inMultiSel && index%2 == 1 {
-		rowBg = theme.Surface
+
+	// The cursor is a one-step lift plus the accent gutter — the same signal
+	// the sidebar uses. It used to be a full-width fill in theme.Selected, a
+	// saturated blue that both shouted across a 160-column pane and introduced
+	// a second highlight colour into an app that has one accent.
+	rowFill := rowBg
+	switch {
+	case selected:
+		rowFill = theme.SurfaceAlt
+	case inMultiSel:
+		rowFill = theme.Surface
 	}
 
 	sel := func(s lipgloss.Style) lipgloss.Style {
-		if selected {
-			return s.Background(theme.Selected)
-		}
-		if inMultiSel {
-			return s.Background(theme.SurfaceAlt)
-		}
-		if rowBg != "" {
-			return s.Background(rowBg)
+		if rowFill != "" {
+			return s.Background(rowFill)
 		}
 		return s
 	}
+	plain := func() lipgloss.Style { return sel(lipgloss.NewStyle()) }
 
 	fgMain := theme.Text
 	fgMuted := theme.TextMuted
 	if selected {
-		fgMain = theme.Background
-		fgMuted = theme.Background
+		fgMain = theme.Text
+		fgMuted = theme.TextMuted
 	}
 
-	// Flag column
+	latest := t.Latest()
+
+	// ── Prefix: star, then unread dot ────────────────────────────────────────
 	flagCh := " "
 	if t.Starred {
 		flagCh = icons.Flag
 	}
 	flag := sel(lipgloss.NewStyle().Foreground(theme.Starred)).Render(flagCh)
 
-	// Status dot
-	var dot string
+	// ── From ─────────────────────────────────────────────────────────────────
+	fromSrc := t.Messages[0]
+	if t.HasUnread && latest != nil {
+		fromSrc = latest
+	}
+	fromStr := util.SingleLine(fromSrc.FromString())
+
+	// The unread dot carries the sender's colour. Presence of the dot is still
+	// the only thing that means unread; its hue is identity, so a column of
+	// dots also reads as "these three are the same sender" at a glance. Read
+	// threads stay colourless, which keeps the list from turning into confetti.
+	dot := plain().Render(" ")
 	if t.HasUnread {
-		dot = sel(lipgloss.NewStyle().Foreground(theme.Unread)).Render(icons.Unread)
-	} else {
-		dot = sel(lipgloss.NewStyle().Foreground(fgMuted)).Render(" ")
+		dot = sel(lipgloss.NewStyle().Foreground(theme.Hue(fromSrc.FromKey()))).Render(icons.Unread)
 	}
 
-	// From field
-	fromStr := util.SingleLine(t.Messages[0].FromString())
-	if t.HasUnread {
-		if latest := t.Latest(); latest != nil {
-			fromStr = util.SingleLine(latest.FromString())
-		}
-	}
+	// prefixW: leading space + star + space + dot + space
+	const prefixW = 5
 
-	// Tags
-	var tagStr string
-	if len(t.Tags) > 0 {
-		tagStyle := lipgloss.NewStyle().
-			Foreground(theme.Background).
-			Background(theme.Accent).
-			Padding(0, 1)
-		minFromW := 5
-		maxTagW := contentW - 3 - lipgloss.Width(util.FormatDate(t.LastDate)) - 2 - minFromW
-		if maxTagW > 0 {
-			var tagParts []string
-			usedW := 0
-			for _, tag := range t.Tags {
-				if len(tagParts) >= 2 {
-					break
-				}
-				remaining := maxTagW - usedW
-				if len(tagParts) > 0 {
-					remaining--
-				}
-				if remaining <= 2 {
-					break
-				}
-				labelMax := remaining - 2
-				if labelMax < 1 {
-					break
-				}
-				label := util.TruncateText(util.SingleLine(tag), labelMax)
-				part := tagStyle.Render(label)
-				partW := util.VisibleWidth(part)
-				if partW > remaining {
-					labelMax = remaining - 2
-					if labelMax < 1 {
-						break
-					}
-					label = util.TruncateText(label, labelMax)
-					part = tagStyle.Render(label)
-					partW = util.VisibleWidth(part)
-				}
-				tagParts = append(tagParts, part)
-				usedW += partW
-				if len(tagParts) > 0 {
-					usedW++
-				}
-			}
-			tagStr = strings.Join(tagParts, " ")
-		}
-	}
-
-	dateStr := util.FormatDate(t.LastDate)
+	// ── Right cluster on line 1: tags, attachment marker, date ───────────────
+	dateStr := listDate(t.LastDate, v.grouped)
 	dateW := util.VisibleWidth(dateStr)
-	tagW := util.VisibleWidth(tagStr)
 
-	const prefixW = 4
+	attachStr := ""
+	attachW := 0
+	if threadHasAttachment(t) {
+		attachStr = sel(lipgloss.NewStyle().Foreground(fgMuted)).Render(icons.Attachment)
+		attachW = util.VisibleWidth(icons.Attachment) + 1
+	}
+
+	tagStr, tagW := v.renderTags(t, contentW-prefixW-dateW-attachW-8, sel)
+
 	spaceBeforeTags := 0
-	if tagStr != "" {
+	if tagW > 0 {
 		spaceBeforeTags = 1
 	}
-	fromW := contentW - prefixW - tagW - dateW - spaceBeforeTags - 1
+	fromW := contentW - prefixW - tagW - attachW - dateW - spaceBeforeTags - 1
 	if fromW < 5 {
 		fromW = 5
 	}
-	fromTrunc := util.TruncateText(fromStr, fromW)
 
 	fromStyle := lipgloss.NewStyle().Width(fromW)
 	if t.HasUnread && !selected {
@@ -439,45 +595,70 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool, index int, inMul
 	} else {
 		fromStyle = sel(fromStyle.Foreground(fgMain))
 	}
-	fromRendered := fromStyle.Render(fromTrunc)
+
+	tagCell := ""
+	if tagStr != "" {
+		tagCell = plain().Render(" ") + tagStr
+	}
+	attachCell := ""
+	if attachStr != "" {
+		attachCell = attachStr + plain().Render(" ")
+	}
 
 	row1Content := sel(lipgloss.NewStyle().Width(contentW)).Render(
-		flag + sel(lipgloss.NewStyle()).Render(" ") +
-			dot + sel(lipgloss.NewStyle()).Render(" ") +
-			fromRendered +
-			func() string {
-				if tagStr != "" {
-					return " " + tagStr
-				}
-				return ""
-			}() +
+		plain().Render(" ") + flag + plain().Render(" ") + dot + plain().Render(" ") +
+			fromStyle.Render(util.TruncateText(fromStr, fromW)) +
+			tagCell +
+			plain().Render(" ") + attachCell +
 			sel(lipgloss.NewStyle().Foreground(fgMuted)).Render(dateStr) +
-			sel(lipgloss.NewStyle()).Render(" "),
+			plain().Render(" "),
 	)
 
+	// ── Line 2: subject, then the snippet in the space left over ─────────────
 	subject := util.SingleLine(t.Subject)
-	if subject == "" {
-		if latest := t.Latest(); latest != nil {
-			subject = util.SingleLine(latest.Subject)
-		}
+	if subject == "" && latest != nil {
+		subject = util.SingleLine(latest.Subject)
 	}
 
 	countStr := ""
+	countW := 0
 	if len(t.Messages) > 1 {
-		countStr = sel(lipgloss.NewStyle().Foreground(fgMuted)).Render(fmt.Sprintf("(%d)", len(t.Messages)))
+		plainCount := fmt.Sprintf("%d msgs", len(t.Messages))
+		countStr = sel(lipgloss.NewStyle().Foreground(fgMuted)).Render(plainCount)
+		countW = util.VisibleWidth(plainCount) + 1
 	}
-	countW := util.VisibleWidth(countStr)
 
 	textW := contentW - prefixW - countW - 1
 	if textW < 1 {
 		textW = 1
 	}
+
+	subjFg := fgMuted
+	subjBold := false
+	if t.HasUnread {
+		subjFg = fgMain
+		subjBold = true
+	}
 	subjectTrunc := util.TruncateText(subject, textW)
-	indent := strings.Repeat(" ", prefixW)
-	subjectRendered := sel(lipgloss.NewStyle().Foreground(fgMuted).Width(prefixW + textW)).Render(indent + subjectTrunc)
+	line2 := sel(lipgloss.NewStyle().Foreground(subjFg).Bold(subjBold)).Render(subjectTrunc)
+	usedW := util.VisibleWidth(subjectTrunc)
+
+	// The snippet only earns its place when there is real room for it, and it
+	// is always the first thing to go.
+	if snip := threadSnippet(t); snip != "" && textW-usedW > 14 {
+		sepStr := "  ·  "
+		room := textW - usedW - util.VisibleWidth(sepStr)
+		snipTrunc := util.TruncateText(snip, room)
+		if util.VisibleWidth(snipTrunc) > 3 {
+			line2 += sel(lipgloss.NewStyle().Foreground(theme.TextFaint)).Render(sepStr + snipTrunc)
+			usedW += util.VisibleWidth(sepStr) + util.VisibleWidth(snipTrunc)
+		}
+	}
 
 	row2Content := sel(lipgloss.NewStyle().Width(contentW)).Render(
-		subjectRendered + countStr + sel(lipgloss.NewStyle()).Render(" "),
+		plain().Render(strings.Repeat(" ", prefixW)) +
+			sel(lipgloss.NewStyle().Width(textW)).Render(line2) +
+			plain().Render(" ") + countStr,
 	)
 
 	if !quickActive {
@@ -652,6 +833,59 @@ func (v *InboxView) renderThread(t *data.Thread, selected bool, index int, inMul
 	return []string{row1, row2}
 }
 
+// renderTags renders up to two tag chips within budget, returning the styled
+// string and its plain column width.
+func (v *InboxView) renderTags(t *data.Thread, budget int, sel func(lipgloss.Style) lipgloss.Style) (string, int) {
+	if len(t.Tags) == 0 || budget <= 4 {
+		return "", 0
+	}
+	// A tag's colour is derived from its own name, so the same label is the
+	// same colour in every folder and across restarts without any stored state.
+	tagBase := sel(lipgloss.NewStyle().Background(v.theme.SurfaceAlt))
+
+	var parts []string
+	used := 0
+	for _, tag := range t.Tags {
+		if len(parts) >= 2 {
+			break
+		}
+		gap := 0
+		if len(parts) > 0 {
+			gap = 1
+		}
+		room := budget - used - gap - 2 // 2 = the chip's own side padding
+		if room < 2 {
+			break
+		}
+		label := util.TruncateText(util.SingleLine(tag), room)
+		parts = append(parts, tagBase.Foreground(v.theme.Hue(strings.ToLower(tag))).Render(" "+label+" "))
+		used += gap + util.VisibleWidth(label) + 2
+	}
+	if len(parts) == 0 {
+		return "", 0
+	}
+	return strings.Join(parts, sel(lipgloss.NewStyle()).Render(" ")), used
+}
+
+// threadHasAttachment reports whether any message in the thread carries one.
+func threadHasAttachment(t *data.Thread) bool {
+	for _, m := range t.Messages {
+		if len(m.Attachments) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// threadSnippet returns the preview text of the newest message in the thread.
+func threadSnippet(t *data.Thread) string {
+	m := t.Latest()
+	if m == nil {
+		return ""
+	}
+	return strings.TrimSpace(util.SingleLine(m.Snippet))
+}
+
 // folderShortName returns the last path segment of a folder name, truncated to
 // maxCols terminal columns.
 func folderShortName(name string, maxCols int) string {
@@ -663,16 +897,4 @@ func folderShortName(name string, maxCols int) string {
 		seg = name
 	}
 	return util.TruncateText(seg, maxCols)
-}
-
-func (v *InboxView) emptyState() string {
-	theme := v.theme
-	msg := lipgloss.NewStyle().
-		Foreground(theme.TextMuted).
-		Render(icons.Inbox + " No messages")
-	hint := lipgloss.NewStyle().
-		Foreground(theme.TextFaint).
-		Render(fmt.Sprintf("%s Press ctrl+r to sync", icons.Refresh))
-	body := lipgloss.JoinVertical(lipgloss.Center, msg, hint)
-	return lipgloss.Place(v.width, v.height, lipgloss.Center, lipgloss.Center, body)
 }

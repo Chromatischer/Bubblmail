@@ -21,8 +21,12 @@ func DemoTime(daysAgo int, hour, minute int) time.Time {
 func BuildDemoFolders() []*data.Folder {
 	return []*data.Folder{
 		{Name: "INBOX", DisplayName: "Inbox", Delimiter: "/", Depth: 0, Unread: 6, Total: 11, AccountName: DemoAccount},
-		{Name: "Work", DisplayName: "Work", Delimiter: "/", Depth: 0, Unread: 0, Total: 8, AccountName: DemoAccount},
+		{Name: "Work", DisplayName: "Work", Delimiter: "/", Depth: 0, Unread: 2, Total: 8, AccountName: DemoAccount},
+		{Name: "Work/Releases", DisplayName: "Releases", Delimiter: "/", Depth: 1, Unread: 3, Total: 19, AccountName: DemoAccount},
+		{Name: "Work/Releases/2026", DisplayName: "2026", Delimiter: "/", Depth: 2, Unread: 1, Total: 7, AccountName: DemoAccount},
+		{Name: "Work/Reviews", DisplayName: "Reviews", Delimiter: "/", Depth: 1, Unread: 0, Total: 12, AccountName: DemoAccount},
 		{Name: "Personal", DisplayName: "Personal", Delimiter: "/", Depth: 0, Unread: 0, Total: 3, AccountName: DemoAccount},
+		{Name: "Personal/Receipts", DisplayName: "Receipts", Delimiter: "/", Depth: 1, Unread: 0, Total: 31, AccountName: DemoAccount},
 		{Name: "Archive", DisplayName: "Archive", Delimiter: "/", Depth: 0, Unread: 0, Total: 47, AccountName: DemoAccount},
 		{Name: "Sent", DisplayName: "Sent", Delimiter: "/", Depth: 0, Unread: 0, Total: 22, AccountName: DemoAccount},
 		{Name: "Trash", DisplayName: "Trash", Delimiter: "/", Depth: 0, Unread: 0, Total: 5, AccountName: DemoAccount},

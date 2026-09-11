@@ -8,6 +8,7 @@ import (
 
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/ui/icons"
+	"github.com/bubblmail/bubblmail/util"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -221,7 +222,7 @@ func (fp *filePicker) view(bodyW, height int) string {
 
 	// ── Compress-confirm state ────────────────────────────────────────────
 	if fp.confirming {
-		name := filepath.Base(fp.pendingDir)
+		name := util.SingleLine(filepath.Base(fp.pendingDir))
 
 		// Row 1: icon + question, SurfaceAlt background.
 		q1 := lipgloss.NewStyle().Foreground(theme.Accent).Background(theme.SurfaceAlt).Render(" " + icons.Package + " ")
@@ -229,7 +230,7 @@ func (fp *filePicker) view(bodyW, height int) string {
 		q3 := lipgloss.NewStyle().Foreground(theme.Accent).Background(theme.SurfaceAlt).Bold(true).Render(name)
 		q4 := lipgloss.NewStyle().Foreground(theme.Text).Background(theme.SurfaceAlt).Render(" as zip?")
 		questionLine := q1 + q2 + q3 + q4
-		questionPlainW := 3 + len([]rune("Compress "+name+" as zip?"))
+		questionPlainW := 3 + util.VisibleWidth("Compress "+name+" as zip?")
 		if pad := bodyW - questionPlainW; pad > 0 {
 			questionLine += lipgloss.NewStyle().Background(theme.SurfaceAlt).Render(strings.Repeat(" ", pad))
 		}
@@ -272,7 +273,7 @@ func (fp *filePicker) view(bodyW, height int) string {
 		cursorSt.Render("▌")
 
 	// Pad to full width (measure with plain runes, not ANSI).
-	queryPlainW := 3 + len([]rune(fp.query)) + 1 // icon cell + query + cursor
+	queryPlainW := 3 + util.VisibleWidth(fp.query) + 1 // icon cell + query + cursor
 	queryPad := bodyW - queryPlainW
 	if queryPad > 0 {
 		queryRendered += lipgloss.NewStyle().Background(theme.SurfaceAlt).Render(strings.Repeat(" ", queryPad))
@@ -326,7 +327,10 @@ func (fp *filePicker) view(bodyW, height int) string {
 		}
 
 		// Split display into directory part (dimmed) + basename (bright).
+		// File names are user data: they can carry emoji and ZWJ sequences, so
+		// they are sanitised here and measured by display width below.
 		dir, base := filepath.Split(match)
+		dir, base = util.SingleLine(dir), util.SingleLine(base)
 
 		selected := i == fp.cursor
 
@@ -373,7 +377,7 @@ func (fp *filePicker) view(bodyW, height int) string {
 		baseRendered := baseSt.Render(base)
 
 		// Measure plain width to compute padding.
-		plainW := 3 + 2 + len([]rune(dir)) + len([]rune(base)) // prefix(3) + icon(2) + dir + base
+		plainW := 3 + 2 + util.VisibleWidth(dir) + util.VisibleWidth(base) // prefix(3) + icon(2) + dir + base
 		padW := bodyW - plainW
 
 		// Attach scroll hint to first/last visible row.
@@ -383,12 +387,12 @@ func (fp *filePicker) view(bodyW, height int) string {
 			scrollHintPlain = icons.ChevronUp + " " + itoa(aboveCount)
 			scrollHint = lipgloss.NewStyle().Foreground(theme.TextFaint).Background(bg).
 				Render(scrollHintPlain)
-			padW -= len([]rune(scrollHintPlain))
+			padW -= util.VisibleWidth(scrollHintPlain)
 		} else if i == end-1 && belowCount > 0 {
 			scrollHintPlain = icons.ChevronDown + " " + itoa(belowCount)
 			scrollHint = lipgloss.NewStyle().Foreground(theme.TextFaint).Background(bg).
 				Render(scrollHintPlain)
-			padW -= len([]rune(scrollHintPlain))
+			padW -= util.VisibleWidth(scrollHintPlain)
 		}
 
 		pad := ""

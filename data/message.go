@@ -1,6 +1,9 @@
 package data
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Flag represents an IMAP message flag.
 type Flag string
@@ -85,6 +88,19 @@ func (m *Message) FromString() string {
 		return ""
 	}
 	return m.From[0].String()
+}
+
+// FromKey returns the stable identity of the sender, used to pick its colour.
+// The address is preferred over the display name because the name changes
+// ("GitHub" vs "GitHub Actions") while the address does not.
+func (m *Message) FromKey() string {
+	if len(m.From) == 0 {
+		return ""
+	}
+	if m.From[0].Address != "" {
+		return strings.ToLower(m.From[0].Address)
+	}
+	return strings.ToLower(m.From[0].Name)
 }
 
 // Thread represents a group of related messages.

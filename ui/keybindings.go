@@ -1,84 +1,71 @@
 package ui
 
-import "github.com/bubblmail/bubblmail/ui/icons"
+import "github.com/bubblmail/bubblmail/ui/components"
 
-// Key constants for all actions.
-const (
-	KeyUp           = "up"
-	KeyDown         = "down"
-	KeyLeft         = "left"
-	KeyRight        = "right"
-	KeyJ            = "j"
-	KeyK            = "k"
-	KeyH            = "h"
-	KeyPageDown     = "ctrl+d"
-	KeyPageUp       = "ctrl+u"
-	KeyTop          = "g"
-	KeyBottom       = "G"
-	KeyEnter        = "enter"
-	KeyEsc          = "esc"
-	KeyBack         = "h"
-	KeyCompose      = "c"
-	KeyReply        = "r"
-	KeyReplyAll     = "R"
-	KeyForward      = "f"
-	KeyDelete       = "d"
-	KeyMove         = "v"
-	KeyArchive      = "e"
-	KeyStar         = "s"
-	KeyMarkRead     = "m"
-	KeyTag          = "t"
-	KeySearch       = "/"
-	KeyIMAPSearch   = "ctrl+f"
-	KeyFoldQuotes   = "z"
-	KeyInbox        = "i"
-	KeySidebar      = "b"
-	KeySidebarFocus = "\\"
-	KeyNextAcct     = "tab"
-	KeyPrevAcct     = "shift+tab"
-	KeySync         = "ctrl+r"
-	KeyHelp         = "?"
-	KeyQuit         = "q"
-	KeyCtrlC        = "ctrl+c"
-)
+// Key bindings live as string literals in the App.Update switch. A parallel
+// table of Key* constants used to sit here, referenced by nothing, and it drifted:
+// it claimed `\` focused the sidebar and `t` opened a tag picker, neither of
+// which the app has ever handled. HelpGroups below is now the only description
+// of the key map, and it is the one the user actually sees.
 
-// HelpLine describes a single key binding for the help overlay.
-type HelpLine struct {
-	Key  string
-	Desc string
+// HelpGroup is a titled block of bindings in the help overlay.
+//
+// Bindings are grouped by what the user is trying to do rather than listed in
+// one flat column: a thirty-row list is a list you scan for a key you already
+// know, and no help for the key you do not.
+type HelpGroup struct {
+	Title string
+	Keys  []components.Hint
 }
 
-// AllHelpLines returns all key bindings for the help overlay.
-func AllHelpLines() []HelpLine {
-	return []HelpLine{
-		{"j/k, " + icons.ArrowUp + "/" + icons.ArrowDown, "Navigate list"},
-		{"ctrl+d/u", "Page down/up"},
-		{"g/G", "Top/bottom"},
-		{"", ""},
-		{"Enter", "Open thread/message"},
-		{icons.ArrowLeftRight + " left/right", "Quick actions"},
-		{"Esc/q/h/" + icons.ArrowLeft, "Back to inbox"},
-		{"", ""},
-		{icons.Reply + "/" + icons.ReplyAll + " r/R", "Reply / Reply All"},
-		{icons.Forward + " f", "Forward"},
-		{icons.Compose + " c", "Compose new"},
-		{icons.Trash + " d", "Delete (move to Trash)"},
-		{icons.FolderOpen + " v", "Move to folder"},
-		{icons.Archive + " e", "Archive"},
-		{icons.Star + " s", "Toggle starred"},
-		{icons.Read + " m", "Toggle read/unread"},
-		{icons.Tag + " t", "Tag picker"},
-		{"", ""},
-		{"z", "Toggle quote folding"},
-		{icons.Search + " /", "Local search"},
-		{"ctrl+f", "IMAP server search"},
-		{icons.Inbox + " i", "Jump to INBOX"},
-		{icons.FolderTree + " b", "Toggle sidebar"},
-		{"\\", "Focus sidebar"},
-		{icons.FolderNew + " n", "New folder (sidebar)"},
-		{"Tab/Shift+Tab", "Next/prev account"},
-		{icons.Refresh + " ctrl+r", "Force sync"},
-		{icons.Help + " ?", "Help"},
-		{icons.Quit + " q q", "Quit"},
+// HelpGroups returns every binding, grouped for display.
+func HelpGroups() []HelpGroup {
+	return []HelpGroup{
+		{"Move", []components.Hint{
+			{Key: "j / k", Desc: "Up / down"},
+			{Key: "ctrl+d / u", Desc: "Page down / up"},
+			{Key: "g / G", Desc: "Top / bottom"},
+			{Key: "shift+↑/↓", Desc: "Extend selection"},
+			{Key: "↵", Desc: "Open thread"},
+			{Key: "esc / h", Desc: "Back"},
+		}},
+		{"Reply", []components.Hint{
+			{Key: "r", Desc: "Reply"},
+			{Key: "R", Desc: "Reply all"},
+			{Key: "f", Desc: "Forward"},
+			{Key: "c", Desc: "Compose new"},
+		}},
+		{"Organise", []components.Hint{
+			{Key: "s", Desc: "Toggle star"},
+			{Key: "m", Desc: "Toggle read"},
+			{Key: "e", Desc: "Archive"},
+			{Key: "v", Desc: "Move to folder"},
+			{Key: "d", Desc: "Delete to trash"},
+			{Key: "← / →", Desc: "Quick actions"},
+		}},
+		{"Find", []components.Hint{
+			{Key: "/", Desc: "Search this account"},
+			{Key: "ctrl+f", Desc: "Search on the server"},
+			{Key: "i", Desc: "Jump to inbox"},
+		}},
+		{"Layout", []components.Hint{
+			{Key: "b", Desc: "Toggle sidebar"},
+			{Key: "tab", Desc: "Focus sidebar"},
+			{Key: "n", Desc: "New folder (in sidebar)"},
+			{Key: "z", Desc: "Fold quoted text"},
+			{Key: "tab / shift+tab", Desc: "Cycle attachments"},
+		}},
+		{"Folder tree", []components.Hint{
+			{Key: "space", Desc: "Fold / unfold"},
+			{Key: "l / →", Desc: "Unfold"},
+			{Key: "h / ←", Desc: "Fold, then go up"},
+			{Key: "H / L", Desc: "Fold / unfold all"},
+			{Key: "click ▸", Desc: "Fold / unfold"},
+		}},
+		{"App", []components.Hint{
+			{Key: "ctrl+r", Desc: "Force sync"},
+			{Key: "?", Desc: "Close this help"},
+			{Key: "q q", Desc: "Quit"},
+		}},
 	}
 }

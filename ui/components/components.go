@@ -8,7 +8,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// Divider renders a full-width horizontal rule styled with the theme border colour.
+// Divider renders a horizontal rule on the surface fill. It belongs inside a
+// modal card, which is opaque; the panes do not use rules at all.
 func Divider(theme *config.Theme, width int) string {
 	return lipgloss.NewStyle().
 		Foreground(theme.Border).
@@ -33,6 +34,8 @@ func ModalBox(theme *config.Theme, content string, boxW, boxH, fullW, fullH int)
 		style = style.Height(boxH)
 	}
 	box := style.Render(content)
+	// The box is filled and the area around it is not: the card floats, and
+	// whatever the terminal shows through stays visible around it.
 	return lipgloss.Place(fullW, fullH, lipgloss.Center, lipgloss.Center, box)
 }
 
@@ -107,8 +110,9 @@ type TextInput struct {
 	Theme       *config.Theme
 	Placeholder string
 	Value       string
-	Icon        string // Optional icon prefix
-	Active      bool   // If true, shows a cursor block
+	Icon        string   // Optional icon prefix
+	Chips       []string // Committed filter chips, rendered as pills before Value
+	Active      bool     // If true, shows a cursor block
 }
 
 // NewTextInput creates a new standardized TextInput.
@@ -123,11 +127,6 @@ func NewTextInput(theme *config.Theme) *TextInput {
 func (t *TextInput) Render(width int) string {
 	theme := t.Theme
 	surf := theme.Surface
-	if t.Active {
-		surf = theme.SurfaceAlt // Highlight background slightly when active if needed, but keeping Surface to match original behavior.
-		// Actually, let's keep it Surface to match Bubblmail's original overlays exactly
-		surf = theme.Surface
-	}
 
 	var iconCell string
 	iconCellW := 0
@@ -141,18 +140,33 @@ func (t *TextInput) Render(width int) string {
 			Render(" " + t.Icon)
 	}
 
-	inputAreaW := width - iconCellW
+	// Committed chips are objects, not text: rendering them as pills is what
+	// tells the user backspace will remove a whole filter rather than a letter.
+	var chipCell string
+	chipCellW := 0
+	for _, c := range t.Chips {
+		room := width - iconCellW - chipCellW - 8 // keep room for the caret
+		if room < 5 {
+			break
+		}
+		label := util.TruncateText(util.SingleLine(c), room-2)
+		pill := Pill(theme, label, ToneAccent, surf)
+		chipCell += pill + lipgloss.NewStyle().Background(surf).Render(" ")
+		chipCellW += util.VisibleWidth(label) + 3
+	}
+
+	inputAreaW := width - iconCellW - chipCellW
 	if inputAreaW < 1 {
 		inputAreaW = 1
 	}
 
 	var textCell string
-	if t.Value == "" {
+	if t.Value == "" && chipCellW == 0 {
 		textCell = lipgloss.NewStyle().
 			Background(surf).
 			Foreground(theme.TextFaint).
 			Width(inputAreaW).
-			Render(t.Placeholder)
+			Render(util.TruncateText(t.Placeholder, inputAreaW))
 	} else {
 		displayVal := util.SingleLine(t.Value)
 		if t.Active {
@@ -174,5 +188,5 @@ func (t *TextInput) Render(width int) string {
 		}
 	}
 
-	return iconCell + textCell
+	return iconCell + chipCell + textCell
 }

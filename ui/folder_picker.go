@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"github.com/bubblmail/bubblmail/config"
 	"strings"
 	"unicode/utf8"
 
@@ -13,7 +14,7 @@ import (
 
 // FolderPickerOverlay is a floating folder-selection menu with type-to-filter search.
 type FolderPickerOverlay struct {
-	styles   *Styles
+	theme    *config.Theme
 	width    int
 	height   int
 	active   bool
@@ -25,8 +26,8 @@ type FolderPickerOverlay struct {
 }
 
 // NewFolderPickerOverlay creates a new folder picker overlay.
-func NewFolderPickerOverlay(styles *Styles) *FolderPickerOverlay {
-	return &FolderPickerOverlay{styles: styles}
+func NewFolderPickerOverlay(theme *config.Theme) *FolderPickerOverlay {
+	return &FolderPickerOverlay{theme: theme}
 }
 
 // SetSize sets the overlay dimensions.
@@ -174,17 +175,30 @@ func (f *FolderPickerOverlay) HandleKey(key string) (closed bool) {
 	return false
 }
 
-// listHeight returns the number of folder rows that fit in the current layout.
+// listHeight returns the number of folder rows the list shows.
+//
+// It follows the result count rather than always claiming the maximum, so a
+// five-folder account gets a five-row box instead of a mostly-empty one — but
+// it has a floor, so filtering down to one match does not make the box jump
+// around under the cursor.
 func (f *FolderPickerOverlay) listHeight() int {
 	// Overhead: border(2) + padding_v(2) + title(1) + blank(1) + input(1) + sep(1) = 8
-	h := f.height - 8
-	if h < 3 {
-		h = 3
+	maxH := f.height - 8
+	if maxH > 15 {
+		maxH = 15
 	}
-	if h > 15 {
-		h = 15
+	if maxH < 3 {
+		maxH = 3
 	}
-	return h
+
+	n := len(f.filtered)
+	if n < 5 {
+		n = 5
+	}
+	if n > maxH {
+		n = maxH
+	}
+	return n
 }
 
 // innerWidth computes the content area width that fits all folder names.
@@ -258,7 +272,7 @@ func pickerFolderIcon(folder *data.Folder) string {
 
 // View renders the folder picker overlay.
 func (f *FolderPickerOverlay) View() string {
-	theme := f.styles.Theme
+	theme := f.theme
 
 	cw := f.innerWidth()
 	listH := f.listHeight()
@@ -269,12 +283,7 @@ func (f *FolderPickerOverlay) View() string {
 	innerW := cw - 2*hPad
 
 	// Title row — plain string, single style, no resets mid-row.
-	titleLine := lipgloss.NewStyle().
-		Background(theme.Surface).
-		Foreground(theme.Accent).
-		Bold(true).
-		Width(innerW).
-		Render(icons.FolderOpen + " Move to folder")
+	titleLine := components.PaneTitle(theme, icons.FolderOpen+" Move to folder", innerW, theme.Surface)
 
 	// Input row
 	ti := components.NewTextInput(theme)
@@ -285,23 +294,28 @@ func (f *FolderPickerOverlay) View() string {
 
 	inputLine := ti.Render(innerW)
 
-	// Folder rows
+	// Folder rows. The cursor is drawn with the same gutter-plus-raised-fill
+	// treatment the sidebar and the search results use.
 	isFiltering := f.query != ""
-	nameAvail := innerW - 3 // " " + icon(1) + " "
+	const gutW = 1
+	rowW := innerW - gutW - 1 // gutter on the left, scroll indicator on the right
+	nameAvail := rowW - 3     // " " + icon(1) + " "
 
 	var rows []string
 	if len(f.filtered) == 0 {
-		emptyMsg := "  " + icons.FolderEmpty + "  No matches"
+		emptyMsg := icons.FolderEmpty + "  No matches"
 		if len(f.all) == 0 {
-			emptyMsg = "  " + icons.FolderEmpty + "  No folders available"
+			emptyMsg = icons.FolderEmpty + "  No folders available"
 		}
 		rows = append(rows, lipgloss.NewStyle().
 			Background(theme.Surface).
 			Foreground(theme.TextFaint).
 			Width(innerW).
+			Align(lipgloss.Center).
 			Render(emptyMsg))
 	}
 
+	track := components.Scrollbar(theme, len(f.filtered), listH, f.list.Offset, listH, theme.Surface)
 	for i := f.list.Offset; i < len(f.filtered) && i < f.list.Offset+listH; i++ {
 		folder := f.filtered[i]
 		isSelected := i == f.list.Cursor
@@ -314,31 +328,27 @@ func (f *FolderPickerOverlay) View() string {
 			nameStr = util.SingleLine(folder.Name)
 		} else {
 			// Tree mode: indented display name reflects mailbox hierarchy.
-			indent := strings.Repeat("  ", folder.Depth)
-			nameStr = indent + util.SingleLine(folder.DisplayName)
+			nameStr = strings.Repeat("  ", folder.Depth) + util.SingleLine(folder.DisplayName)
 		}
 
-		// plainRow is pure plain text — safe for Width(innerW).
-		plainRow := " " + icon + " " + util.TruncateText(nameStr, nameAvail)
-
+		bg, fg, gut := theme.Surface, theme.Text, components.GutterNone
+		bold := false
 		if isSelected {
-			rows = append(rows, lipgloss.NewStyle().
-				Background(theme.Selected).
-				Foreground(theme.Background).
-				Bold(true).
-				Width(innerW).
-				Render(plainRow))
-		} else {
-			rows = append(rows, lipgloss.NewStyle().
-				Background(theme.Surface).
-				Foreground(theme.Text).
-				Width(innerW).
-				Render(plainRow))
+			bg, fg, gut, bold = theme.SurfaceAlt, theme.Text, components.GutterActive, true
 		}
+
+		// plainRow is pure plain text — safe for Width(rowW).
+		plainRow := " " + icon + " " + util.TruncateText(nameStr, nameAvail)
+		row := components.GutterCell(theme, gut, bg) +
+			lipgloss.NewStyle().Background(bg).Foreground(fg).Bold(bold).Width(rowW).Render(plainRow)
+		if idx := i - f.list.Offset; idx < len(track) {
+			row += track[idx]
+		}
+		rows = append(rows, row)
 	}
 
 	// Pad remaining rows to keep the box height stable.
-	blank := lipgloss.NewStyle().Background(theme.Surface).Width(innerW).Render("")
+	blank := components.Fill(innerW, theme.Surface)
 	for len(rows) < listH {
 		rows = append(rows, blank)
 	}

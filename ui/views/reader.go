@@ -35,6 +35,7 @@ type ReaderView struct {
 	// msgLineOffsets[i] is the first line index of thread.Messages[i].
 	msgLineOffsets []int
 	// Button-row tracking for mouse hit testing.
+	outerWidth            int // full pane width; v.width is outerWidth minus the scrollbar
 	attachButtonScrollRow int // index in v.lines where attach action buttons appear, or -1
 	eventButtonScrollRow  int // index in v.lines where event action buttons appear (thread mode), or -1
 	eventButtonHeaderRow  int // row within static single-mode header where event buttons appear, or -1
@@ -55,12 +56,66 @@ func (v *ReaderView) ToggleQuoteFolds() {
 func (v *ReaderView) QuotesFolded() bool { return v.quotesFolded }
 
 // SetSize sets the view dimensions and re-renders cached lines.
+//
+// v.width is the *content* width: the rightmost column of the pane belongs to
+// the scroll indicator. Keeping the reservation here means every line builder
+// downstream wraps to the right width without knowing the scrollbar exists.
 func (v *ReaderView) SetSize(w, h int) {
-	v.width = w
+	v.outerWidth = w
+	v.width = w - readerBarW
+	if v.width < 1 {
+		v.width = 1
+	}
 	v.height = h
 	if v.thread != nil || v.message != nil {
 		v.rebuildLines()
 	}
+}
+
+// readerBarW is the column reserved on the right for the scroll indicator.
+// readerBodyPad is the left margin given to message text: body copy set flush
+// against the sidebar border is markedly harder to read than the same text
+// with two columns of air, and the reader is the one pane that is all prose.
+const (
+	readerBarW    = 1
+	readerBodyPad = 2
+)
+
+// readerActionIndent is the column where in-body action buttons start. Both
+// the renderer and the mouse hit-tests read it, so the two cannot drift.
+const readerActionIndent = 2
+
+// bodyWidth is the column budget for wrapped message text.
+func (v *ReaderView) bodyWidth() int {
+	w := v.width - readerBodyPad*2
+	if w < 20 {
+		w = 20
+	}
+	return w
+}
+
+// indent shifts rendered body lines into the body gutter.
+func indent(lines []string, n int) []string {
+	pad := strings.Repeat(" ", n)
+	out := make([]string, len(lines))
+	for i, l := range lines {
+		out[i] = pad + l
+	}
+	return out
+}
+
+// withScrollbar joins the scroll indicator column onto rendered body rows.
+func (v *ReaderView) withScrollbar(rows []string, total, offset int) []string {
+	track := components.Scrollbar(v.theme, total, len(rows), offset, len(rows), "")
+	out := make([]string, len(rows))
+	for i, r := range rows {
+		cell := components.Fill(readerBarW, "")
+		if i < len(track) {
+			cell = track[i]
+		}
+		out[i] = v.pane().Width(v.width).MaxWidth(v.width).Render(r) + cell
+	}
+	return out
 }
 
 // SetMessage switches to single-message mode.
@@ -268,9 +323,9 @@ func (v *ReaderView) HitTestContent(contentY, x int) string {
 }
 
 // readerHitTestAttachButtons maps an x coordinate to an attachment button action.
-// Buttons are rendered at indent=12: Open(6) space Download(10) space Editor(8).
+// Buttons are rendered at readerActionIndent: Open(6) space Download(10) space Editor(8).
 func readerHitTestAttachButtons(x int) string {
-	const indent = 12
+	const indent = readerActionIndent
 	if x < indent {
 		return ""
 	}
@@ -293,9 +348,9 @@ func readerHitTestAttachButtons(x int) string {
 }
 
 // readerHitTestEventButtons maps an x coordinate to an event button action.
-// Buttons are rendered at indent=12: CopyPlain(12) space CopyJSON(11) space Reject(8).
+// Buttons are rendered at readerActionIndent: CopyPlain(12) space CopyJSON(11) space Reject(8).
 func readerHitTestEventButtons(x int) string {
-	const indent = 12
+	const indent = readerActionIndent
 	if x < indent {
 		return ""
 	}
@@ -459,19 +514,16 @@ func (v *ReaderView) buildSingleLines() {
 	bodyLoaded := v.message.Body != "" || v.message.HTMLBody != ""
 	hasAttachments := len(v.message.Attachments) > 0
 	if !bodyLoaded && !hasAttachments {
-		v.lines = []string{fmt.Sprintf("(%s No body loaded — press Enter to fetch)", icons.Download)}
+		v.lines = []string{v.pane().Foreground(v.theme.TextFaint).
+			Render(fmt.Sprintf("  %s No body loaded — press ↵ to fetch", icons.Download))}
 		return
-	}
-	textWidth := v.width - 2
-	if textWidth < 20 {
-		textWidth = 20
 	}
 	if bodyLoaded {
 		plainBody := v.message.Body
 		if v.quotesFolded && v.message.HTMLBody == "" && plainBody != "" {
 			plainBody = render.FoldQuoteBlocks(plainBody)
 		}
-		v.lines = render.RenderBody(plainBody, v.message.HTMLBody, textWidth, v.theme)
+		v.lines = indent(render.RenderBody(plainBody, v.message.HTMLBody, v.bodyWidth(), v.theme), readerBodyPad)
 	} else {
 		v.lines = nil
 	}
@@ -495,13 +547,16 @@ func (v *ReaderView) buildThreadLines() {
 	v.eventButtonScrollRow = -1
 	var all []string
 
-	divider := lipgloss.NewStyle().Foreground(v.theme.Border).Render(strings.Repeat("─", v.width))
+	// A blank row on the content plane, not a rule. Each block in this pane
+	// already carries its own accent bar or section label; a full-width line
+	// between them was a second separator doing the same job louder.
+	gap := components.Fill(v.width, "")
 	for i, msg := range msgs {
 		v.msgLineOffsets[i] = len(all)
 		isLatest := i == len(msgs)-1
 
 		if i == 0 {
-			all = append(all, v.fullMsgHeader(msg)...)
+			all = append(all, v.messageHeaderLines(msg)...)
 		} else {
 			all = append(all, "") // blank spacer before separator
 			all = append(all, v.compactMsgHeader(msg))
@@ -511,22 +566,17 @@ func (v *ReaderView) buildThreadLines() {
 		if isLatest {
 			if extra := v.renderSuggestedEventSection(); len(extra) > 0 {
 				if i > 0 {
-					// compactMsgHeader has no trailing divider — add one before the event.
-					all = append(all, divider)
+					all = append(all, gap)
 				}
 				all = append(all, extra...)
 				// Event buttons are the last line only when the event has actions.
 				if v.event != nil && v.event.HasEvent {
 					v.eventButtonScrollRow = len(all) - 1
 				}
-				all = append(all, divider)
+				all = append(all, gap)
 			}
 		}
 
-		textWidth := v.width - 2
-		if textWidth < 20 {
-			textWidth = 20
-		}
 		if msg.Body == "" && msg.HTMLBody == "" {
 			all = append(all, fmt.Sprintf("  (%s Loading…)", icons.Syncing))
 		} else {
@@ -534,7 +584,7 @@ func (v *ReaderView) buildThreadLines() {
 			if v.quotesFolded && msg.HTMLBody == "" && plainBody != "" {
 				plainBody = render.FoldQuoteBlocks(plainBody)
 			}
-			all = append(all, render.RenderBody(plainBody, msg.HTMLBody, textWidth, v.theme)...)
+			all = append(all, indent(render.RenderBody(plainBody, msg.HTMLBody, v.bodyWidth(), v.theme), readerBodyPad)...)
 		}
 		// The latest message's attachments are handled by the interactive
 		// section appended below; render all others non-interactively.
@@ -562,40 +612,16 @@ func (v *ReaderView) renderAttachmentLines() []string {
 		v.attachButtonScrollRow = -1
 		return nil
 	}
-	theme := v.theme
-	divider := lipgloss.NewStyle().Foreground(theme.Border).Render(strings.Repeat("─", v.width))
-	labelStyle := lipgloss.NewStyle().Foreground(theme.TextMuted).Width(10).Align(lipgloss.Right)
-	normalStyle := lipgloss.NewStyle().Foreground(theme.Text)
-	focusedStyle := lipgloss.NewStyle().Foreground(theme.Accent).Bold(true)
-
-	maxNameW := v.width - 28
-	if maxNameW < 10 {
-		maxNameW = 10
-	}
-
 	v.attachButtonScrollRow = -1
-	lines := []string{divider}
-	for i, att := range atts {
-		label := "        "
-		if i == 0 {
-			label = labelStyle.Render("Attach")
-		}
-		focused := v.attachFocus == i
-		name := util.TruncateText(util.SingleLine(att.Filename), maxNameW)
-		size := formatAttachmentSize(len(att.Data))
 
-		rowStyle := normalStyle
-		if focused {
-			rowStyle = focusedStyle
-		}
-		row := label + "  " + rowStyle.Render(icons.Attachment+" "+name+"  "+size)
-		lines = append(lines, row)
-		if focused {
-			v.attachButtonScrollRow = len(lines) // relative to this slice's start
-			lines = append(lines, "            "+v.renderAttachmentButtons())
-		}
+	rows, buttonRow := v.attachmentRows(atts, v.attachFocus)
+	out := []string{components.Fill(v.width, "")}
+	out = append(out, components.Card(v.theme, rows, v.width, v.theme.Border)...)
+	if buttonRow >= 0 {
+		// +len(prefix rows) to convert from card-relative to slice-relative.
+		v.attachButtonScrollRow = buttonRow + 2
 	}
-	return lines
+	return out
 }
 
 // renderAttachmentLinesSimple renders attachment names for thread mode (no interactivity).
@@ -603,27 +629,48 @@ func (v *ReaderView) renderAttachmentLinesSimple(atts []data.Attachment) []strin
 	if len(atts) == 0 {
 		return nil
 	}
+	rows, _ := v.attachmentRows(atts, -1)
+	out := []string{components.Fill(v.width, "")}
+	return append(out, components.Card(v.theme, rows, v.width, v.theme.Border)...)
+}
+
+// attachmentRows renders the shared attachment list body. focus is the index of
+// the attachment whose action buttons should be shown, or -1 for none; the
+// returned buttonRow is that row's index within rows, or -1.
+func (v *ReaderView) attachmentRows(atts []data.Attachment, focus int) (rows []string, buttonRow int) {
 	theme := v.theme
-	divider := lipgloss.NewStyle().Foreground(theme.Border).Render(strings.Repeat("─", v.width))
-	labelStyle := lipgloss.NewStyle().Foreground(theme.TextMuted).Width(10).Align(lipgloss.Right)
-	valueStyle := lipgloss.NewStyle().Foreground(theme.Text)
+	buttonRow = -1
 
-	maxNameW := v.width - 28
-	if maxNameW < 10 {
-		maxNameW = 10
+	inner := v.width - readerActionIndent
+	if inner < 20 {
+		inner = 20
 	}
 
-	lines := []string{divider}
+	rows = append(rows, v.pane().Foreground(theme.TextFaint).Bold(true).
+		Render(icons.Attachment+" "+strings.ToUpper(util.PluralCount(len(atts), "attachment", "attachments"))))
+
 	for i, att := range atts {
-		label := "        "
-		if i == 0 {
-			label = labelStyle.Render("Attach")
-		}
-		name := util.TruncateText(util.SingleLine(att.Filename), maxNameW)
 		size := formatAttachmentSize(len(att.Data))
-		lines = append(lines, label+"  "+valueStyle.Render(icons.Attachment+" "+name+"  "+size))
+		sizeW := util.VisibleWidth(size)
+		nameW := inner - sizeW - 3 // 2 cols between name and size, 1 of trailing air
+		if nameW < 8 {
+			nameW = 8
+		}
+
+		nameSt := v.pane().Foreground(theme.Text).Width(nameW)
+		if i == focus {
+			nameSt = nameSt.Foreground(theme.Accent).Bold(true)
+		}
+		rows = append(rows,
+			nameSt.Render(util.TruncateText(util.SingleLine(att.Filename), nameW))+
+				v.pane().Foreground(theme.TextFaint).Render(size+" "))
+
+		if i == focus {
+			buttonRow = len(rows)
+			rows = append(rows, v.renderAttachmentButtons())
+		}
 	}
-	return lines
+	return rows, buttonRow
 }
 
 func (v *ReaderView) renderAttachmentButtons() string {
@@ -649,85 +696,158 @@ func formatAttachmentSize(n int) string {
 	}
 }
 
-// fullMsgHeader returns the 5-line header: From / To / Date / Subject / divider.
-func (v *ReaderView) fullMsgHeader(msg *data.Message) []string {
+// messageHeaderLines renders the header block for one message:
+//
+//	▌ Q1 Planning Meeting                                             ★
+//	▌ Sarah Chen <sarah@acme.com>  →  Alice Demo
+//	▌ Thursday, August 20, 2026 · 09:00                     󰁦 2 files
+//	────────────────────────────────────────────────────────────────────
+//
+// The subject leads because it is what the reader came for; the old layout put
+// three routing fields above it and made the headline the fourth line down.
+// The accent bar is the same Card idiom used by the suggested-event block, so
+// the two read as siblings rather than as unrelated header styles.
+func (v *ReaderView) messageHeaderLines(msg *data.Message) []string {
 	theme := v.theme
-	divider := lipgloss.NewStyle().Foreground(theme.Border).Render(strings.Repeat("─", v.width))
 
-	labelStyle := lipgloss.NewStyle().Foreground(theme.TextMuted).Width(10).Align(lipgloss.Right)
-	valueStyle := lipgloss.NewStyle().Foreground(theme.Text)
-	boldStyle := lipgloss.NewStyle().Foreground(theme.Text).Bold(true)
-
-	maxValW := v.width - 12
-	if maxValW < 10 {
-		maxValW = 10
-	}
-	maxSubjectW := maxValW - 2
-	if maxSubjectW < 5 {
-		maxSubjectW = 5
+	// Card prepends "▌ " — two columns off the content budget.
+	const barW = 2
+	inner := v.width - barW
+	if inner < 20 {
+		inner = 20
 	}
 
-	fromStr := util.TruncateText(util.SingleLine(addressListStr(msg.From)), maxValW)
-	toStr := util.TruncateText(util.SingleLine(addressListStr(msg.To)), maxValW)
-	dateStr := util.TruncateText(util.FormatDateLong(msg.Date)+"  "+msg.Date.Format("15:04"), maxValW)
-	subjectStr := util.TruncateText(util.SingleLine(msg.Subject), maxSubjectW)
-
-	stars := ""
+	// ── Line 1: subject, with the star pinned right ──────────────────────────
+	star, starW := "", 0
 	if msg.IsStarred() {
-		stars = lipgloss.NewStyle().Foreground(theme.Starred).Render(" " + icons.Star)
+		star = v.pane().Foreground(theme.Starred).Render(icons.Star)
+		starW = util.VisibleWidth(icons.Star) + 1
+	}
+	subject := util.SingleLine(msg.Subject)
+	if strings.TrimSpace(subject) == "" {
+		subject = "(no subject)"
+	}
+	subject = util.TruncateText(subject, inner-starW)
+	subjLine := v.pane().
+		Foreground(theme.Text).Bold(true).
+		Width(inner - starW).
+		Render(subject)
+	if star != "" {
+		subjLine += " " + star
 	}
 
-	return []string{
-		labelStyle.Render("From") + "  " + valueStyle.Render(fromStr),
-		labelStyle.Render("To") + "  " + valueStyle.Render(toStr),
-		labelStyle.Render("Date") + "  " + valueStyle.Render(dateStr),
-		labelStyle.Render("Subject") + "  " + boldStyle.Render(subjectStr) + stars,
-		divider,
+	// ── Line 2: sender → recipients ──────────────────────────────────────────
+	arrow := v.pane().Foreground(theme.TextFaint).Render("  " + icons.ArrowRight + "  ")
+	arrowW := util.VisibleWidth("  " + icons.ArrowRight + "  ")
+
+	from := util.SingleLine(addressListStr(msg.From))
+	to := util.SingleLine(addressListStr(msg.To))
+
+	fromW := inner
+	toW := 0
+	if to != "" {
+		// The sender is the more useful half, so it gets the larger share and
+		// the recipient list absorbs the truncation.
+		fromW = (inner - arrowW) * 3 / 5
+		if fromW < 10 {
+			fromW = 10
+		}
+		toW = inner - arrowW - fromW
+		if toW < 0 {
+			toW = 0
+		}
 	}
+	// The sender's hue is the same one the inbox put on this thread's unread
+	// dot, so opening a message confirms what the list already said.
+	peopleLine := v.pane().Foreground(theme.Hue(msg.FromKey())).Bold(true).
+		Render(util.TruncateText(from, fromW))
+	if to != "" && toW > 3 {
+		peopleLine += arrow + v.pane().Foreground(theme.TextMuted).
+			Render(util.TruncateText(to, toW))
+	}
+
+	// ── Line 3: date, with the attachment tally pinned right ─────────────────
+	var attachStr string
+	attachW := 0
+	if n := len(msg.Attachments); n > 0 {
+		plain := icons.Attachment + " " + util.PluralCount(n, "file", "files")
+		attachStr = v.pane().Foreground(theme.TextMuted).Render(plain)
+		attachW = util.VisibleWidth(plain)
+	}
+	dateStr := util.FormatDateLong(msg.Date) + " · " + msg.Date.Format("15:04")
+	dateLine := v.pane().
+		Foreground(theme.TextMuted).
+		Width(inner - attachW).
+		Render(util.TruncateText(dateStr, inner-attachW))
+	if attachStr != "" {
+		dateLine += attachStr
+	}
+
+	lines := components.Card(theme, []string{subjLine, peopleLine, dateLine}, v.width, theme.Hue(msg.FromKey()))
+	// A blank row on the content plane closes the card. A full-width rule here
+	// competed with the card's own accent bar: two separators for one break.
+	return append(lines, components.Fill(v.width, ""))
 }
 
-// compactMsgHeader renders a single decorative separator line used between
-// messages in a thread:   ──── Sender Name ──────────────────── Date ────
+// compactMsgHeader renders the separator between messages inside a thread:
+//
+//	SARAH CHEN ─────────────────────────────────────────   Mon 09:41
+//
+// It is the same small-caps-label-plus-rule idiom the inbox uses for its date
+// groups, so "a new block starts here" looks the same in both panes.
 func (v *ReaderView) compactMsgHeader(msg *data.Message) string {
 	theme := v.theme
-	dash := lipgloss.NewStyle().Foreground(theme.Border)
-	fromStyle := lipgloss.NewStyle().Foreground(theme.Text).Bold(true)
-	dateStyle := lipgloss.NewStyle().Foreground(theme.TextMuted)
 
-	maxFromW := v.width / 2
-	if maxFromW < 10 {
-		maxFromW = 10
+	dateStr := util.FormatDate(msg.Date) + " " + msg.Date.Format("15:04")
+	dateW := util.VisibleWidth(dateStr) + 3 // 2 cols of lead-in, 1 of trailing air
+
+	labelW := v.width - dateW
+	if labelW < 8 {
+		labelW = 8
+		dateW = 0
+		dateStr = ""
 	}
-	fromStr := util.TruncateText(util.SingleLine(addressListStr(msg.From)), maxFromW)
-	dateStr := util.FormatDate(msg.Date)
 
-	fromPart := fromStyle.Render(fromStr)
-	datePart := dateStyle.Render(dateStr)
-
-	// layout: "──── " + fromPart + " " + fill + " " + datePart + " ────"
-	//          5 cols    fromW     1      fillW   1     dateW     5 cols
-	fromW := lipgloss.Width(fromPart)
-	dateW := lipgloss.Width(datePart)
-	fillW := v.width - 5 - fromW - 1 - 1 - dateW - 5
-	if fillW < 1 {
-		fillW = 1
+	from := util.SingleLine(addressListStr(msg.From))
+	line := components.TintedLabel(theme, from, labelW, "", theme.Hue(msg.FromKey()))
+	if dateStr != "" {
+		line += v.pane().
+			Foreground(theme.TextMuted).
+			Width(dateW).
+			Align(lipgloss.Right).
+			Render(dateStr + " ")
 	}
-	fill := dash.Render(strings.Repeat("─", fillW))
-
-	return dash.Render("──── ") + fromPart + " " + fill + " " + datePart + dash.Render(" ────")
+	return line
 }
 
 // View renders the reader pane.
+// pane returns the base style for a line of reader content. It sets no
+// background: the content area is transparent, so a terminal with a background
+// image or an alpha channel shows through the mail rather than behind it.
+func (v *ReaderView) pane() lipgloss.Style {
+	return lipgloss.NewStyle()
+}
+
 func (v *ReaderView) View() string {
 	theme := v.theme
 	if v.thread == nil && v.message == nil {
-		empty := lipgloss.NewStyle().Foreground(theme.TextMuted).Render(icons.MailOpen + " No message selected")
-		return lipgloss.Place(v.width, v.height, lipgloss.Center, lipgloss.Center, empty)
+		return components.EmptyState(theme, v.outerWidth, v.height,
+			icons.MailOpen, "No message selected", "pick a thread and press ↵")
 	}
 	if v.thread != nil {
-		return v.viewThread()
+		return v.pad(v.viewThread())
 	}
-	return v.viewSingle()
+	return v.pad(v.viewSingle())
+}
+
+// pad squares the reader off to the full pane height so the rows below the
+// message are blank rather than absent. It adds no fill of its own.
+func (v *ReaderView) pad(body string) string {
+	rows := strings.Split(body, "\n")
+	for len(rows) < v.height {
+		rows = append(rows, "")
+	}
+	return strings.Join(rows, "\n")
 }
 
 // viewThread renders the thread as a scrollable full-height block.
@@ -746,34 +866,12 @@ func (v *ReaderView) viewThread() string {
 	copy(padded, v.lines[start:end])
 	// empty strings already in padded from make
 
-	// Scroll percentage in bottom-right of the last row (only when there is room).
-	if len(v.lines) > bh && bh > 0 {
-		pct := (v.scrollY + bh) * 100 / len(v.lines)
-		if pct > 100 {
-			pct = 100
-		}
-		indicator := lipgloss.NewStyle().
-			Foreground(v.theme.TextFaint).
-			Render(fmt.Sprintf(" %d%%", pct))
-		indW := lipgloss.Width(indicator)
-		last := padded[bh-1]
-		lastW := lipgloss.Width(last)
-		gap := v.width - lastW - indW
-		if gap >= 0 {
-			// There is room: right-align indicator without overflowing the line.
-			padded[bh-1] = last + strings.Repeat(" ", gap) + indicator
-		}
-		// If gap < 0 the line is already wide enough to overflow — skip the
-		// indicator rather than wrapping the line and pushing the header off screen.
-	}
-
-	return lipgloss.NewStyle().Width(v.width).Render(strings.Join(padded, "\n"))
+	return strings.Join(v.withScrollbar(padded, len(v.lines), v.scrollY), "\n")
 }
 
 // viewSingle renders the classic static-header + scrollable-body layout.
 func (v *ReaderView) viewSingle() string {
-	theme := v.theme
-	headerStr := strings.Join(v.singleHeaderLines(), "\n")
+	headerLines := v.singleHeaderLines()
 
 	bh := v.bodyHeight()
 	start := v.scrollY
@@ -788,63 +886,20 @@ func (v *ReaderView) viewSingle() string {
 	padded := make([]string, bh)
 	copy(padded, v.lines[start:end])
 
-	if len(v.lines) > bh {
-		pct := 0
-		if len(v.lines) > 0 {
-			pct = (v.scrollY + bh) * 100 / len(v.lines)
-			if pct > 100 {
-				pct = 100
-			}
-		}
-		scrollIndicator := lipgloss.NewStyle().
-			Foreground(theme.TextFaint).
-			Render(fmt.Sprintf(" %d%%", pct))
-		_ = scrollIndicator // retained for future: show in divider row
+	// The header keeps the full pane width; only the scrolling body carries a
+	// position indicator, because only the body scrolls.
+	rows := make([]string, 0, len(headerLines)+bh)
+	for _, h := range headerLines {
+		rows = append(rows, v.pane().Width(v.outerWidth).MaxWidth(v.outerWidth).Render(h))
 	}
+	rows = append(rows, v.withScrollbar(padded, len(v.lines), v.scrollY)...)
 
-	bodyStr := lipgloss.NewStyle().
-		Width(v.width).
-		Render(strings.Join(padded, "\n"))
-
-	return lipgloss.JoinVertical(lipgloss.Left,
-		lipgloss.NewStyle().Width(v.width).Render(headerStr),
-		bodyStr,
-	)
+	return strings.Join(rows, "\n")
 }
 
 func (v *ReaderView) singleHeaderLines() []string {
-	theme := v.theme
-	divider := lipgloss.NewStyle().Foreground(theme.Border).Render(strings.Repeat("─", v.width))
-	labelStyle := lipgloss.NewStyle().Foreground(theme.TextMuted).Width(10).Align(lipgloss.Right)
-	valueStyle := lipgloss.NewStyle().Foreground(theme.Text)
-	boldStyle := lipgloss.NewStyle().Foreground(theme.Text).Bold(true)
+	lines := v.messageHeaderLines(v.message)
 
-	maxValW := v.width - 12
-	if maxValW < 10 {
-		maxValW = 10
-	}
-	maxSubjectW := maxValW - 2
-	if maxSubjectW < 5 {
-		maxSubjectW = 5
-	}
-
-	fromStr := util.TruncateText(util.SingleLine(addressListStr(v.message.From)), maxValW)
-	toStr := util.TruncateText(util.SingleLine(addressListStr(v.message.To)), maxValW)
-	dateStr := util.TruncateText(util.FormatDateLong(v.message.Date)+"  "+v.message.Date.Format("15:04"), maxValW)
-	subjectStr := util.TruncateText(util.SingleLine(v.message.Subject), maxSubjectW)
-
-	stars := ""
-	if v.message.IsStarred() {
-		stars = lipgloss.NewStyle().Foreground(theme.Starred).Render(" " + icons.Star)
-	}
-
-	lines := []string{
-		labelStyle.Render("From") + "  " + valueStyle.Render(fromStr),
-		labelStyle.Render("To") + "  " + valueStyle.Render(toStr),
-		labelStyle.Render("Date") + "  " + valueStyle.Render(dateStr),
-		labelStyle.Render("Subject") + "  " + boldStyle.Render(subjectStr) + stars,
-	}
-	lines = append(lines, divider)
 	v.eventButtonHeaderRow = -1
 	if extra := v.renderSuggestedEventSection(); len(extra) > 0 {
 		// Event buttons are the last line only when the event has actions.
@@ -852,121 +907,103 @@ func (v *ReaderView) singleHeaderLines() []string {
 			v.eventButtonHeaderRow = len(lines) + len(extra) - 1
 		}
 		lines = append(lines, extra...)
-		lines = append(lines, divider)
+		lines = append(lines, components.Fill(v.width, ""))
 	}
 	return lines
 }
 
 func (v *ReaderView) renderSuggestedEventSection() []string {
-	labelStyle := lipgloss.NewStyle().Foreground(v.theme.TextMuted).Width(10).Align(lipgloss.Right)
-	header := labelStyle.Render("Event") + "  " + lipgloss.NewStyle().Foreground(v.theme.Accent).Bold(true).Render(icons.Calendar+" Suggested Event")
-
-	if v.event == nil {
-		return []string{
-			header,
-			"            " + lipgloss.NewStyle().Foreground(v.theme.TextMuted).Render("Loading suggestion..."),
-		}
+	theme := v.theme
+	inner := v.width - readerActionIndent
+	if inner < 20 {
+		inner = 20
 	}
-	if !v.event.GenerationOK {
-		msg := "No suggested event available"
+
+	title := v.pane().Foreground(theme.TextFaint).Bold(true).
+		Render(icons.Calendar + " SUGGESTED EVENT")
+
+	// Non-event states are a single explanatory line under the same bar, so the
+	// block does not change shape as the suggestion resolves.
+	note := func(msg string) []string {
+		return components.Card(theme, []string{
+			title,
+			v.pane().Foreground(theme.TextMuted).
+				Render(util.TruncateText(util.SingleLine(msg), inner)),
+		}, v.width, theme.AccentSoft)
+	}
+
+	switch {
+	case v.event == nil:
+		return note(icons.Syncing + " Looking for an event…")
+	case !v.event.GenerationOK:
 		if v.event.ParseError != "" {
-			msg = util.TruncateText(util.SingleLine(v.event.ParseError), max(20, v.width-14))
+			return note(v.event.ParseError)
 		}
-		return []string{
-			header,
-			"            " + lipgloss.NewStyle().Foreground(v.theme.TextMuted).Render(msg),
-		}
-	}
-	if !v.event.HasEvent {
-		return []string{
-			header,
-			"            " + lipgloss.NewStyle().Foreground(v.theme.TextMuted).Render("No event found in this message"),
-		}
+		return note("No suggested event available")
+	case !v.event.HasEvent:
+		return note("No event found in this message")
 	}
 
-	// Render the event fields as highlighted rows.
-	fieldLabel := lipgloss.NewStyle().Foreground(v.theme.TextMuted)
-	fieldValue := lipgloss.NewStyle().Foreground(v.theme.Text)
-	titleStyle := lipgloss.NewStyle().Foreground(v.theme.Text).Bold(true)
-	indent := "            "
+	ev := v.event
+	muted := v.pane().Foreground(theme.TextMuted)
 
-	var out []string
-	out = append(out, header)
+	body := []string{title}
 
-	// Title row
-	summary := util.SingleLine(v.event.Summary)
-	if summary != "" {
-		out = append(out, indent+titleStyle.Render(summary))
+	if summary := util.SingleLine(ev.Summary); summary != "" {
+		body = append(body, v.pane().Foreground(theme.Text).Bold(true).
+			Render(util.TruncateText(summary, inner)))
 	}
 
-	// Date / time row
-	if v.event.AllDay && v.event.Date != "" {
-		out = append(out, indent+fieldLabel.Render("Date    ")+fieldValue.Render(util.SingleLine(v.event.Date))+" "+fieldLabel.Render("(all day)"))
-	} else if v.event.Date != "" || v.event.Start != "" || v.event.End != "" {
-		datePart := util.SingleLine(v.event.Date)
-		timePart := strings.TrimSpace(util.SingleLine(v.event.Start) + " – " + util.SingleLine(v.event.End))
-		timePart = strings.TrimPrefix(timePart, " – ")
-		timePart = strings.TrimSuffix(timePart, " – ")
-		row := indent + fieldLabel.Render("Date    ")
-		if datePart != "" {
-			row += fieldValue.Render(datePart)
-		}
-		if timePart != "" {
-			if datePart != "" {
-				row += "  " + fieldLabel.Render("Time    ") + fieldValue.Render(timePart)
-			} else {
-				row += fieldValue.Render(timePart)
+	// When / how often, on one line — two short facts do not need two rows.
+	when := ""
+	switch {
+	case ev.AllDay && ev.Date != "":
+		when = util.SingleLine(ev.Date) + " · all day"
+	default:
+		when = util.SingleLine(ev.Date)
+		times := strings.Trim(strings.TrimSpace(
+			util.SingleLine(ev.Start)+" – "+util.SingleLine(ev.End)), "– ")
+		if times != "" {
+			if when != "" {
+				when += " · "
 			}
+			when += times
 		}
-		out = append(out, row)
+	}
+	if ev.Recurring {
+		when = strings.TrimSpace(when + " · repeats")
+	}
+	if when != "" {
+		body = append(body, muted.Render(icons.Clock+" "+util.TruncateText(when, inner-2)))
+	}
+	if ev.Location != "" {
+		body = append(body, muted.Render(icons.Pin+" "+
+			util.TruncateText(util.SingleLine(ev.Location), inner-2)))
 	}
 
-	// Location row
-	if v.event.Location != "" {
-		out = append(out, indent+fieldLabel.Render("Location")+fieldValue.Render("  "+util.SingleLine(v.event.Location)))
-	}
-
-	// Recurring
-	if v.event.Recurring {
-		out = append(out, indent+fieldLabel.Render("Repeats ")+fieldValue.Render("  Yes"))
-	}
-
-	// Description (wrapped, preserving paragraph breaks)
-	if v.event.Description != "" {
-		textWidth := v.width - 14
-		if textWidth < 20 {
-			textWidth = 20
-		}
-		out = append(out, "")
-		for _, line := range strings.Split(v.event.Description, "\n") {
+	if ev.Description != "" {
+		body = append(body, "")
+		for _, line := range strings.Split(ev.Description, "\n") {
 			sanitised := util.SingleLine(line)
 			if strings.TrimSpace(sanitised) == "" {
-				out = append(out, "")
+				body = append(body, "")
 				continue
 			}
-			wrapped := util.WrapText(sanitised, textWidth)
-			for _, w := range wrapped {
-				out = append(out, indent+fieldValue.Render(w))
+			for _, w := range util.WrapText(sanitised, inner) {
+				body = append(body, v.pane().Foreground(theme.Text).Render(w))
 			}
 		}
 	}
 
-	// Buttons below the event
-	out = append(out, "")
-	out = append(out, indent+v.renderEventButtons())
-	return out
+	body = append(body, "", v.renderEventButtons())
+	return components.Card(theme, body, v.width, theme.AccentSoft)
 }
 
 func (v *ReaderView) renderEventButtons() string {
-	copyPlainActive := v.eventFocus == 0
-	copyJSONActive := v.eventFocus == 1
-	rejectActive := v.eventFocus == 2
-
-	copyPlain := components.RenderButton(v.theme, "Copy Plain", copyPlainActive, false)
-	copyJSON := components.RenderButton(v.theme, "Copy JSON", copyJSONActive, false)
-	reject := components.RenderButton(v.theme, "Reject", rejectActive, true)
-
-	return copyPlain + " " + copyJSON + " " + reject
+	gap := " "
+	return components.RenderButton(v.theme, "Copy Plain", v.eventFocus == 0, false) + gap +
+		components.RenderButton(v.theme, "Copy JSON", v.eventFocus == 1, false) + gap +
+		components.RenderButton(v.theme, "Reject", v.eventFocus == 2, true)
 }
 
 func formatSuggestedEventPlain(ev *data.SuggestedEvent) string {

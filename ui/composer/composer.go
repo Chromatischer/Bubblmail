@@ -8,6 +8,7 @@ import (
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/data"
 	outsmtp "github.com/bubblmail/bubblmail/smtp"
+	"github.com/bubblmail/bubblmail/ui/components"
 	"github.com/bubblmail/bubblmail/ui/icons"
 	"github.com/bubblmail/bubblmail/util"
 	"github.com/charmbracelet/bubbletea"
@@ -54,7 +55,51 @@ type Composer struct {
 	// Draft persistence: stash when closing with content, prompt on reopen.
 	savedDraft *savedDraftState
 	prompting  bool // showing the continue/discard prompt
+
+	// Footer hit zones, cached by View. HitTestFooter used to rebuild the hint
+	// list and re-run the centring arithmetic to find them again, which is how
+	// the two drifted: the copy in the hit-test listed a different scroll key.
+	footerZones []components.HintZone
+	footerY     int
+	promptZones []components.HintZone
+	promptY     int
 }
+
+// composerHints is the footer key list. It is built in one place so the
+// rendered bar and the clickable zones can never disagree.
+func (c *Composer) composerHints() []components.Hint {
+	hints := []components.Hint{
+		{Icon: icons.Send, Key: "ctrl+s", Desc: "send", Action: "ctrl+s"},
+		{Icon: icons.ChevronRight, Key: "tab", Desc: "next field", Action: "tab", Priority: 2},
+		{Icon: icons.ArrowUpDown, Key: "pgup/pgdn", Desc: "scroll", Priority: 3},
+		{Icon: icons.Attachment, Key: "@", Desc: "attach", Action: "@", Priority: 1},
+	}
+	if len(c.attachments) > 0 {
+		desc := "anonymize"
+		if c.anonymize {
+			desc = "anonymize ON"
+		}
+		hints = append(hints, components.Hint{Icon: icons.Label, Key: "ctrl+r", Desc: desc, Action: "ctrl+r", Priority: 1})
+	}
+	return append(hints, components.Hint{Icon: icons.Close, Key: "esc", Desc: "cancel", Action: "esc"})
+}
+
+// Row geometry. The box is built from a fixed stack of rows, and three
+// separate places need to know where each part lands: bodyHeight sizes the
+// body to whatever is left, HitTestField maps a click to a field, and
+// BodyDragZone maps a drag to the body text. They used to hardcode 5/6/7/9 and
+// "fixed := 8 + 1 + 1 + 4" independently.
+const (
+	composerBoxChrome = 4 // border top+bottom, padding top+bottom
+	composerBoxOffset = 2 // rows above the content: border top + padding top
+	composerTitleRows = 2 // section label + from line
+	composerFieldRows = 3 // To / CC / Subject
+	composerSectRows  = 1 // dashed divider between header and body
+	composerFootRows  = 2 // divider + hint bar
+
+	composerFirstFieldY = composerBoxOffset + composerTitleRows
+	composerBodyY0      = composerFirstFieldY + composerFieldRows + composerSectRows
+)
 
 const (
 	composerLabelWidth = 10
@@ -365,8 +410,9 @@ func (c *Composer) IsPrompting() bool { return c.prompting }
 // content-area to screen coordinates.
 //
 // Geometry (all in screen coords, y=0 is terminal top):
-//   x: skip left-border(1) + left-pad(2) + label(10) + sep(3) = 16 cols from box left
-//   y: border(1)+pad(1)+title(1)+from(1)+divider(1)+3fields(3)+sectionDiv(1) = 9 rows down
+//
+//	x: skip left-border(1) + left-pad(2) + label(10) + sep(3) = 16 cols from box left
+//	y: border(1)+pad(1)+title(1)+from(1)+divider(1)+3fields(3)+sectionDiv(1) = 9 rows down
 func (c *Composer) BodyDragZone(headerH int) (x0, y0, x1, y1 int) {
 	if !c.active || c.prompting {
 		return
@@ -383,8 +429,7 @@ func (c *Composer) BodyDragZone(headerH int) (x0, y0, x1, y1 int) {
 	x0 = boxX0 + 1 + 2 + composerLabelWidth + 3
 	// x: last content col, before right-pad(2) + right-border(1)
 	x1 = boxX0 + boxWidth - 2
-	// y: 9 rows of overhead (see comment above), then bodyHeight rows of text
-	y0 = headerH + 9
+	y0 = headerH + composerBodyY0
 	y1 = y0 + c.bodyHeight() - 1
 	return
 }
@@ -408,100 +453,40 @@ func (c *Composer) HitTestField(contentY int) int {
 	if !c.active || c.prompting {
 		return -1
 	}
-	switch contentY {
-	case 5:
-		return 0 // To
-	case 6:
-		return 1 // CC
-	case 7:
-		return 2 // Subject
+	if contentY >= composerFirstFieldY && contentY < composerFirstFieldY+composerFieldRows {
+		return contentY - composerFirstFieldY // 0=To, 1=CC, 2=Subject
 	}
-	// Body occupies rows 9 through 8+bodyHeight.
-	bodyY0 := 9
-	if contentY >= bodyY0 && contentY < bodyY0+c.bodyHeight() {
+	if contentY >= composerBodyY0 && contentY < composerBodyY0+c.bodyHeight() {
 		return 3
 	}
 	return -1
 }
 
-// HitTestDraftPrompt returns "c" (Continue) or "d" (Discard) for a click on
-// the hint row of the draft prompt dialog, or "" if not on that row.
-//
-// Geometry: prompt box has 5 content rows + 2 padding + 2 border = 9 rows total;
-// boxY0 = (height-9)/2. Hint row is at boxY0+6. Left half = Continue, right = Discard.
+// HitTestDraftPrompt returns "c" (continue) or "d" (discard) for a click on the
+// draft prompt's hint row, or "" elsewhere. Geometry comes from what View drew.
 func (c *Composer) HitTestDraftPrompt(x, contentY int) string {
-	boxY0 := (c.height - 9) / 2
-	if contentY != boxY0+6 {
+	if !c.prompting || contentY != c.promptY {
 		return ""
 	}
-	if x < c.width/2 {
-		return "c"
+	for _, z := range c.promptZones {
+		if x >= z.X0 && x < z.X1 {
+			return z.Action
+		}
 	}
-	return "d"
+	return ""
 }
 
 // HitTestFooter returns the key string for a click on the in-box footer hint
-// row, or "" if the click doesn't land on an actionable hint.
-//
-// Geometry: footer hint row is at content-area y = 10 + bodyHeight + attachRows.
-// Hint x positions are computed the same way View() does it.
+// row, or "" if the click doesn't land on an actionable hint. Both the row and
+// the x ranges come from what View() actually drew.
 func (c *Composer) HitTestFooter(x, contentY int) string {
-	if !c.active || c.prompting {
+	if !c.active || c.prompting || contentY != c.footerY {
 		return ""
 	}
-	expectedY := 10 + c.bodyHeight() + c.attachSectionRows()
-	if contentY != expectedY {
-		return ""
-	}
-
-	boxWidth := c.width - 16
-	if boxWidth > 110 {
-		boxWidth = 110
-	}
-	if boxWidth < 60 {
-		boxWidth = 60
-	}
-	boxX0 := (c.width - boxWidth - 2) / 2
-	innerW := boxWidth - 4
-
-	type hintItem struct{ icon, key, desc string }
-	hints := []hintItem{
-		{icons.Send, "ctrl+s", "send"},
-		{icons.ChevronRight, "tab", "next field"},
-		{icons.ArrowUpDown, "", "scroll"}, // pgup/pgdn not a single key
-		{icons.Attachment, "@", "attach"},
-	}
-	if len(c.attachments) > 0 {
-		anonDesc := "anonymize"
-		if c.anonymize {
-			anonDesc = "anonymize ON"
+	for _, z := range c.footerZones {
+		if x >= z.X0 && x < z.X1 {
+			return z.Action
 		}
-		hints = append(hints, hintItem{icons.Label, "ctrl+r", anonDesc})
-	}
-	hints = append(hints, hintItem{icons.Close, "esc", "cancel"})
-
-	// Reproduce the plain-width calculation from View() to get the same padLeft.
-	var plainParts []string
-	for _, h := range hints {
-		plainParts = append(plainParts, h.icon+" "+h.desc+" ("+h.key+")")
-	}
-	plainW := len([]rune(strings.Join(plainParts, "  ")))
-	padLeft := (innerW - plainW) / 2
-	if padLeft < 0 {
-		padLeft = 0
-	}
-
-	// Hit-test each hint: content starts at boxX0+border(1)+pad(2) = boxX0+3.
-	curX := boxX0 + 3 + padLeft
-	for i, h := range hints {
-		if i > 0 {
-			curX += 2 // "  " gap between hints
-		}
-		partW := len([]rune(h.icon + " " + h.desc + " (" + h.key + ")"))
-		if x >= curX && x < curX+partW {
-			return h.key // "" for the scroll hint = no action
-		}
-		curX += partW
 	}
 	return ""
 }
@@ -568,10 +553,8 @@ func (c *Composer) attachSectionRows() int {
 
 // bodyHeight computes available rows for the body / file picker area.
 func (c *Composer) bodyHeight() int {
-	// Fixed rows consumed: title(1) + from(1) + topDivider(1) + 3 header fields(3) + sectionDiv(1) = 8
-	// After body: attachSection + divider(1) + hints(1)
-	// Box overhead: padding top(1) + padding bot(1) + border top(1) + border bot(1) = 4
-	fixed := 8 + 1 + 1 + 4 + c.attachSectionRows()
+	fixed := composerTitleRows + composerFieldRows + composerSectRows +
+		composerFootRows + composerBoxChrome + c.attachSectionRows()
 	h := c.height - fixed
 	if h < 3 {
 		h = 3
@@ -602,19 +585,14 @@ func (c *Composer) View() string {
 	innerW := boxWidth - 4
 
 	// ── Title ────────────────────────────────────────────────────────────────
+	// Section label plus a muted identity line, the same shape the search,
+	// folder-picker and new-folder overlays use.
 	mode := c.mode
 	if mode == "" {
 		mode = "New Message"
 	}
-	title := lipgloss.NewStyle().
-		Foreground(theme.Accent).
-		Background(theme.Surface).
-		Bold(true).
-		Align(lipgloss.Center).
-		Width(innerW).
-		Render(mode)
+	title := components.PaneTitle(theme, mode, innerW, theme.Surface)
 
-	// ── From line ────────────────────────────────────────────────────────────
 	fromStr := c.from.Address
 	if c.from.Name != "" {
 		fromStr = c.from.Name + " <" + c.from.Address + ">"
@@ -622,15 +600,11 @@ func (c *Composer) View() string {
 	fromLine := lipgloss.NewStyle().
 		Foreground(theme.TextMuted).
 		Background(theme.Surface).
-		Align(lipgloss.Center).
 		Width(innerW).
-		Render(fromStr)
+		Render(" " + util.TruncateText(util.SingleLine(fromStr), innerW-1))
 
 	// ── Dividers ─────────────────────────────────────────────────────────────
-	divider := lipgloss.NewStyle().
-		Foreground(theme.Border).
-		Background(theme.Surface).
-		Render(strings.Repeat("─", innerW))
+	divider := components.Divider(theme, innerW)
 
 	sectionDiv := lipgloss.NewStyle().
 		Foreground(theme.Overlay).
@@ -639,7 +613,7 @@ func (c *Composer) View() string {
 
 	// ── Header fields (To / CC / Subject) ────────────────────────────────────
 	var rows []string
-	rows = append(rows, title, fromLine, divider)
+	rows = append(rows, title, fromLine)
 
 	for i, f := range c.fields[:3] {
 		ef := NewEditorField(theme, f)
@@ -939,54 +913,24 @@ func (c *Composer) View() string {
 	// ── Footer ───────────────────────────────────────────────────────────────
 	rows = append(rows, divider)
 
-	hintIconSt := lipgloss.NewStyle().Foreground(theme.Accent).Background(theme.Surface)
-	hintDescSt := lipgloss.NewStyle().Foreground(theme.TextMuted).Background(theme.Surface)
-	hintKeySt := lipgloss.NewStyle().Foreground(theme.TextFaint).Background(theme.Surface)
-	hintSepSt := lipgloss.NewStyle().Foreground(theme.TextFaint).Background(theme.Surface)
-
-	type hintItem struct{ icon, key, desc string }
-	composerHints := []hintItem{
-		{icons.Send, "ctrl+s", "send"},
-		{icons.ChevronRight, "tab", "next field"},
-		{icons.ArrowUpDown, "pgup/pgdn", "scroll"},
-		{icons.Attachment, "@", "attach"},
-	}
-	if len(c.attachments) > 0 {
-		anonDesc := "anonymize"
-		if c.anonymize {
-			anonDesc = "anonymize ON"
-		}
-		composerHints = append(composerHints, hintItem{icons.Label, "ctrl+r", anonDesc})
-	}
-	composerHints = append(composerHints, hintItem{icons.Close, "esc", "cancel"})
-
-	var plainParts []string
-	for _, h := range composerHints {
-		plainParts = append(plainParts, h.icon+" "+h.desc+" ("+h.key+")")
-	}
-	plainHint := strings.Join(plainParts, "  ")
-	plainW := len([]rune(plainHint))
-	padLeft := (innerW - plainW) / 2
+	bar, barW, zones := components.HintBar(theme, c.composerHints(), innerW, 0, theme.Surface)
+	padLeft := (innerW - barW) / 2
 	if padLeft < 0 {
 		padLeft = 0
 	}
-	padRight := innerW - plainW - padLeft
-	if padRight < 0 {
-		padRight = 0
-	}
+	rows = append(rows,
+		components.Fill(padLeft, theme.Surface)+bar+components.Fill(innerW-padLeft-barW, theme.Surface))
 
-	var hintParts []string
-	for _, h := range composerHints {
-		hintParts = append(hintParts,
-			hintIconSt.Render(h.icon+" ")+
-				hintDescSt.Render(h.desc+" ")+
-				hintKeySt.Render("("+h.key+")"),
-		)
+	// Cache the footer geometry for HitTestFooter. The row index comes from the
+	// row list itself, plus the two rows the box border and padding add above it.
+	boxX0 := (c.width - boxWidth - 2) / 2
+	c.footerY = len(rows) - 1 + 2
+	c.footerZones = make([]components.HintZone, len(zones))
+	for i, z := range zones {
+		// content starts at boxX0 + border(1) + pad(2)
+		off := boxX0 + 3 + padLeft
+		c.footerZones[i] = components.HintZone{X0: z.X0 + off, X1: z.X1 + off, Action: z.Action}
 	}
-	styledHint := hintSepSt.Render(strings.Repeat(" ", padLeft)) +
-		strings.Join(hintParts, hintSepSt.Render("  ")) +
-		hintSepSt.Render(strings.Repeat(" ", padRight))
-	rows = append(rows, styledHint)
 
 	content := strings.Join(rows, "\n")
 
@@ -1166,38 +1110,48 @@ func (c *Composer) scrollBody(delta int) {
 
 // viewDraftPrompt renders the "Continue draft or Discard?" dialog.
 func (c *Composer) viewDraftPrompt(theme *config.Theme) string {
-	boxWidth := c.width - 4
-	if boxWidth < 60 {
-		boxWidth = 60
+	boxWidth := 60
+	if c.width < boxWidth+8 {
+		boxWidth = c.width - 8
+	}
+	if boxWidth < 30 {
+		boxWidth = 30
 	}
 	innerW := boxWidth - 4
 
-	titleSt := lipgloss.NewStyle().Foreground(theme.Accent).Background(theme.Surface).Bold(true).Align(lipgloss.Center).Width(innerW)
-	textSt := lipgloss.NewStyle().Foreground(theme.Text).Background(theme.Surface).Align(lipgloss.Center).Width(innerW)
-	hintSt := lipgloss.NewStyle().Foreground(theme.TextMuted).Background(theme.Surface).Align(lipgloss.Center).Width(innerW)
-	divSt := lipgloss.NewStyle().Foreground(theme.Border).Background(theme.Surface)
+	textSt := lipgloss.NewStyle().Foreground(theme.Text).Background(theme.Surface).
+		Align(lipgloss.Center).Width(innerW)
 
-	divider := divSt.Render(strings.Repeat("─", innerW))
-
-	rows := []string{
-		titleSt.Render("Unsaved Draft"),
-		divider,
-		textSt.Render("You have an unsaved draft."),
-		textSt.Render(""),
-		hintSt.Render("  [enter / c]  Continue editing    [d / esc]  Discard  "),
+	hints := []components.Hint{
+		{Icon: icons.Check, Key: "↵ / c", Desc: "continue editing", Action: "c"},
+		{Icon: icons.Trash, Key: "d / esc", Desc: "discard", Action: "d"},
+	}
+	bar, barW, zones := components.HintBar(theme, hints, innerW, 0, theme.Surface)
+	padLeft := (innerW - barW) / 2
+	if padLeft < 0 {
+		padLeft = 0
 	}
 
-	content := strings.Join(rows, "\n")
-	box := lipgloss.NewStyle().
-		Background(theme.Surface).
-		Foreground(theme.Text).
-		Padding(1, 2).
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(theme.Accent).
-		Width(boxWidth).
-		Render(content)
+	rows := []string{
+		components.PaneTitle(theme, "Unsaved draft", innerW, theme.Surface),
+		components.Fill(innerW, theme.Surface),
+		textSt.Render("You have an unsaved draft."),
+		components.Fill(innerW, theme.Surface),
+		components.Fill(padLeft, theme.Surface) + bar + components.Fill(innerW-padLeft-barW, theme.Surface),
+	}
 
-	return lipgloss.Place(c.width, c.height, lipgloss.Center, lipgloss.Center, box)
+	// Cache the hint geometry so the click targets are the words themselves
+	// rather than "left half of the screen means continue".
+	boxH := len(rows) + composerBoxChrome
+	boxX0 := (c.width - boxWidth - 2) / 2 // -2 for the border columns
+	c.promptY = (c.height-boxH)/2 + composerBoxOffset + len(rows) - 1
+	c.promptZones = make([]components.HintZone, len(zones))
+	for i, z := range zones {
+		off := boxX0 + 3 + padLeft
+		c.promptZones[i] = components.HintZone{X0: z.X0 + off, X1: z.X1 + off, Action: z.Action}
+	}
+
+	return components.ModalBox(theme, strings.Join(rows, "\n"), boxWidth, 0, c.width, c.height)
 }
 
 // hasDraftContent returns true if any field has been filled in or any

@@ -1,17 +1,19 @@
 package ui
 
 import (
+	"github.com/bubblmail/bubblmail/config"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/bubblmail/bubblmail/ui/components"
 	"github.com/bubblmail/bubblmail/ui/icons"
+	"github.com/bubblmail/bubblmail/util"
 	"github.com/charmbracelet/lipgloss"
 )
 
 // NewFolderOverlay is a floating dialog for creating a new IMAP folder.
 type NewFolderOverlay struct {
-	styles    *Styles
+	theme     *config.Theme
 	width     int
 	height    int
 	active    bool
@@ -22,8 +24,8 @@ type NewFolderOverlay struct {
 }
 
 // NewNewFolderOverlay creates a new folder creation overlay.
-func NewNewFolderOverlay(styles *Styles) *NewFolderOverlay {
-	return &NewFolderOverlay{styles: styles}
+func NewNewFolderOverlay(theme *config.Theme) *NewFolderOverlay {
+	return &NewFolderOverlay{theme: theme}
 }
 
 // SetSize sets the overlay dimensions (full content area, not the modal box).
@@ -117,7 +119,7 @@ func (o *NewFolderOverlay) HandleKey(key string) (closed bool) {
 
 // View renders the new-folder dialog centered on the content area.
 func (o *NewFolderOverlay) View() string {
-	theme := o.styles.Theme
+	theme := o.theme
 
 	const minBoxW = 42
 	cw := minBoxW
@@ -133,12 +135,7 @@ func (o *NewFolderOverlay) View() string {
 	innerW := cw - 2*hPad
 
 	// ── Title ────────────────────────────────────────────────────────────────
-	titleLine := lipgloss.NewStyle().
-		Background(theme.Surface).
-		Foreground(theme.Accent).
-		Bold(true).
-		Width(innerW).
-		Render(icons.FolderNew + " New Folder")
+	titleLine := components.PaneTitle(theme, icons.FolderNew+" New folder", innerW, theme.Surface)
 
 	// ── Input row — mirrors search.go ────────────────────────────────────────
 	ti := components.NewTextInput(theme)
@@ -161,33 +158,16 @@ func (o *NewFolderOverlay) View() string {
 			Background(theme.Surface).
 			Foreground(theme.Error).
 			Width(innerW).
-			Render(icons.Error + " " + o.errMsg)
+			Render(util.TruncateText(icons.Error+" "+o.errMsg, innerW))
 	} else {
-		iconStyle := lipgloss.NewStyle().Foreground(theme.Accent).Background(theme.Surface)
-		descStyle := lipgloss.NewStyle().Foreground(theme.TextMuted).Background(theme.Surface)
-		keyStyle := lipgloss.NewStyle().Foreground(theme.TextFaint).Background(theme.Surface)
-		sp := lipgloss.NewStyle().Background(theme.Surface).Render(" ")
-		gap := lipgloss.NewStyle().Background(theme.Surface).Render("  ")
-
-		type hint struct{ icon, key, desc string }
-		hints := []hint{
-			{icons.Check, "enter", "create"},
-			{icons.Close, "esc", "cancel"},
-		}
-		var parts []string
-		for _, h := range hints {
-			parts = append(parts,
-				iconStyle.Render(h.icon)+sp+descStyle.Render(h.desc)+sp+keyStyle.Render("("+h.key+")"),
-			)
-		}
-		hintStr := strings.Join(parts, gap)
-		footerLine = lipgloss.NewStyle().
-			Background(theme.Surface).
-			Width(innerW).
-			Render(hintStr)
+		bar, w, _ := components.HintBar(theme, []components.Hint{
+			{Icon: icons.Check, Key: "enter", Desc: "create"},
+			{Icon: icons.Close, Key: "esc", Desc: "cancel"},
+		}, innerW, 0, theme.Surface)
+		footerLine = bar + components.Fill(innerW-w, theme.Surface)
 	}
 
-	blank := lipgloss.NewStyle().Background(theme.Surface).Width(innerW).Render("")
+	blank := components.Fill(innerW, theme.Surface)
 
 	content := strings.Join([]string{titleLine, blank, inputLine, sep, footerLine}, "\n")
 

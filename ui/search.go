@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"github.com/bubblmail/bubblmail/config"
 	"strings"
 
 	"github.com/bubblmail/bubblmail/data"
@@ -24,7 +25,7 @@ func (c SearchChip) String() string {
 
 // SearchOverlay is a floating search box with FTS + semantic results.
 type SearchOverlay struct {
-	styles   *Styles
+	theme    *config.Theme
 	width    int
 	height   int
 	active   bool
@@ -41,12 +42,17 @@ type SearchOverlay struct {
 	spinnerFrame int
 
 	// filter chips
-	chips         []SearchChip
-	chipKey       string   // chip type being built ("from","to","subject","has"), "" = normal
-	chipInput     string   // value being typed for the active chip
-	autocomplete  []string // filtered suggestions shown during chip entry
-	acCursor      int      // cursor within autocomplete list
+	chips          []SearchChip
+	chipKey        string   // chip type being built ("from","to","subject","has"), "" = normal
+	chipInput      string   // value being typed for the active chip
+	autocomplete   []string // filtered suggestions shown during chip entry
+	acCursor       int      // cursor within autocomplete list
 	knownAddresses []string // address list mined from cache on open
+
+	// Geometry cached by View for mouse hit-testing. Deriving it a second time
+	// in HitTestResult is how the two used to drift apart.
+	resultY0   int
+	resultRows int
 }
 
 // SearchResult holds a search match and its source labels.
@@ -71,8 +77,8 @@ var chipPrefixes = map[string]string{
 }
 
 // NewSearchOverlay creates a new search overlay.
-func NewSearchOverlay(styles *Styles) *SearchOverlay {
-	return &SearchOverlay{styles: styles, minChars: 3}
+func NewSearchOverlay(theme *config.Theme) *SearchOverlay {
+	return &SearchOverlay{theme: theme, minChars: 3}
 }
 
 // SetSize sets the overlay dimensions.
@@ -204,13 +210,10 @@ func (s *SearchOverlay) SetCursor(idx int) {
 }
 
 // HitTestResult returns the result index for a click at the given content-area y,
-// or -1 if no result row was hit.
+// or -1 if no result row was hit. It reads the geometry View recorded.
 func (s *SearchOverlay) HitTestResult(contentY int) int {
-	// Geometry: box border(1)+padding(1)=2 rows overhead, then inputRow(1)+divider(1)=2,
-	// plus autocomplete rows (if shown), then results.
-	resultY0 := 5 + s.acRowCount()
-	i := contentY - resultY0
-	if i < 0 || i >= s.visibleRowCount() || s.list.Offset+i >= len(s.results) {
+	i := contentY - s.resultY0
+	if i < 0 || i >= s.resultRows || s.list.Offset+i >= len(s.results) {
 		return -1
 	}
 	return s.list.Offset + i
@@ -385,6 +388,38 @@ func (s *SearchOverlay) commitChipValue() string {
 	return strings.TrimSpace(s.chipInput)
 }
 
+// boxWidth is the overlay's outer width.
+//
+// The overlay used to fill the terminal, which meant a search with no results
+// yet was a full screen of empty box. It now takes only the width a mail row
+// actually needs, capped so the lines stay scannable on a wide terminal.
+func (s *SearchOverlay) boxWidth() int {
+	w := s.width - 8
+	if w > 108 {
+		w = 108
+	}
+	if w < 48 {
+		w = 48
+	}
+	if w > s.width {
+		w = s.width
+	}
+	return w
+}
+
+// chrome rows inside the box: input, divider, footer divider, footer.
+const searchChromeRows = 4
+
+// maxResultRows is how many result rows the terminal can accommodate.
+func (s *SearchOverlay) maxResultRows() int {
+	// 2 border + 2 padding rows, plus a little breathing room top and bottom.
+	n := s.height - 8 - searchChromeRows - s.acRowCount()
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
 // acRowCount returns how many autocomplete rows are currently displayed.
 func (s *SearchOverlay) acRowCount() int {
 	if s.chipKey == "" || len(s.autocomplete) == 0 {
@@ -397,169 +432,156 @@ func (s *SearchOverlay) acRowCount() int {
 	return n + 1 // +1 for the AC divider line
 }
 
-// visibleRowCount returns how many result rows fit inside the overlay.
+// visibleRowCount returns how many result rows the overlay shows. The box
+// grows with the result set and stops growing at the terminal's limit, so an
+// empty search is a small box rather than an empty screen.
 func (s *SearchOverlay) visibleRowCount() int {
-	boxH := s.height - 4
-	if boxH < 10 {
-		boxH = 10
+	maxRows := s.maxResultRows()
+	if len(s.results) == 0 {
+		// Enough to centre a one-line state message without the box collapsing.
+		if maxRows < 3 {
+			return maxRows
+		}
+		return 3
 	}
-	// Padding(1,2) = 2 rows; input(1)+divider(1)+footer(1) = 3; ac rows on top.
-	vr := boxH - 5 - s.acRowCount()
-	if vr < 1 {
-		vr = 1
+	if len(s.results) < maxRows {
+		return len(s.results)
 	}
-	return vr
+	return maxRows
 }
 
 // View renders the search overlay centered over the terminal.
 func (s *SearchOverlay) View() string {
-	theme := s.styles.Theme
-
-	boxW := s.width - 4
-	if boxW < 44 {
-		boxW = 44
-	}
-	boxH := s.height - 4
-	if boxH < 10 {
-		boxH = 10
-	}
-
-	// innerW: content area inside Padding(1, 2) = boxW − 4
-	innerW := boxW - 4
-	if innerW < 10 {
-		innerW = 10
-	}
-
-	vr := s.visibleRowCount()
-
+	theme := s.theme
 	surf := theme.Surface
 
-	// bg-colored single-space helper used between cells so resets don't expose
-	// the terminal default background between styled blocks.
-	sp := func(bg lipgloss.Color) string {
-		return lipgloss.NewStyle().Background(bg).Render(" ")
+	boxW := s.boxWidth()
+	// innerW: content area inside Padding(1, 2) = boxW − 4
+	innerW := boxW - 4
+	if innerW < 20 {
+		innerW = 20
 	}
+	vr := s.visibleRowCount()
 
 	// ── Input row ────────────────────────────────────────────────────────────
 	ti := components.NewTextInput(theme)
-	ti.Placeholder = "Search mail… (type from: to: subject: has:)"
-	ti.Value = s.inputDisplayValue()
+	ti.Placeholder = "Search mail…   from:  to:  subject:  has:"
 	ti.Icon = icons.Search
-	ti.Active = s.chipKey == ""
-
+	ti.Active = true
+	for _, c := range s.chips {
+		ti.Chips = append(ti.Chips, c.Key+":"+c.Value)
+	}
+	if s.chipKey != "" {
+		ti.Value = s.chipKey + ":" + s.chipInput
+	} else {
+		ti.Value = s.query
+	}
 	inputRow := ti.Render(innerW)
 
-	// ── Divider ──────────────────────────────────────────────────────────────
-	divider := components.Divider(theme, innerW)
+	lines := []string{inputRow, components.Divider(theme, innerW)}
 
 	// ── Autocomplete rows (chip mode only) ───────────────────────────────────
-	var acLines []string
 	if s.chipKey != "" && len(s.autocomplete) > 0 {
 		maxAC := len(s.autocomplete)
 		if maxAC > 4 {
 			maxAC = 4
 		}
 		for i := 0; i < maxAC; i++ {
-			addr := s.autocomplete[i]
-			selected := i == s.acCursor
-			bg := surf
-			fg := theme.Text
-			if selected {
-				bg = theme.Selected
-				fg = theme.Background
+			bg, fg := surf, theme.Text
+			gut := components.GutterNone
+			if i == s.acCursor {
+				bg, fg, gut = theme.SurfaceAlt, theme.Text, components.GutterActive
 			}
-			row := lipgloss.NewStyle().
-				Width(innerW).
-				Background(bg).
-				Foreground(fg).
-				Render(" " + util.TruncateText(addr, innerW-2))
-			acLines = append(acLines, row)
+			lines = append(lines, components.GutterCell(theme, gut, bg)+
+				lipgloss.NewStyle().Width(innerW-1).Background(bg).Foreground(fg).
+					Render(" "+util.TruncateText(s.autocomplete[i], innerW-3)))
 		}
-		// Separator below AC list
-		acLines = append(acLines, components.Divider(theme, innerW))
+		lines = append(lines, components.Divider(theme, innerW))
 	}
 
-	// ── Result rows ──────────────────────────────────────────────────────────
-	blankLine := lipgloss.NewStyle().Background(surf).Width(innerW).Render("")
-	var resultLines []string
+	// resultY0 is where the first result row lands relative to the content
+	// area, which is what mouse hit-testing needs.
+	boxTopMargin := (s.height - (vr + searchChromeRows + len(lines) - 2 + 2)) / 2
+	if boxTopMargin < 0 {
+		boxTopMargin = 0
+	}
+	s.resultY0 = boxTopMargin + 2 + len(lines) // border + top padding + chrome rows
+	s.resultRows = vr
 
+	// ── Result rows ──────────────────────────────────────────────────────────
+	blankLine := components.Fill(innerW, surf)
 	if len(s.results) == 0 {
-		var stateMsg string
-		var stateColor lipgloss.Color
-		switch {
-		case !s.CanSearch():
-			if s.query == "" && len(s.chips) == 0 {
-				stateMsg = "Type to search, or use from: to: subject: has:"
-			} else {
-				stateMsg = "Keep typing…"
-			}
-			stateColor = theme.TextFaint
-		case s.loading:
-			stateMsg = searchSpinnerFrames[s.spinnerFrame] + " Searching…"
-			stateColor = theme.TextMuted
-		default:
-			stateMsg = "No results"
-			stateColor = theme.TextMuted
-		}
-		topPad := (vr - 1) / 2
-		for i := 0; i < topPad; i++ {
-			resultLines = append(resultLines, blankLine)
-		}
-		resultLines = append(resultLines,
-			lipgloss.NewStyle().
-				Width(innerW).
-				Background(surf).
-				Foreground(stateColor).
-				Align(lipgloss.Center).
-				Render(stateMsg),
-		)
-		for len(resultLines) < vr {
-			resultLines = append(resultLines, blankLine)
-		}
+		lines = append(lines, s.stateRows(vr, innerW, surf)...)
 	} else {
-		for i := s.list.Offset; i < len(s.results) && i < s.list.Offset+vr; i++ {
-			resultLines = append(resultLines, s.renderRow(s.results[i], i == s.list.Cursor, innerW, sp))
-		}
-		for len(resultLines) < vr {
-			resultLines = append(resultLines, blankLine)
+		track := components.Scrollbar(theme, len(s.results), vr, s.list.Offset, vr, surf)
+		for i := 0; i < vr; i++ {
+			idx := s.list.Offset + i
+			if idx >= len(s.results) {
+				lines = append(lines, blankLine)
+				continue
+			}
+			row := s.renderRow(s.results[idx], idx == s.list.Cursor, innerW-1)
+			lines = append(lines, row+track[i])
 		}
 	}
 
 	// ── Footer ───────────────────────────────────────────────────────────────
-	var footerStr string
-	if len(s.results) > 0 {
-		countTxt := util.PluralCount(len(s.results), "result", "results")
-		countCell := lipgloss.NewStyle().
-			Background(surf).
-			Foreground(theme.TextFaint).
-			Render(countTxt)
-		if s.loading {
-			spinTxt := searchSpinnerFrames[s.spinnerFrame] + " streaming…"
-			spinCell := lipgloss.NewStyle().
-				Background(surf).
-				Foreground(theme.TextMuted).
-				Render(spinTxt)
-			gap := innerW - util.VisibleWidth(countTxt) - util.VisibleWidth(spinTxt)
-			if gap < 1 {
-				gap = 1
-			}
-			gapCell := lipgloss.NewStyle().Background(surf).Render(strings.Repeat(" ", gap))
-			footerStr = countCell + gapCell + spinCell
-		} else {
-			footerStr = countCell
+	lines = append(lines, components.Divider(theme, innerW), s.footer(innerW, surf))
+
+	return components.ModalBox(theme, strings.Join(lines, "\n"), boxW, 0, s.width, s.height)
+}
+
+// stateRows renders the centred message shown when there are no results yet.
+func (s *SearchOverlay) stateRows(vr, innerW int, surf lipgloss.Color) []string {
+	theme := s.theme
+
+	var msg string
+	var color lipgloss.Color
+	switch {
+	case !s.CanSearch():
+		msg, color = "Keep typing…", theme.TextFaint
+		if s.query == "" && len(s.chips) == 0 {
+			msg = "Type to search this account"
 		}
-	} else {
-		footerStr = blankLine
+	case s.loading:
+		msg, color = searchSpinnerFrames[s.spinnerFrame]+" Searching…", theme.TextMuted
+	default:
+		msg, color = "No matches", theme.TextMuted
 	}
 
-	// ── Assemble ─────────────────────────────────────────────────────────────
-	lines := make([]string, 0, 3+len(acLines)+vr)
-	lines = append(lines, inputRow, divider)
-	lines = append(lines, acLines...)
-	lines = append(lines, resultLines...)
-	lines = append(lines, footerStr)
+	rows := make([]string, vr)
+	for i := range rows {
+		rows[i] = components.Fill(innerW, surf)
+	}
+	rows[vr/2] = lipgloss.NewStyle().
+		Width(innerW).Background(surf).Foreground(color).Align(lipgloss.Center).
+		Render(msg)
+	return rows
+}
 
-	return components.ModalBox(theme, strings.Join(lines, "\n"), boxW, boxH, s.width, s.height)
+// footer shows the result count on the left and streaming state on the right.
+func (s *SearchOverlay) footer(innerW int, surf lipgloss.Color) string {
+	theme := s.theme
+
+	left := ""
+	if len(s.results) > 0 {
+		left = util.PluralCount(len(s.results), "result", "results")
+	}
+	right := ""
+	if s.loading && len(s.results) > 0 {
+		right = searchSpinnerFrames[s.spinnerFrame] + " streaming…"
+	} else if len(s.results) > 0 {
+		right = "* semantic   ~ similar"
+	}
+
+	gap := innerW - util.VisibleWidth(left) - util.VisibleWidth(right)
+	if gap < 1 {
+		gap = 1
+		right = ""
+	}
+	return lipgloss.NewStyle().Background(surf).Foreground(theme.TextFaint).Render(left) +
+		components.Fill(gap, surf) +
+		lipgloss.NewStyle().Background(surf).Foreground(theme.TextFaint).Render(right)
 }
 
 // inputDisplayValue builds the text shown in the input box: committed chips
@@ -579,96 +601,74 @@ func (s *SearchOverlay) inputDisplayValue() string {
 }
 
 // renderRow renders a single search result at the given width.
-// All widths are computed from plain strings; each cell uses Width(N) to self-pad.
-// sp is a pre-built bg-colored single space injected between cells so that
-// resets from inner styles don't expose the terminal's default background.
-func (s *SearchOverlay) renderRow(res *SearchResult, selected bool, innerW int, sp func(lipgloss.Color) string) string {
-	theme := s.styles.Theme
+// All widths are computed from plain strings; each cell uses Width(N) to
+// self-pad, so the columns hold whatever the sender name contains.
+func (s *SearchOverlay) renderRow(res *SearchResult, selected bool, innerW int) string {
+	theme := s.theme
 	msg := res.Message
 
 	bg := theme.Surface
+	rowFg, metaFg := theme.Text, theme.TextMuted
+	gut := components.GutterNone
 	if selected {
-		bg = theme.Selected
+		bg, rowFg, metaFg, gut = theme.SurfaceAlt, theme.Text, theme.TextMuted, components.GutterActive
 	}
 
-	var rowFg, metaFg lipgloss.Color
-	if selected {
-		rowFg = theme.Background
-		metaFg = theme.Background
-	} else {
-		rowFg = theme.Text
-		metaFg = theme.TextMuted
-	}
-
-	cell := func(w int, fg lipgloss.Color, plain string) string {
+	cell := func(w int, fg lipgloss.Color, bold bool, plain string) string {
 		return lipgloss.NewStyle().
-			Width(w).
-			Background(bg).
-			Foreground(fg).
-			Render(plain)
+			Width(w).Background(bg).Foreground(fg).Bold(bold).
+			Render(util.TruncateText(util.SingleLine(plain), w))
 	}
+	sp := components.Fill(1, bg)
 
-	// Unread indicator (1 col)
-	var unreadChar string
-	var unreadFg lipgloss.Color
+	// Unread marker (1 col)
+	unreadCell := sp
 	if !msg.IsRead() {
-		unreadChar = icons.Unread
-		unreadFg = theme.Unread
-	} else {
-		unreadChar = " "
-		unreadFg = bg
+		unreadCell = lipgloss.NewStyle().Width(1).Background(bg).Foreground(theme.Unread).
+			Render(icons.Unread)
 	}
-	unreadCell := cell(1, unreadFg, unreadChar)
 
-	// Date — fixed width so the indicator column stays vertically aligned.
+	// Match kind: 1 col, immediately before the date.
+	const indW = 1
+	indChar, indFg := " ", bg
+	switch {
+	case res.Semantic:
+		indChar, indFg = "*", theme.Accent
+	case res.Similar:
+		indChar, indFg = "~", theme.TextMuted
+	}
+	indCell := lipgloss.NewStyle().Width(indW).Background(bg).Foreground(indFg).Render(indChar)
+
+	// Date — fixed width so the marker column stays vertically aligned.
 	const dateW = 6
 	dateFmt := util.FormatDate(msg.Date)
 	if dateFmt == "Yesterday" {
 		dateFmt = "Yest."
 	}
-	dateRaw := util.TruncateText(util.SingleLine(dateFmt), dateW)
-	dateCell := cell(dateW, metaFg, dateRaw)
+	dateCell := cell(dateW, metaFg, false, dateFmt)
 
-	// Match-type indicator: 1-col character right before the date.
-	const indCellW = 2
-	var indChar string
-	var indFg lipgloss.Color
-	switch {
-	case res.Semantic:
-		indChar = "*"
-		indFg = theme.Accent
-	case res.Similar:
-		indChar = "~"
-		indFg = theme.TextMuted
-	default:
-		indChar = " "
-		indFg = bg
+	// From gets a fixed share; the subject absorbs the rest.
+	fromW := innerW / 4
+	if fromW < 10 {
+		fromW = 10
 	}
-	indCell := cell(indCellW, indFg, indChar)
-
-	suffixW := 1 + indCellW + 1 + dateW
-
-	// From (fixed 18 cols)
-	const fromW = 18
-	fromCell := cell(fromW, rowFg, util.TruncateText(util.SingleLine(msg.FromString()), fromW))
-
-	// Subject fills remaining space
-	subjectW := innerW - 1 - 1 - fromW - 1 - suffixW
+	if fromW > 22 {
+		fromW = 22
+	}
+	subjectW := innerW - 1 - 1 - fromW - 1 - indW - 1 - dateW
 	if subjectW < 1 {
 		subjectW = 1
 	}
-	subjectCell := cell(subjectW, rowFg, util.TruncateText(util.SingleLine(msg.Subject), subjectW))
 
-	if !selected && msg.IsRead() {
-		subjectCell = lipgloss.NewStyle().
-			Width(subjectW).
-			Background(bg).
-			Foreground(theme.TextMuted).
-			Render(util.TruncateText(util.SingleLine(msg.Subject), subjectW))
+	subjFg, subjBold := metaFg, false
+	if !msg.IsRead() {
+		subjFg, subjBold = rowFg, true
 	}
 
-	spc := sp(bg)
-	suffix := spc + indCell + spc + dateCell
-
-	return unreadCell + spc + fromCell + spc + subjectCell + suffix
+	return components.GutterCell(theme, gut, bg) +
+		unreadCell +
+		cell(fromW, rowFg, false, msg.FromString()) + sp +
+		cell(subjectW, subjFg, subjBold, msg.Subject) + sp +
+		indCell + sp +
+		dateCell
 }

@@ -1,11 +1,11 @@
 package views
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/bubblmail/bubblmail/config"
 	"github.com/bubblmail/bubblmail/data"
+	"github.com/bubblmail/bubblmail/ui/components"
 	"github.com/bubblmail/bubblmail/ui/icons"
 	"github.com/bubblmail/bubblmail/util"
 	"github.com/charmbracelet/lipgloss"
@@ -22,10 +22,12 @@ type FolderView struct {
 	offset  int
 }
 
-// Layout constants — mirrors the composer's fixed overhead accounting.
+// Layout constants. The header is a section label plus one blank row; the
+// footer is a rule plus the hint bar. Both counts are read by listHeight and by
+// HitTestFolder, so a row added to either is accounted for in exactly one place.
 const (
-	folderHeaderRows = 3 // title + account + divider
-	folderFooterRows = 2 // section-divider + hints
+	folderHeaderRows = 2 // section label + blank
+	folderFooterRows = 2 // rule + hints
 )
 
 // NewFolderView creates a new folder view.
@@ -163,108 +165,80 @@ func (v *FolderView) GoToBottom() {
 // View renders the folder browser.
 func (v *FolderView) View() string {
 	theme := v.theme
+	const surf = lipgloss.Color("") // the pane is transparent
 
 	if len(v.folders) == 0 {
-		msg := lipgloss.NewStyle().
-			Background(theme.Surface).
-			Foreground(theme.TextMuted).
-			Render(icons.FolderTree + " No folders")
-		return lipgloss.Place(v.width, v.height, lipgloss.Center, lipgloss.Center, msg)
+		return components.EmptyState(theme, v.width, v.height,
+			icons.FolderTree, "No folders", "Press n to create one")
 	}
 
-	// ── Title block ───────────────────────────────────────────────────────────
-	// Centered accent title + muted account subtitle, mirroring the composer's
-	// title/from-line layout.
-	title := lipgloss.NewStyle().
-		Foreground(theme.Accent).
-		Background(theme.Surface).
-		Bold(true).
-		Align(lipgloss.Center).
-		Width(v.width).
-		Render(icons.FolderTree + " Folders")
+	label := "Folders"
+	if v.account != "" {
+		label = "Folders · " + util.SingleLine(v.account)
+	}
 
-	fromLine := lipgloss.NewStyle().
-		Foreground(theme.TextMuted).
-		Background(theme.Surface).
-		Align(lipgloss.Center).
-		Width(v.width).
-		Render(v.account)
-
-	divider := lipgloss.NewStyle().
-		Foreground(theme.Border).
-		Background(theme.Surface).
-		Render(strings.Repeat("─", v.width))
-
-	// ── Folder list ───────────────────────────────────────────────────────────
 	lh := v.listHeight()
 	end := v.offset + lh
 	if end > len(v.folders) {
 		end = len(v.folders)
 	}
 
-	var rows []string
+	track := components.Scrollbar(theme, len(v.folders), lh, v.offset, lh, surf)
+	rows := make([]string, 0, lh)
 	for i := v.offset; i < end; i++ {
-		rows = append(rows, v.renderFolder(v.folders[i], i == v.cursor))
+		row := v.renderFolder(v.folders[i], i == v.cursor)
+		if idx := i - v.offset; idx < len(track) {
+			row += track[idx]
+		}
+		rows = append(rows, row)
 	}
+	rows = components.Pad(rows, lh, v.width, surf)
 
-	// Pad remaining rows to keep the view height stable.
-	blank := lipgloss.NewStyle().Background(theme.Surface).Width(v.width).Render("")
-	for len(rows) < lh {
-		rows = append(rows, blank)
+	hints := []components.Hint{
+		{Icon: icons.ArrowUpDown, Key: "j/k", Desc: "navigate"},
+		{Icon: icons.ChevronRight, Key: "enter", Desc: "open", Priority: 2},
+		{Icon: icons.FolderNew, Key: "n", Desc: "new folder", Priority: 1},
+		{Icon: icons.Close, Key: "esc", Desc: "back", Priority: 3},
 	}
+	bar, barW, _ := components.HintBar(theme, hints, v.width-2, 1, surf)
+	footer := components.Fill(1, surf) + bar + components.Fill(v.width-1-barW, surf)
 
-	// ── Footer ────────────────────────────────────────────────────────────────
-	// Dashed section divider + centered hint bar — mirrors composer footer.
-	sectionDiv := lipgloss.NewStyle().
-		Foreground(theme.Overlay).
-		Background(theme.Surface).
-		Render(strings.Repeat("╌", v.width))
-
-	return lipgloss.JoinVertical(lipgloss.Left,
-		title,
-		fromLine,
-		divider,
-		strings.Join(rows, "\n"),
-		sectionDiv,
-		v.renderHints(),
-	)
+	out := []string{
+		components.PaneTitle(theme, label, v.width, surf),
+		components.Fill(v.width, surf),
+	}
+	out = append(out, rows...)
+	out = append(out, components.Divider(theme, v.width), footer)
+	return components.JoinRows(out)
 }
 
-// renderFolder renders a single folder row as three explicit-background cells:
+// renderFolder renders a single folder row from plain-string column budgets:
 //
-//	[iconCell: margin + indent + icon + space]  [nameCell: folder name]  [unreadCell: badge]
+//	[gutter][ indent + icon + name ][unread count]
 //
-// All cells carry explicit Background(bg) — no stray terminal resets between segments.
-// Widths are computed from plain strings only; no ANSI string is ever measured.
+// Every cell carries an explicit background so no terminal default leaks
+// between segments, and no ANSI string is ever measured.
 func (v *FolderView) renderFolder(f *data.Folder, selected bool) string {
 	theme := v.theme
 
-	var bg, nameFg, iconFg lipgloss.Color
+	bg, nameFg, gut := lipgloss.Color(""), theme.Text, components.GutterNone
 	if selected {
-		bg = theme.Selected
-		nameFg = theme.Background
-		iconFg = theme.Background
-	} else {
-		bg = theme.Surface
-		nameFg = theme.Text
-		iconFg = theme.Accent
+		bg, gut = theme.SurfaceAlt, components.GutterActive
 	}
 
-	const leftPad = 1 // single leading space for breathing room
-	const unreadW = 5 // right-side badge: right-aligned count + trailing space
+	const gutW = 1
+	rowW := v.width - gutW - 1 // the last column belongs to the scroll indicator
 
-	// Icon cell: left margin + depth indent + icon glyph + trailing space.
+	countW := 0
+	var countCell string
+	if f.Unread > 0 {
+		countW = components.CountWidth(f.Unread) + 1
+		countCell = components.Count(theme, f.Unread, bg, theme.Unread) +
+			lipgloss.NewStyle().Background(bg).Render(" ")
+	}
+
 	depthIndent := 2 * f.Depth
-	iconCellW := leftPad + depthIndent + 2 // +2 for icon(1) + space(1)
-	iconPrefix := strings.Repeat(" ", leftPad+depthIndent) + folderIcon(f) + " "
-	iconCell := lipgloss.NewStyle().
-		Background(bg).
-		Foreground(iconFg).
-		Width(iconCellW).
-		Render(iconPrefix)
-
-	// Name cell: fills remaining width between icon and unread badge.
-	nameW := v.width - iconCellW - unreadW
+	nameW := rowW - 3 - depthIndent - countW // " " + icon(1) + " "
 	if nameW < 1 {
 		nameW = 1
 	}
@@ -272,86 +246,15 @@ func (v *FolderView) renderFolder(f *data.Folder, selected bool) string {
 	if name == "" {
 		name = util.SingleLine(f.Name)
 	}
-	name = util.TruncateText(name, nameW)
 
-	nameSt := lipgloss.NewStyle().
-		Background(bg).
-		Foreground(nameFg).
-		Width(nameW)
+	plainLeft := " " + strings.Repeat(" ", depthIndent) + folderIcon(f) + " " +
+		util.TruncateText(name, nameW)
+	leftSt := lipgloss.NewStyle().Background(bg).Foreground(nameFg).Width(rowW - countW)
 	if selected {
-		nameSt = nameSt.Bold(true)
-	}
-	nameCell := nameSt.Render(name)
-
-	// Unread badge: right-aligned count in Unread color; blank when zero or selected.
-	var unreadStr string
-	var unreadFg lipgloss.Color
-	if f.Unread > 0 && !selected {
-		count := f.Unread
-		if count > 9999 {
-			count = 9999
-		}
-		// "%4d " → right-aligned count in 4 cols + 1 trailing space = 5 total.
-		unreadStr = fmt.Sprintf("%4d ", count)
-		unreadFg = theme.Unread
-	} else {
-		unreadStr = strings.Repeat(" ", unreadW)
-		unreadFg = bg
-	}
-	unreadCell := lipgloss.NewStyle().
-		Background(bg).
-		Foreground(unreadFg).
-		Width(unreadW).
-		Render(unreadStr)
-
-	return iconCell + nameCell + unreadCell
-}
-
-// renderHints builds the centered footer hint bar.
-// Structure and styling mirror the composer's footer hints exactly.
-func (v *FolderView) renderHints() string {
-	theme := v.theme
-
-	hintIconSt := lipgloss.NewStyle().Foreground(theme.Accent).Background(theme.Surface)
-	hintDescSt := lipgloss.NewStyle().Foreground(theme.TextMuted).Background(theme.Surface)
-	hintKeySt := lipgloss.NewStyle().Foreground(theme.TextFaint).Background(theme.Surface)
-	hintSepSt := lipgloss.NewStyle().Foreground(theme.TextFaint).Background(theme.Surface)
-
-	type hintItem struct{ icon, key, desc string }
-	hints := []hintItem{
-		{icons.ArrowUpDown, "j/k", "navigate"},
-		{icons.ChevronRight, "enter", "open"},
-		{icons.FolderNew, "n", "new folder"},
-		{icons.Close, "esc", "back"},
+		leftSt = leftSt.Bold(true)
 	}
 
-	// Compute plain-text width for centering using rune count (same as composer).
-	var plainParts []string
-	for _, h := range hints {
-		plainParts = append(plainParts, h.icon+" "+h.desc+" ("+h.key+")")
-	}
-	plainHint := strings.Join(plainParts, "  ")
-	plainW := len([]rune(plainHint))
-	padLeft := (v.width - plainW) / 2
-	if padLeft < 0 {
-		padLeft = 0
-	}
-	padRight := v.width - plainW - padLeft
-	if padRight < 0 {
-		padRight = 0
-	}
-
-	var styledParts []string
-	for _, h := range hints {
-		styledParts = append(styledParts,
-			hintIconSt.Render(h.icon+" ")+
-				hintDescSt.Render(h.desc+" ")+
-				hintKeySt.Render("("+h.key+")"),
-		)
-	}
-	return hintSepSt.Render(strings.Repeat(" ", padLeft)) +
-		strings.Join(styledParts, hintSepSt.Render("  ")) +
-		hintSepSt.Render(strings.Repeat(" ", padRight))
+	return components.GutterCell(theme, gut, bg) + leftSt.Render(plainLeft) + countCell
 }
 
 // folderIcon returns a contextual icon for the given folder, checking both
