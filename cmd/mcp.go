@@ -731,19 +731,20 @@ func registerSendMessage(s *mcp.Server, cfg *config.Config, store *cache.Store) 
 			Subject: in.Subject,
 			Body:    in.Body,
 		}
-		res := outsmtp.SendMessage(acct, draft)()
-		if r, ok := res.(outsmtp.SendResultMsg); ok && r.Err != nil {
-			return nil, okOutput{}, r.Err
+		res, ok := outsmtp.SendMessage(acct, draft)().(outsmtp.SendResultMsg)
+		if !ok {
+			return nil, okOutput{}, errors.New("unexpected SMTP response")
+		}
+		if res.Err != nil {
+			return nil, okOutput{}, res.Err
 		}
 		// Best-effort: append a copy to the Sent folder. A send that succeeded
 		// must not be reported as a failure if this step fails.
 		if sent, _ := resolveSpecialFolder(store, acct.Name, `\Sent`, "Sent", "Sent Items", "Sent Mail", "Sent Messages"); sent != "" {
-			if raw, berr := outsmtp.BuildRawMessage(draft); berr == nil {
-				_ = withClient(cfg, acct.Name, func(client *imaplib.Client) error {
-					client.AppendMessage(sent, raw, []data.Flag{data.FlagSeen})()
-					return nil
-				})
-			}
+			_ = withClient(cfg, acct.Name, func(client *imaplib.Client) error {
+				client.AppendMessage(sent, res.Raw, []data.Flag{data.FlagSeen})()
+				return nil
+			})
 		}
 		return nil, okOutput{OK: true}, nil
 	})

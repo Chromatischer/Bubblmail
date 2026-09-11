@@ -48,6 +48,15 @@ password_cmd = "pass email/work"
 
 Prefer `password_cmd` over storing a plaintext password.
 
+SMTP port 465 uses implicit TLS. Other ports, including the default port 587,
+must advertise STARTTLS. Bubblmail does not send credentials over plaintext
+SMTP.
+
+Mail deliverability also depends on the sending domain and provider. Configure
+SPF and DKIM with the SMTP provider, publish a DMARC policy, and use a `From`
+address authorized by the authenticated account. These DNS controls cannot be
+configured by Bubblmail.
+
 ### `[embeddings]`
 
 Used for semantic search and smart move.

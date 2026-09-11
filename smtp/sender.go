@@ -3,11 +3,16 @@ package smtp
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"mime"
 	"mime/multipart"
+	"mime/quotedprintable"
+	"net"
+	"net/mail"
 	"net/smtp"
 	"net/textproto"
 	"os"
@@ -19,6 +24,8 @@ import (
 	"github.com/bubblmail/bubblmail/data"
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+const userAgent = "Bubblmail/0.1.0"
 
 // Attachment is a file to include in the email.
 type Attachment struct {
@@ -38,31 +45,64 @@ type ComposedMessage struct {
 
 // SendResultMsg carries the result of a send operation.
 type SendResultMsg struct {
-	Err error
+	Account string
+	Raw     []byte
+	Err     error
 }
 
 // BuildRawMessage builds the raw RFC 2822 bytes for a composed message.
 // The returned bytes can be used both for SMTP DATA and for IMAP APPEND.
 func BuildRawMessage(draft *ComposedMessage) ([]byte, error) {
+	if draft == nil {
+		return nil, fmt.Errorf("message is required")
+	}
+	from, err := formatAddress(draft.From)
+	if err != nil {
+		return nil, fmt.Errorf("invalid From address: %w", err)
+	}
+	to, err := formatAddresses(draft.To)
+	if err != nil {
+		return nil, fmt.Errorf("invalid To address: %w", err)
+	}
+	if to == "" {
+		return nil, fmt.Errorf("at least one recipient is required")
+	}
+	cc, err := formatAddresses(draft.CC)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Cc address: %w", err)
+	}
+	messageID, err := newMessageID(draft.From.Address)
+	if err != nil {
+		return nil, err
+	}
+
 	var buf bytes.Buffer
 	date := time.Now().Format(time.RFC1123Z)
 	buf.WriteString("Date: " + date + "\r\n")
-	buf.WriteString("From: " + formatAddress(draft.From) + "\r\n")
-	buf.WriteString("To: " + formatAddresses(draft.To) + "\r\n")
-	if len(draft.CC) > 0 {
-		buf.WriteString("Cc: " + formatAddresses(draft.CC) + "\r\n")
+	buf.WriteString("Message-ID: " + messageID + "\r\n")
+	buf.WriteString("From: " + from + "\r\n")
+	buf.WriteString("To: " + to + "\r\n")
+	if cc != "" {
+		buf.WriteString("Cc: " + cc + "\r\n")
 	}
 	buf.WriteString("Subject: " + mime.QEncoding.Encode("utf-8", draft.Subject) + "\r\n")
+	buf.WriteString("User-Agent: " + userAgent + "\r\n")
 	buf.WriteString("MIME-Version: 1.0\r\n")
 
 	if len(draft.Attachments) == 0 {
 		buf.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
 		buf.WriteString("Content-Transfer-Encoding: quoted-printable\r\n")
 		buf.WriteString("\r\n")
-		buf.WriteString(draft.Body)
+		qw := quotedprintable.NewWriter(&buf)
+		if _, err := qw.Write([]byte(normalizeCRLF(draft.Body))); err != nil {
+			return nil, fmt.Errorf("encoding message body: %w", err)
+		}
+		if err := qw.Close(); err != nil {
+			return nil, fmt.Errorf("encoding message body: %w", err)
+		}
 	} else {
 		mw := multipart.NewWriter(&buf)
-		buf.WriteString("Content-Type: multipart/mixed; boundary=\"" + mw.Boundary() + "\"\r\n")
+		buf.WriteString("Content-Type: " + mime.FormatMediaType("multipart/mixed", map[string]string{"boundary": mw.Boundary()}) + "\r\n")
 		buf.WriteString("\r\n")
 
 		th := make(textproto.MIMEHeader)
@@ -72,7 +112,13 @@ func BuildRawMessage(draft *ComposedMessage) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("creating text part: %w", err)
 		}
-		fmt.Fprint(pw, draft.Body)
+		qw := quotedprintable.NewWriter(pw)
+		if _, err := qw.Write([]byte(normalizeCRLF(draft.Body))); err != nil {
+			return nil, fmt.Errorf("encoding message body: %w", err)
+		}
+		if err := qw.Close(); err != nil {
+			return nil, fmt.Errorf("encoding message body: %w", err)
+		}
 
 		for _, a := range draft.Attachments {
 			fileData, err := os.ReadFile(a.Path)
@@ -81,18 +127,20 @@ func BuildRawMessage(draft *ComposedMessage) ([]byte, error) {
 			}
 			ct := mimeTypeForFile(a.Filename)
 			ah := make(textproto.MIMEHeader)
-			ah.Set("Content-Type", ct)
+			ah.Set("Content-Type", mime.FormatMediaType(ct, map[string]string{"name": a.Filename}))
 			ah.Set("Content-Transfer-Encoding", "base64")
-			ah.Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", a.Filename))
+			ah.Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": a.Filename}))
 			aw, err := mw.CreatePart(ah)
 			if err != nil {
 				return nil, fmt.Errorf("creating attachment part: %w", err)
 			}
-			enc := base64.NewEncoder(base64.StdEncoding, aw)
-			enc.Write(fileData)
-			enc.Close()
+			if err := writeBase64(aw, fileData); err != nil {
+				return nil, fmt.Errorf("encoding attachment %s: %w", a.Filename, err)
+			}
 		}
-		mw.Close()
+		if err := mw.Close(); err != nil {
+			return nil, fmt.Errorf("closing MIME message: %w", err)
+		}
 	}
 	return buf.Bytes(), nil
 }
@@ -100,33 +148,24 @@ func BuildRawMessage(draft *ComposedMessage) ([]byte, error) {
 // SendMessage returns a tea.Cmd that sends the composed message via SMTP.
 func SendMessage(cfg *config.AccountConfig, draft *ComposedMessage) tea.Cmd {
 	return func() tea.Msg {
-		err := sendMessage(cfg, draft)
-		return SendResultMsg{Err: err}
+		raw, err := BuildRawMessage(draft)
+		if err == nil {
+			err = sendRawMessage(cfg, draft, raw)
+		}
+		return SendResultMsg{Account: cfg.Name, Raw: raw, Err: err}
 	}
 }
 
-func sendMessage(cfg *config.AccountConfig, draft *ComposedMessage) error {
+func sendRawMessage(cfg *config.AccountConfig, draft *ComposedMessage, raw []byte) error {
 	password, err := cfg.ResolvePassword()
 	if err != nil {
 		return fmt.Errorf("resolving password: %w", err)
 	}
 
-	raw, err := BuildRawMessage(draft)
+	addr := fmt.Sprintf("%s:%d", cfg.SMTPHost, cfg.SMTPPort)
+	client, err := connectSMTP(addr, cfg.SMTPHost, cfg.SMTPPort)
 	if err != nil {
 		return err
-	}
-
-	addr := fmt.Sprintf("%s:%d", cfg.SMTPHost, cfg.SMTPPort)
-	tlsCfg := &tls.Config{ServerName: cfg.SMTPHost}
-	tlsConn, err := tls.Dial("tcp", addr, tlsCfg)
-	if err != nil {
-		return fmt.Errorf("connecting to SMTP server: %w", err)
-	}
-	defer tlsConn.Close()
-
-	client, err := smtp.NewClient(tlsConn, cfg.SMTPHost)
-	if err != nil {
-		return fmt.Errorf("creating SMTP client: %w", err)
 	}
 	defer client.Close()
 
@@ -137,7 +176,10 @@ func sendMessage(cfg *config.AccountConfig, draft *ComposedMessage) error {
 
 	fromEmail := cfg.Username
 	if draft.From.Address != "" {
-		fromEmail = draft.From.Address
+		fromEmail, err = envelopeAddress(draft.From.Address)
+		if err != nil {
+			return fmt.Errorf("invalid SMTP sender: %w", err)
+		}
 	}
 	if err := client.Mail(fromEmail); err != nil {
 		return fmt.Errorf("SMTP MAIL command failed: %w", err)
@@ -187,32 +229,125 @@ func mimeTypeForFile(name string) string {
 	}
 }
 
-func formatAddress(a data.Address) string {
-	if a.Name != "" {
-		return fmt.Sprintf("%s <%s>", mime.QEncoding.Encode("utf-8", a.Name), a.Address)
+func connectSMTP(addr, host string, port int) (*smtp.Client, error) {
+	tlsCfg := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
+	dialer := &net.Dialer{Timeout: 15 * time.Second}
+	if port == 465 {
+		conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsCfg)
+		if err != nil {
+			return nil, fmt.Errorf("connecting to SMTP server: %w", err)
+		}
+		client, err := smtp.NewClient(conn, host)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("creating SMTP client: %w", err)
+		}
+		return client, nil
 	}
-	return a.Address
+
+	conn, err := dialer.Dial("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("connecting to SMTP server: %w", err)
+	}
+	client, err := smtp.NewClient(conn, host)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("creating SMTP client: %w", err)
+	}
+	if ok, _ := client.Extension("STARTTLS"); !ok {
+		client.Close()
+		return nil, fmt.Errorf("SMTP server does not support STARTTLS")
+	}
+	if err := client.StartTLS(tlsCfg); err != nil {
+		client.Close()
+		return nil, fmt.Errorf("starting SMTP TLS: %w", err)
+	}
+	return client, nil
 }
 
-func formatAddresses(addrs []data.Address) string {
-	parts := make([]string, len(addrs))
-	for i, a := range addrs {
-		parts[i] = formatAddress(a)
+func formatAddress(a data.Address) (string, error) {
+	parsed, err := mail.ParseAddress(a.Address)
+	if err != nil {
+		return "", err
 	}
-	return strings.Join(parts, ", ")
+	if a.Name != "" {
+		parsed.Name = a.Name
+	}
+	return parsed.String(), nil
+}
+
+func formatAddresses(addrs []data.Address) (string, error) {
+	parts := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		if strings.TrimSpace(a.Address) == "" {
+			continue
+		}
+		formatted, err := formatAddress(a)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, formatted)
+	}
+	return strings.Join(parts, ", "), nil
+}
+
+func newMessageID(from string) (string, error) {
+	domain := "localhost"
+	address, err := envelopeAddress(from)
+	if err != nil {
+		return "", err
+	}
+	if at := strings.LastIndexByte(address, '@'); at >= 0 && at+1 < len(address) {
+		domain = address[at+1:]
+	}
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return "", fmt.Errorf("generating Message-ID: %w", err)
+	}
+	return fmt.Sprintf("<%x@%s>", random, domain), nil
+}
+
+func normalizeCRLF(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return strings.ReplaceAll(s, "\n", "\r\n")
+}
+
+func writeBase64(w io.Writer, data []byte) error {
+	encoded := base64.StdEncoding.EncodeToString(data)
+	for len(encoded) > 76 {
+		if _, err := fmt.Fprint(w, encoded[:76], "\r\n"); err != nil {
+			return err
+		}
+		encoded = encoded[76:]
+	}
+	_, err := fmt.Fprint(w, encoded, "\r\n")
+	return err
 }
 
 func collectRecipients(to, cc []data.Address) []string {
 	var out []string
 	for _, a := range to {
 		if a.Address != "" {
-			out = append(out, a.Address)
+			if address, err := envelopeAddress(a.Address); err == nil {
+				out = append(out, address)
+			}
 		}
 	}
 	for _, a := range cc {
 		if a.Address != "" {
-			out = append(out, a.Address)
+			if address, err := envelopeAddress(a.Address); err == nil {
+				out = append(out, address)
+			}
 		}
 	}
 	return out
+}
+
+func envelopeAddress(raw string) (string, error) {
+	address, err := mail.ParseAddress(raw)
+	if err != nil {
+		return "", err
+	}
+	return address.Address, nil
 }
