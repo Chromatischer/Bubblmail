@@ -5,12 +5,12 @@ import (
 	"io"
 	"mime"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/bubblmail/bubblmail/data"
 	tea "github.com/charmbracelet/bubbletea"
 	imaplib "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
+	_ "github.com/emersion/go-message/charset"
 	gomail "github.com/emersion/go-message/mail"
 )
 
@@ -240,21 +240,18 @@ func (c *Client) fetchFolders() ([]*data.Folder, error) {
 }
 
 func (c *Client) fetchMessages(folder string, skip, limit int) ([]*data.Message, error) {
-	if _, err := c.conn.Select(folder, nil).Wait(); err != nil {
+	if skip < 0 || limit <= 0 {
+		return nil, fmt.Errorf("invalid message page: skip=%d limit=%d", skip, limit)
+	}
+
+	selected, err := c.conn.Select(folder, nil).Wait()
+	if err != nil {
 		return nil, fmt.Errorf("selecting folder %q: %w", folder, err)
 	}
 
-	status, err := c.conn.Status(folder, &imaplib.StatusOptions{
-		NumMessages: true,
-	}).Wait()
-	if err != nil {
-		return nil, fmt.Errorf("getting status for %q: %w", folder, err)
-	}
-
-	total := uint32(0)
-	if status.NumMessages != nil {
-		total = *status.NumMessages
-	}
+	// SELECT already returns the current message count. Issuing STATUS for the
+	// selected mailbox is redundant and is rejected by some IMAP servers.
+	total := selected.NumMessages
 	if total == 0 || uint32(skip) >= total {
 		return nil, nil
 	}
@@ -421,14 +418,18 @@ func parseBody(r io.Reader) (string, string, []data.Attachment, error) {
 		if err != nil {
 			continue
 		}
-		switch {
-		case strings.HasPrefix(ct, "text/plain"):
-			if utf8.Valid(body) && plainText == "" {
-				plainText = string(body)
+		mediaType, _, parseErr := mime.ParseMediaType(ct)
+		if parseErr != nil {
+			mediaType = strings.ToLower(strings.TrimSpace(strings.SplitN(ct, ";", 2)[0]))
+		}
+		switch strings.ToLower(mediaType) {
+		case "text/plain":
+			if plainText == "" {
+				plainText = decodeTextBody(body)
 			}
-		case strings.HasPrefix(ct, "text/html"):
-			if utf8.Valid(body) && htmlText == "" {
-				htmlText = string(body)
+		case "text/html":
+			if htmlText == "" {
+				htmlText = decodeTextBody(body)
 			}
 		default:
 			name := extractAttachmentFilename(ct, cd)
@@ -458,6 +459,12 @@ func parseBody(r io.Reader) (string, string, []data.Attachment, error) {
 	}
 
 	return plainText, htmlText, attachments, nil
+}
+
+// decodeTextBody preserves the decoded MIME text even if a sender included an
+// invalid UTF-8 byte. Charset conversion is performed by go-message/charset.
+func decodeTextBody(body []byte) string {
+	return strings.ToValidUTF8(string(body), "�")
 }
 
 // extractAttachmentFilename returns the filename from Content-Disposition or Content-Type, or "".

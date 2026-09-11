@@ -83,6 +83,50 @@ func TestParseBody_HTMLFallbackWhenNoPlainPart(t *testing.T) {
 	}
 }
 
+func TestParseBody_MixedCaseHTMLContentType(t *testing.T) {
+	raw := strings.NewReader(strings.Join([]string{
+		"From: no-reply@mail.anthropic.com",
+		"Content-Type: Text/HTML; charset=UTF-8",
+		"",
+		"<div>Your secure link to Claude.ai</div>",
+	}, "\r\n"))
+
+	plain, html, _, err := parseBody(raw)
+	if err != nil {
+		t.Fatalf("parseBody: %v", err)
+	}
+	if html != "<div>Your secure link to Claude.ai</div>" {
+		t.Fatalf("html = %q", html)
+	}
+	if plain != "Your secure link to Claude.ai" {
+		t.Fatalf("plain = %q", plain)
+	}
+}
+
+func TestParseBody_DecodesTextCharset(t *testing.T) {
+	raw := strings.NewReader("Content-Type: text/html; charset=iso-8859-1\r\n\r\n<p>cr\xe8me</p>")
+
+	plain, html, _, err := parseBody(raw)
+	if err != nil {
+		t.Fatalf("parseBody: %v", err)
+	}
+	if html != "<p>crème</p>" || plain != "crème" {
+		t.Fatalf("plain=%q html=%q", plain, html)
+	}
+}
+
+func TestParseBody_ReplacesInvalidUTF8(t *testing.T) {
+	raw := strings.NewReader("Content-Type: text/html; charset=utf-8\r\n\r\n<p>Claude \xff login</p>")
+
+	plain, html, _, err := parseBody(raw)
+	if err != nil {
+		t.Fatalf("parseBody: %v", err)
+	}
+	if html == "" || plain == "" {
+		t.Fatalf("body was discarded: plain=%q html=%q", plain, html)
+	}
+}
+
 func TestParseBody_AttachmentFilenameFromDisposition(t *testing.T) {
 	raw := strings.NewReader(strings.Join([]string{
 		"MIME-Version: 1.0",
